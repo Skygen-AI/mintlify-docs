@@ -1,97 +1,55 @@
 ---
 title: "Introduction"
-description: "Welcome to the new home for your documentation"
+description: "Skygen is an AI agent automation platform that runs on real devices, Cloud PCs, and sandboxed environments."
 ---
 
-## Setting up
+Skygen lets you build and run AI agents that control computers. Connect your laptop or spin up a Cloud PC, chat with an agent, and it will click, type, browse, and use apps on your behalf. Integrations with 500+ third-party services (via MCP) let agents read your email, update your CRM, or post to Slack while they work.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
+## What you can build
 
 <Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+  <Card title="Automate a desktop workflow" icon="desktop" href="/concepts/agents">
+    An agent on your real device opens Figma, renames 40 layers, exports PNGs, and uploads them to Google Drive.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Run a task on a Cloud PC" icon="cloud" href="/concepts/cloud-pc">
+    Launch a persistent virtual machine, paste a URL, and have the agent fill out a form without tying up your laptop.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Connect integrations" icon="plug" href="/concepts/mcp-integrations">
+    Let the agent use Gmail, Slack, GitHub, Notion, Linear, and more through a single OAuth consent screen.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Schedule recurring tasks" icon="calendar" href="/guides/scheduled-tasks">
+    "Every Monday at 9am, summarize my open PRs and post to #standup."
   </Card>
 </Columns>
 
-## Create beautiful pages
+## Core concepts
 
-Everything you need to create world-class documentation.
+Start here to understand how Skygen fits together.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Devices" icon="laptop" href="/concepts/devices">
+    Real machines and virtual sandboxes that agents run on.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Chat sessions" icon="comments" href="/concepts/chat-sessions">
+    Conversations that scope the agent's context and memory.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Agents" icon="robot" href="/concepts/agents">
+    Action loop, tool use, and how agents route to devices.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Confirmations" icon="shield-check" href="/concepts/confirmations">
+    Approval flow for sensitive actions before they execute.
   </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Register, connect a device, and run your first session in 5 minutes.
+  </Card>
+  <Card title="API reference" icon="code" href="/api-reference/introduction">
+    Every endpoint with request, response, and examples.
+  </Card>
+</CardGroup>
+
+{/* TODO: add hero screenshot of dashboard once brand assets are finalized */}

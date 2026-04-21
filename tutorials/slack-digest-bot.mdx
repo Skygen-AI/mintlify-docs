@@ -1,0 +1,141 @@
+---
+title: "Build a Slack digest bot"
+description: "10-minute tutorial — connect Slack, schedule a daily agent run, receive a summary in your DMs."
+---
+
+By the end of this tutorial you will have:
+
+- A connected Slack account in Skygen
+- A scheduled task that fires every weekday at 9 AM local time
+- An agent that reads yesterday's `#engineering` posts and DMs you a summary
+
+<Info>
+**Prereqs.** An authenticated Skygen user, a Slack workspace you can install an app into, and `COMPOSIO_ENABLED=true` on your deployment.
+</Info>
+
+## 1. Connect Slack
+
+Get the OAuth redirect URL:
+
+```bash
+curl https://api.skygen.ai/mcp/integrations/connect-url/slack \
+  -H "Authorization: Bearer $TOKEN"
+# → { "redirect_url": "https://composio.dev/authorize?...", "toolkit": "slack" }
+```
+
+Open `redirect_url` in a browser. Approve the Slack install. Composio posts a signed webhook to `/mcp/webhooks/composio`, and Skygen creates a `ComposioConnection` with `status="connected"`.
+
+Verify:
+
+```bash
+curl https://api.skygen.ai/mcp/integrations/available \
+  -H "Authorization: Bearer $TOKEN"
+# → { "composio": [ { "slug": "slack", "connected_accounts": [{ "account_id": "...", ... }] } ] }
+```
+
+## 2. Give the account a friendly label
+
+```bash
+curl -X PATCH https://api.skygen.ai/mcp/integrations/connections/$ACCOUNT_ID/label \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"label": "Work Slack"}'
+```
+
+## 3. Pick a device
+
+Daily runs need a device. For Slack-only automations, a chat-only session works (no device required), but most users bind to a real device or a Cloud PC so the agent has tools:
+
+```bash
+curl https://api.skygen.ai/devices \
+  -H "Authorization: Bearer $TOKEN"
+# → [ { "id": "dev_abc", ... } ]
+```
+
+## 4. Create the scheduled task
+
+```bash
+curl -X POST https://api.skygen.ai/scheduled-tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Daily Slack digest",
+    "frequency": "daily",
+    "time_of_day": "09:00",
+    "timezone": "America/New_York",
+    "prompt": "Read messages in #engineering from the last 24 hours. Summarize the top decisions, open questions, and blockers. DM me the summary on Slack.",
+    "device_id": "dev_abc",
+    "is_enabled": true
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "task-uuid",
+  "next_run_at": "2026-04-21T13:00:00Z",
+  "run_count": 0,
+  "is_enabled": true
+}
+```
+
+(`next_run_at` is UTC; 9 AM ET on 2026-04-21 is 13:00 UTC.)
+
+## 5. Run it once right now (optional)
+
+To verify without waiting until tomorrow:
+
+```bash
+curl -X POST https://api.skygen.ai/scheduled-tasks/$TASK_ID/run \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Skygen creates a chat session, sends the prompt as a user message, and the agent starts working. Subscribe to `/user` Socket.IO to watch progress, or poll `GET /sessions/{id}/messages`.
+
+## 6. Inspect runs
+
+```bash
+curl https://api.skygen.ai/scheduled-tasks/$TASK_ID/runs \
+  -H "Authorization: Bearer $TOKEN"
+# → { "items": [ { "id": "run-uuid", "status": "completed", "scheduled_for": "...", "completed_at": "..." } ] }
+```
+
+Each execution creates a new session; drill into `session_id` to see the transcript.
+
+## 7. Pause or edit
+
+```bash
+# Pause without deleting
+curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID/toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"is_enabled": false}'
+
+# Change schedule
+curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"time_of_day": "08:30", "frequency": "weekly", "day_of_week": 1}'
+```
+
+## Common mistakes
+
+<Warning>
+**Webhook never arrives.** If connecting Slack seems to hang, check `COMPOSIO_WEBHOOK_SECRET` on both Composio dashboard and Skygen backend — mismatched secrets mean signature verification fails silently and connections never finalize.
+</Warning>
+
+<Note>
+**Task fires but agent does nothing.** The agent needs an explicit instruction to call Slack — "read messages" in natural language is usually enough, but ambiguous prompts ("catch up on Slack") sometimes don't trigger the toolkit. Be specific: name the channel and the time window.
+</Note>
+
+<Note>
+**Timezone off by hours.** If your digest arrives at the wrong time, verify `timezone` matches your IANA tz (`America/New_York`, `Europe/Berlin`). `EST` / `GMT+2` are not valid.
+</Note>
+
+<Note>
+**Late runs don't backfill.** If Skygen was down at 9 AM and it's now 11, the scheduler skips the 9 AM run (> 1 hour late) and advances to tomorrow. The run shows up with `status=skipped` in history. See [Scheduled tasks](/guides/scheduled-tasks).
+</Note>
+
+## What to read next
+
+- [Triggers](/guides/triggers) — fire on a Slack event instead of a schedule
+- [MCP integrations](/concepts/mcp-integrations) — full toolkit catalog
+- [Connecting integrations](/guides/connecting-integrations) — OAuth details

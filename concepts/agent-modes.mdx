@@ -1,0 +1,140 @@
+---
+title: "Agent modes"
+description: "auto, cua, deep_research, mcp, swe, ask_human — what each does and when to use it."
+---
+
+The `agent_mode` header on `POST /messages` selects the specialist agent that will handle the request. Each mode has a different tool surface, LLM selection bias, and progress-event shape.
+
+## The modes
+
+| Mode | Agent class | Use case | Typical LLM tier |
+|------|-------------|----------|------------------|
+| `auto` | Router | Let the system pick | Adaptive |
+| `cua` | CUA_OrchestratorAgent | GUI automation (clicks, typing, screenshots) | Balanced / Premium |
+| `deep_research` | PlannerAgent → DataFetcher | Multi-step research with long context | Long-context (Claude Sonnet 4.6, Gemini 2.5) |
+| `mcp` | MCPToolsAgent | Run connected MCP tools (Gmail, Slack, GitHub, ...) | Tool-capable (Claude, GPT) |
+| `swe` | ProjectSoftwareAgent | Code reading, analysis, generation | Heavy reasoning (Claude Opus, GPT-4.7) |
+| `ask_human` | BaseAgent with RequestConfirmationTool | Pause for user input | No LLM |
+
+## `auto` — smart routing
+
+The default. The router analyzes the incoming message and picks the best specialist:
+
+- Keywords like "click", "navigate", "screenshot", "open app" → `cua`
+- "research", "find", "search", "summarize" with long horizon → `deep_research`
+- File/code reference or request to write code → `swe`
+- Reference to a connected integration ("send email", "create issue") → `mcp`
+- Anything with an unclear input → `ask_human` (to clarify)
+
+Platform also factors in:
+
+- On macOS/Windows (with a connected real device), `auto` biases toward `cua`
+- On web/chat-only sessions, `auto` biases toward `mcp` or `deep_research`
+
+## `cua` — computer use
+
+**When to use**: desktop automation on real devices or Cloud PCs. Open a browser, fill a form, upload a file, interact with an app's GUI.
+
+The CUA hierarchy:
+
+- **Orchestrator** decomposes the high-level goal into sub-plans
+- **Supervisor** manages each sub-plan and assigns steps to the Performer
+- **Performer** takes screenshots, identifies elements with a vision LLM, and calls `perform_gui_action` for each click / type / scroll
+
+Under the hood, every action goes through the device action API (see [Agents](/concepts/agents)):
+
+```
+agent → POST /agent/device/execute { action_type: "CLICK", parameters: {x, y} }
+        ↓
+      backend routes to device (Socket.IO) or Cloud PC (E2B SDK)
+        ↓
+      device returns result, agent polls /agent/device/status/{action_id}
+```
+
+Events on `/user` Socket.IO:
+
+```json
+{ "type": "ui_meta_update", "mode": "cua", "stage": "perception", "action_type": "screenshot" }
+{ "type": "ui_meta_update", "mode": "cua", "stage": "action", "action_type": "click" }
+```
+
+## `deep_research` — long-context research
+
+**When to use**: "Summarize the last 50 PRs on this repo and identify trending themes." "Compare Anthropic's model lineup across 6 dimensions." Long-context reasoning, multiple tool calls, structured output.
+
+PlannerAgent decomposes the task, then delegates each step to DataFetcher (web browsing, API calls, file reads). The router biases toward long-context models (Claude Sonnet 4.6 with 1M context, Gemini 2.5 Pro).
+
+Events:
+
+```json
+{ "type": "mode_progress", "mode": "deep_research", "stage": "planning", "progress": 0.1 }
+{ "type": "mode_progress", "mode": "deep_research", "stage": "browsing", "progress": 0.4 }
+{ "type": "mode_progress", "mode": "deep_research", "stage": "synthesizing", "progress": 0.9 }
+```
+
+## `mcp` — MCP tools
+
+**When to use**: the user is asking the agent to do something in a connected service. "Send an email to Alice saying I'll be late", "Open a Linear issue for this bug", "Post the summary to Slack #eng".
+
+MCPToolsAgent loads the set of tools available to the user (Composio toolkits + custom connectors), decides which to call, fills in arguments, and executes. Results stream back as tool call traces.
+
+```json
+{ "type": "mode_progress", "mode": "mcp", "stage": "executing", "tool": "GMAIL_SEND_EMAIL" }
+```
+
+See [MCP integrations](/concepts/mcp-integrations) for the tool catalog.
+
+## `swe` — software engineering
+
+**When to use**: modify a repo, analyze code, write a patch. "Rename `foo` to `bar` across this file." "Write a test for this function." "Explain how this module works."
+
+ProjectSoftwareAgent is git-aware. The router picks heavy-reasoning models (Claude Opus 4.7, GPT-4.7). Tools include file read/write, shell commands, linters.
+
+Events:
+
+```json
+{ "type": "mode_progress", "mode": "swe", "stage": "analyzing", "file": "src/foo.ts" }
+{ "type": "mode_progress", "mode": "swe", "stage": "coding", "file": "src/bar.ts" }
+{ "type": "mode_progress", "mode": "swe", "stage": "testing", "status": "passing" }
+```
+
+## `ask_human` — pause for input
+
+**When to use**: internal, not usually explicit. When an agent (in any mode) hits ambiguity or needs approval, it can switch to `ask_human` via `RequestConfirmationTool`. No LLM runs during this step.
+
+The user gets a `confirmation_request` on Socket.IO, responds via `POST /agent/confirmations/{id}/respond`, and the agent resumes. See [Confirmations](/concepts/confirmations).
+
+## Selecting a mode
+
+Three ways:
+
+1. **Explicit header** on `POST /messages`:
+   ```bash
+   -H "agent_mode: cua"
+   ```
+
+2. **Auto-routing** (default). The router analyzes the message.
+
+3. **Admin override**. Not user-facing. Set by the backend for specific flows (e.g., scheduled tasks force a specific mode).
+
+## Mode-specific billing
+
+Modes that invoke LLMs burn tokens proportional to their model tier and context size. `cua` + premium LLMs can burn faster than `deep_research` with economy. The per-session premium cap (default 3 calls unless `heavy_reasoning=true`) prevents a single mode from blowing the budget.
+
+Cloud PC actions incur additional per-minute compute cost on top of LLM tokens.
+
+## Gotchas
+
+<Note>
+**Agent mode is a hint, not a lock.** The agent can switch modes mid-run (`cua` → `ask_human` → `cua`) via tool calls. Subscribe to `mode_progress` if you need the current mode.
+</Note>
+
+<Note>
+**`deep_research` doesn't always stream progress.** Some long research steps are silent from the user's perspective (background web browsing). Expect gaps between `mode_progress` events.
+</Note>
+
+## See also
+
+- [Agents](/concepts/agents) — the runtime that hosts modes
+- [LLM routing](/guides/llm-routing) — how each mode picks its model
+- [Confirmations](/concepts/confirmations) — `ask_human` under the hood

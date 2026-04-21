@@ -1,0 +1,184 @@
+---
+title: "Chat sessions"
+description: "The conversation container that binds a user, a device, and an agent together."
+---
+
+A **chat session** is the container for one conversation with an agent. It holds the message history, the working memory the agent keeps, and the binding to a specific device. Every user message, every agent reply, every action, every token charge lives in exactly one session.
+
+Sessions can be bound to a device (`device_id` set — the normal case) or "chat-only" (`device_id = null`, no device actions possible).
+
+## Why sessions matter
+
+- **Memory scope** — the agent only recalls context from the current session.
+- **Device lock** — when the agent is running, the session holds an exclusive Redis lock on its device so two agents cannot fight over the same mouse.
+- **Billing boundary** — the `/billing/transactions/grouped` endpoint groups all usage by session so you can see what each conversation cost.
+
+## Models
+
+**`ChatSession`** fields: `id`, `user_id`, `device_id` (nullable), `title`, `is_active`, `deleted_at`, `meta_data` (free-form JSON), timestamps. Composite index on `(user_id, device_id, is_active, deleted_at)` makes the common "my active sessions" query cheap.
+
+**`ChatMessage`** fields: `id`, `session_id` (cascade delete), `role`, `content`, `meta_data`, `task_id` (nullable), `created_at`. `attachments` relationship is eager-loaded.
+
+### Message roles
+
+```python
+class MessageRole(str, Enum):
+    user = "user"
+    assistant = "assistant"
+    system = "system"
+```
+
+### What goes in `meta_data`
+
+`meta_data` is the escape hatch where the agent stashes context about a message. Some keys are user-visible, some are internal and filtered before responses.
+
+**Filtered before API responses** (never shown to clients):
+- `worker_id`
+- `sub_agent_count`
+- `sleep_seconds`
+- `reasoning`
+- `condition`
+
+**User-visible**: `source`, `agent_mode`, `display_type`, `render_data`, `status`, and anything else the agent writes.
+
+## Real-time vs persistent events
+
+Not every agent event becomes a `ChatMessage`. Progress updates stream over Socket.IO but are not saved. Only user messages and final assistant responses land in the database.
+
+| Event | Saved? | Description |
+|-------|--------|-------------|
+| `USER_MESSAGE` | yes | Your input |
+| `ASSISTANT_MESSAGE` | yes | The final agent reply |
+| `ASK_HUMAN_MESSAGE` | yes | The agent pauses for a decision (see [Confirmations](/concepts/confirmations)) |
+| `STATUS_UPDATE` | no | "thinking", "executing", "hibernated" |
+| `PLAN_UPDATE` | no | The agent's step tree (live) |
+| `MODE_PROGRESS` | no | Per-mode progress (`cua`, `deep_research`, `mcp`, `swe`, `ask_human`) |
+| `ATTACHMENT_READY` | no | File upload completion notice |
+| `BILLING_NOTICE` | no | Live billing alert (token-low, overage) |
+
+The live feed stays clean; the database stays an audit log.
+
+## Message flow
+
+<Steps>
+  <Step title="You POST a message">
+    `POST /sessions/{session_id}/messages` with role, content, and optional metadata.
+  </Step>
+  <Step title="Pre-flight checks">
+    Client version (if enforcement enabled), billing access (`billing_service.can_user_access`), then task status (auto-resume a completed prior task if relevant).
+  </Step>
+  <Step title="Persist immediately">
+    The message lands in the DB with `role=user`.
+  </Step>
+  <Step title="Route">
+    If the session is already active (an agent worker is handling a previous message), deliver as a follow-up via Socket.IO directly to the agent's inbox. Otherwise acquire the device lock in Redis and publish to RabbitMQ.
+  </Step>
+  <Step title="Worker picks up">
+    A worker process consumes from the queue, opens a planning loop, calls tools, submits device actions, and streams updates back over the `/user` Socket.IO namespace.
+  </Step>
+  <Step title="Final reply lands">
+    The assistant response is saved to the DB and emitted as `agent_response` on Socket.IO. The device lock releases.
+  </Step>
+</Steps>
+
+### Device locking (Redis)
+
+For device-bound sessions, `send_to_processing_queue` atomically SETNX-locks the device (`device:{device_id} → {session_id, locked_at, user_id}`). If another session already holds the lock, the request fails with `409 Conflict` and the response includes `active_session_id` so the client can point the user at the right place. Chat-only sessions skip the device lock.
+
+## Socket.IO `/user` namespace
+
+Connect with your JWT:
+
+```javascript
+const socket = io("https://api.skygen.ai", {
+  path: "/socket.io",
+  auth: { token: "YOUR_JWT", user_id: "YOUR_USER_ID" }
+});
+```
+
+Events you will see:
+
+| Event | Payload (shape) | Persisted? |
+|-------|-----------------|------------|
+| `agent_response` | `{ session_id, message, status, tokens_remaining }` | yes |
+| `ui_meta_update` | `{ session_id, payload: { type, steps / plan / ... } }` | no |
+| `status_update` | `{ session_id, status, content? }` | no |
+| `plan_update` | `{ plan_version, steps[] }` | no |
+| `mode_progress` | `{ mode, stage, status, progress, detail }` | no |
+| `confirmation_request` | `{ input_config: { type, prompt, choices } }` | yes (as ask_human message) |
+| `task_progress` | `{ session_id, progress, status, message }` | no |
+| `device_status_update` | `{ device_id, status }` | n/a |
+| `attachments_ready` | `{ session_id, message_id, attachments[] }` | n/a |
+
+If you are offline when an event fires, the backend stores it in Redis and replays on reconnect (max 30 seconds per replay task).
+
+<Note>
+Skygen does **not** stream tokens for assistant replies. The agent sends one complete `agent_response` when it finishes. Use `ui_meta_update`, `status_update`, and `mode_progress` for live progress indication.
+</Note>
+
+## Endpoints
+
+### Sessions
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/sessions` | Create. Body: `{ title, device_id?, meta_data?, reuse_existing? }` |
+| `GET` | `/sessions` | List with pagination. `limit` ∈ [1, 100], default 20. Sorted by `updated_at` DESC. |
+| `GET` | `/sessions/{id}` | Fetch one. |
+| `PATCH` | `/sessions/{id}` | Update `title`, `device_id`, `is_active`, `meta_data`. Title-only updates **preserve** `updated_at` so the sidebar does not re-shuffle. |
+| `DELETE` | `/sessions/{id}` | Soft-delete. Releases device and session locks. |
+| `POST` | `/sessions/{id}/restore` | Un-soft-delete. |
+| `DELETE` | `/sessions/{id}/permanent` | Hard-delete. Cascades to messages, attachments, ratings. |
+| `GET` | `/sessions/{id}/plan` | Latest `plan` payload from system messages. |
+| `GET` | `/sessions/{id}/summary` | Simplified transcript: user messages + final assistant replies, no intermediates. |
+
+### Messages
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/sessions/{id}/messages` | Send a message. Triggers queueing or inbox delivery. |
+| `GET` | `/sessions/{id}/messages` | Full transcript, ordered by `created_at ASC`, capped at 5000. Internal `meta_data` keys stripped. |
+| `DELETE` | `/sessions/{id}/messages/{msg_id}` | Remove a single message. |
+| `POST` | `/sessions/{id}/messages/{msg_id}/rate` | Rate a message 1–5 with optional `comment`. Low ratings (≤ 2) trigger a Telegram alert asynchronously. |
+| `GET` | `/sessions/{id}/messages/{msg_id}/rating` | Your existing rating if any. |
+
+## End to end
+
+```bash
+# 1. Create a session
+curl -X POST https://api.skygen.ai/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title": "Research task", "device_id": "dev_abc"}'
+# → { "id": "sess_123", "is_active": true, ... }
+
+# 2. Subscribe to the user namespace (JS)
+# (see Socket.IO example above)
+
+# 3. Send a message
+curl -X POST https://api.skygen.ai/sessions/sess_123/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "agent_mode: auto" \
+  -H "client_version: 1.0.0" \
+  -d '{
+    "role": "user",
+    "content": "Navigate to example.com and summarize the homepage."
+  }'
+# → 201 { "id": "msg_456", "display_type": "user_message", ... }
+
+# 4. Watch `ui_meta_update` / `mode_progress` / `agent_response` stream on the socket.
+
+# 5. Fetch history later
+curl https://api.skygen.ai/sessions/sess_123/messages \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Attachments
+
+Attachments hang off messages via `ChatMessage.id` FK (nullable, `ON DELETE SET NULL`). A file uploaded before a message exists can later be linked to one. See [Files and uploads](/guides/screenshots) for the upload flow. Internal metadata is filtered from responses the same way as `meta_data`.
+
+## See also
+
+- [Agents](/concepts/agents) — what happens after you send a message
+- [Confirmations](/concepts/confirmations) — the `ask_human` pause
+- [Devices](/concepts/devices) — what sessions bind to
+- [Billing](/concepts/billing) — per-session usage accounting

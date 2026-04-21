@@ -1,0 +1,225 @@
+---
+title: "Errors"
+description: "Status codes, response formats, domain-specific error catalog, and retry strategy."
+---
+
+Skygen uses standard HTTP status codes. Responses are JSON. Different parts of the API use different error schemas, which is a known inconsistency we're migrating toward the `AppError` shape.
+
+## Error response formats
+
+**Legacy** (HTTPException, most of the API):
+
+```json
+{
+  "detail": "Email already registered"
+}
+```
+
+**Pydantic validation** (422):
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "email"],
+      "msg": "value is not a valid email address",
+      "type": "value_error.email"
+    }
+  ]
+}
+```
+
+**AppError** (v2 billing, newer services):
+
+```json
+{
+  "error": "payment_required",
+  "detail": "Add a payment method before subscribing",
+  "request_id": "a1b2c3-...",
+  "extra": {"plan_id": "plan_xyz"}
+}
+```
+
+Clients should handle all three. The WebApp's `extractErrorMessage()` normalizes them (see [API client](/webapp/api-client)).
+
+## Status code reference
+
+| Code | Name | When |
+|------|------|------|
+| `200` | OK | Success |
+| `201` | Created | New resource |
+| `202` | Accepted | Change pending webhook confirmation |
+| `204` | No Content | DELETE succeeded |
+| `400` | Bad Request | Malformed input or rejected business rule |
+| `401` | Unauthorized | Missing / invalid / expired JWT or agent token |
+| `402` | Payment Required | Subscription expired, token balance exhausted, feature requires paid tier |
+| `403` | Forbidden | Authenticated but not allowed (ownership, admin-only, tier gate, safety block) |
+| `404` | Not Found | Resource missing or not yours |
+| `409` | Conflict | State clash — duplicate device, already-rated ticket, plan change in progress |
+| `410` | Gone | Underlying sandbox/device is gone |
+| `422` | Unprocessable Entity | Pydantic validation |
+| `423` | Locked | Device or Cloud PC busy with another action |
+| `429` | Too Many Requests | Rate limit; check `Retry-After` header (not always set) |
+| `500` | Server Error | Unexpected; check `request_id` and retry |
+| `501` | Not Implemented | Stub endpoint (admin refresh, admin me) |
+| `502` | Bad Gateway | Stripe, upstream API failed |
+| `503` | Service Unavailable | Feature disabled, Stripe/Redis/DB unreachable |
+| `504` | Gateway Timeout | Action submitted but device didn't respond in time |
+
+## By domain
+
+### Common (all endpoints)
+
+- `401 "Could not validate credentials"` — missing/invalid JWT. Refresh via `/auth/token`.
+- `401 "Invalid agent token"` — agent endpoint called without `AGENT_API_TOKEN`.
+- `403 "Administrator privileges required"` — endpoint admin-only.
+- `403 "Not authorized"` — the resource belongs to another user.
+- `403 "Agent endpoints are internal-only"` — `/agent/*`, `/knowledge/*`, `/safety/*` blocked from external ALB.
+- `422` — Pydantic validation; `detail` array points at the invalid field.
+- `500 "Internal server error"` — global exception handler fired; include `request_id` in bug reports.
+
+### Authentication (`/auth/*`)
+
+- `400 "Email already registered"`
+- `400 "This email is already registered using {Provider}. Please sign in with {Provider}."`
+- `400 "Invite code is required for registration"` — when `REGISTRATION_MODE=invite_only`
+- `400 "Invalid invite code"` / `"This invite code has been deactivated"` / `"...has already been used"` / `"...has expired"`
+- `401 "Incorrect email or password"` — login failure (no user enumeration)
+- `429` — login 20/15min, forgot-password 3/hour, reset-password 5/hour, all per IP
+
+### Devices
+
+- `409 "Device with token kid '{kid}' already exists"` — KID already registered to a different user
+- `423` — implicit; device busy with another agent action
+- `429` — KID rotation rate-limited (once per 5 minutes)
+
+### Chat sessions and messages
+
+- `404 "Session not found"`, `"Message not found"` — or belongs to another user
+- `400 "Session is not deleted"` — can't permanent-delete an active session
+- `409 Conflict` on `POST /messages` — device already locked by another session. Response body includes `active_session_id`
+
+### Billing
+
+- `402` with structured body `{error, message, action, reason, extra}` — subscription lapsed, tokens exhausted, card declined
+- `400 "Model profile not available on plan"`
+- `400 "Session not found"` / `"Plan not found"` / `"Invalid billing request"`
+- `400 "Failed to change plan"`
+- `404 "No active subscription"` — on cancel
+- `409 "Already on this plan"`
+- `503 "Payment system unavailable"` / `"Stripe not configured"` — Stripe API unreachable
+- Webhook: `400 "Missing signature"` / `"Invalid signature"` — Stripe webhook HMAC failure
+
+### Cloud PC
+
+- `503 "Cloud PC feature is disabled"` — `CLOUD_PC_ENABLED=false`
+- `402 "Insufficient tokens for Cloud PC"` — balance too low
+- `409 "Cloud PC is not active"` — connect called on non-ACTIVE instance
+- `409 "Can only delete Cloud PC in 'deleted' state"` — need to soft-delete first
+- `410` — underlying E2B sandbox is gone
+- `404 "Cloud PC not found"`
+
+### E2B sandboxes
+
+- `400 "Device type must be 'e2b_sandbox'"`
+- `404 "Sandbox not found"` / `403 "Sandbox does not belong to current user"`
+- `500 "Sandbox operation failed"` — E2B API error
+
+### Knowledge base
+
+- `400` bad format / validation
+- `403` ownership check failed
+- `404 "Knowledge item not found"`
+- `500 "Storage service unavailable"` — S3/DB transient
+
+### MCP integrations
+
+- `400 "Invalid parameters"` / `"Required scope missing"`
+- `404 "No active connection found for '{provider}'"` — need to connect first
+- `502 "OAuth provider unavailable"`
+- `503 "MCP service unavailable"` / `"MCP tool execution failed"`
+
+### Invites
+
+- `400 "Count must be between 1 and 100"` — on batch create
+- `400 "Invite code is already inactive"` — deactivate on already-deactivated
+
+### Admin
+
+- `501 "Not implemented"` — `/admin/api/auth/refresh`, `/admin/api/auth/me`
+- `400 "Email already registered"` — create user
+- `404 "Role not found"`, `"Plan not found"`, `"Session not found"`
+- `409 "View with slug '{slug}' already exists"` — admin landing view create
+- `400 "Cannot delete default view"` — admin landing view delete
+- `502 / 504` — admin prod proxy timeout / upstream error
+
+### Connectors (custom)
+
+- `400 "server_url is required for custom_mcp connectors"`
+- `400 "Invalid server URL: {details}"` — SSRF validation rejected it
+
+### Screenshots
+
+- `500 "Failed to upload screenshot"` — S3/MinIO failure
+- `404 "Screenshot not found"` / `403 "Access denied"`
+
+### Helpdesk
+
+- `400 "Invalid rating"` — rating must be 1–5
+- `409 Conflict` — ticket already rated
+- `404 "Ticket not found"`
+
+## Retry strategy
+
+<Warning>
+**Retryable**: `429`, `502`, `503`, `504`. Exponential backoff with jitter, cap at `Retry-After` when present.
+
+**Non-retryable**: `400`, `401`, `403`, `404`, `409`, `422`. Retrying without changing the request wastes load.
+</Warning>
+
+Starting point: 500ms initial, multiplier 2, max 30s, max 5 attempts.
+
+```python
+for attempt in range(5):
+    try:
+        return await call()
+    except HttpClientError as e:
+        if e.status not in {429, 502, 503, 504}:
+            raise
+        if attempt == 4:
+            raise
+        wait = min(30, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5)
+        await asyncio.sleep(wait)
+```
+
+## Known inconsistencies
+
+<Note>
+**Two error formats in flight.** Legacy `HTTPException` raises `{detail}`. Newer `AppError` subclasses in `core/exceptions.py` raise `{error, message, request_id, ...}`. Migration is ongoing — handle both.
+</Note>
+
+<Note>
+**`str(e)` leaks internal messages.** Some routers raise `HTTPException(status_code=400, detail=str(e))`. The `detail` can include stack hints or internal error classes. Don't parse these strings for branching logic; use status codes + structured fields.
+</Note>
+
+<Note>
+**No `Retry-After` header on 429.** Rate limits return 429 but don't yet set the header. Use the fixed windows documented per endpoint to back off.
+</Note>
+
+<Note>
+**Generic 500 "Operation failed".** Several admin routers raise `status_code=500, detail="Operation failed"` without context. Correlate with Loki logs using the `request_id` header.
+</Note>
+
+## Middleware and global handlers
+
+- `internal_guard` middleware returns 403 on `/agent/*`, `/knowledge/*`, `/safety/*` from external ALB traffic
+- `logging_middleware` tags every request with a `request_id` and logs duration + status
+- Global `@app.exception_handler(Exception)` catches unhandled → 500 with `{detail, request_id}`
+- `/ready` returns 503 if DB or Redis are unavailable; `/health` is lighter (process alive)
+
+## See also
+
+- [Authentication](/guides/authentication) — 401 / 403 details
+- [Billing](/concepts/billing) — 402 response shape
+- [Devices](/concepts/devices) — 409 / 423 / 429 on KID rotation
+- [API client](/webapp/api-client) — `extractErrorMessage()` normalizer

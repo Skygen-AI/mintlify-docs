@@ -1,0 +1,120 @@
+---
+title: "Tasks"
+description: "Discrete chat-linked work units with a lifecycle — not to be confused with scheduled tasks."
+---
+
+A **task** is a lightweight work item created during a chat session, linked to a chat message, with its own status lifecycle. It is distinct from [Scheduled tasks](/guides/scheduled-tasks) (cron-based recurring runs).
+
+You use tasks when the agent needs to track a discrete action (e.g., "verify email", "generate report") that has its own lifecycle, might run longer than a message turn, and may need resumption.
+
+## Model
+
+```python
+class Task(Base):
+    id: UUID
+    user_id: FK → users
+    device_id: FK → devices
+    status: str  # enum string
+    title: str
+    description: Optional[str]
+    payload: dict  # JSON, task-type specific
+    idempotency_key: str  # globally unique
+    has_safety_violation: bool = False
+    evaluation_completed: bool = False
+    created_at, updated_at
+```
+
+ChatMessage has a nullable `task_id` FK. A task can accumulate multiple messages over its lifetime.
+
+## Status lifecycle
+
+```
+CREATED → QUEUED → ASSIGNED → SENT → IN_PROGRESS
+                                          │
+                  ┌───────────────────────┤
+                  ▼                       ▼
+            TASK_RUNNING             TASK_WAITING
+                  │                       │
+                  ▼                       ▼
+        AWAITING_CONFIRMATION       (any of below)
+                  │
+                  ▼
+      COMPLETED | TASK_COMPLETED
+        | FAILED | CANCELLED
+        | AUTO_CANCELLED | TIMEOUT
+```
+
+Skygen does not enforce valid transitions — the agent can set any status. Be consistent in your own pipelines.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/tasks` | Create (requires idempotency_key) |
+| `GET` | `/tasks` | List user's tasks. `limit` 1–200, `offset` |
+| `GET` | `/tasks/{id}` | Fetch one |
+| `PATCH` | `/tasks/{id}` | Update status, title, description, payload |
+| `DELETE` | `/tasks/{id}` | Delete |
+
+All require JWT auth and enforce ownership (or admin).
+
+## Create
+
+```bash
+curl -X POST https://api.skygen.ai/tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "device_id": "dev_abc",
+    "title": "Verify email address",
+    "description": "Check if user@example.com is valid",
+    "payload": {"email": "user@example.com"},
+    "idempotency_key": "verify-email-user-123"
+  }'
+# → 201 { "id": "task_xyz", "status": "CREATED", ... }
+```
+
+Analytics event `task_created` is tracked (non-blocking — failures log a warning).
+
+## Idempotency
+
+`idempotency_key` is **globally unique** (not scoped per user). Re-posting the same key with the same body returns the existing task rather than creating a duplicate. Use namespaces to avoid collisions:
+
+- ✅ `verify-email-user-123-2026-04-20`
+- ❌ `verify-email` (likely to collide)
+
+## Update
+
+```bash
+curl -X PATCH https://api.skygen.ai/tasks/task_xyz \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status": "COMPLETED"}'
+```
+
+Partial updates; only fields in the request body change.
+
+## Safety and evaluation fields
+
+- `has_safety_violation` — set to `true` if the agent's safety layer flagged the task. Read by internal evaluators.
+- `evaluation_completed` — set by the agent trajectory evaluator once it's graded the run.
+
+Neither has a dedicated endpoint — they're mutated by internal workers.
+
+## Gotchas
+
+<Note>
+**Status is a string, not a DB enum.** Legacy tasks may have unexpected strings. If your client branches on status, include a fallback.
+</Note>
+
+<Note>
+**Payload has no schema.** Task type A and B can share the `tasks` table with completely different payload shapes. Document your payload shapes externally.
+</Note>
+
+<Note>
+**Device FK is enforced.** Task creation fails if `device_id` doesn't exist or belongs to another user.
+</Note>
+
+## See also
+
+- [Chat sessions](/concepts/chat-sessions) — tasks link to messages via `task_id`
+- [Scheduled tasks](/guides/scheduled-tasks) — recurring tasks
+- [Devices](/concepts/devices) — where tasks execute

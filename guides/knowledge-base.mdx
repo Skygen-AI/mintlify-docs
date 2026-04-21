@@ -1,0 +1,154 @@
+---
+title: "Knowledge base"
+description: "Long-term memory for agents — documents, embeddings, vector search, and copy-on-write globals."
+---
+
+The knowledge base is Skygen's long-term memory layer. Agents save "insights" (passages, facts, observations), retrieve them by semantic similarity during reasoning, and share a global pool of knowledge across users via a copy-on-write model.
+
+## Data model
+
+Built on **`GeneralInsight`**, a single table that handles per-user and global knowledge:
+
+| Field | Purpose |
+|-------|---------|
+| `insight_id` (PK) | UUID |
+| `user_id` | FK-like string; can be a real user ID or literal `"global"` |
+| `agent_type` | Indexed tag (e.g. `orchestrator`, `planner`) |
+| `insight_type` | Free-form category string |
+| `global_insight_type` | Enum: `SOCIAL` or `TECHNICAL` |
+| `content` | The knowledge text |
+| `embedding` | 768-dim vector (Gemini embedding-001) |
+| `insight_metadata` | Arbitrary JSON |
+| `is_user_visible` | Hide internal insights from user-facing endpoints |
+| `overrides_global_id` | Copy-on-write pointer to a global insight this row overrides |
+| `is_tombstone` | Marks deletion without removing the row |
+| `created_at`, `updated_at` | Timestamps |
+
+Supporting tables: `trajectory_plans` (agent execution plans with embeddings), `task_evaluations` (task trajectory + LLM eval), `conversation_summaries` (session-level digests with keywords).
+
+## Authentication
+
+The KB uses a **shared bearer token** (`AGENT_API_TOKEN`), distinct from user JWTs:
+
+```bash
+curl https://api.skygen.ai/knowledge/retrieve \
+  -H "Authorization: Bearer $AGENT_API_TOKEN" \
+  -d '{"query": "...", "user_id": "...", "agent_type": "orchestrator", "num_insights": 5}'
+```
+
+User-facing endpoints (`/knowledge/insights`, `/knowledge/insights/{id}`) use normal user JWT auth — the KB exposes both surfaces.
+
+## Vector search
+
+- **Embedding model**: Gemini `embedding-001` (768 dims), called via `generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents`. Batch size 128.
+- **Fallback**: `OPENROUTER_EMBEDDING_MODEL` if `GEMINI_API_KEY` is unset.
+- **Distance metric**: pgvector cosine (`embedding <-> :query_vec`).
+- **Dedup**: on save, if an existing insight in the same `(user_id, insight_type)` has cosine distance `< 0.08`, Skygen updates the existing row instead of creating a duplicate.
+
+Query embeddings are computed on-the-fly; they are not pre-stored.
+
+## Copy-on-write (globals)
+
+Global insights (`user_id = "global"`) are visible to every user. When a user edits or deletes a global, Skygen does **not** mutate the shared row. Instead:
+
+- **Update** creates a new row with `user_id=<caller>` and `overrides_global_id=<global_id>`.
+- **Delete** creates a tombstone: a new row with `is_tombstone=true` and `overrides_global_id=<global_id>`.
+
+Retrieve queries filter globals out if the caller has an override or a tombstone. The global stays intact for everyone else.
+
+## Endpoints
+
+### Agent-authenticated (`Authorization: Bearer $AGENT_API_TOKEN`)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/knowledge/save` | Insert or upsert (dedup at distance `< 0.08`). Body: `{ agent_type, insight_type, global_insight_type, user_id, content, key?, metadata?, timestamp?, is_user_visible? }` |
+| `POST` | `/knowledge/update/{insight_id}` | Partial update; triggers CoW if target is global |
+| `POST` | `/knowledge/retrieve` | Vector search. Body: `{ query, agent_type, insight_type, user_id, num_insights }` |
+| `GET` | `/knowledge/read/{insight_id}` | Fetch one |
+| `DELETE` | `/knowledge/delete/{insight_id}` | Delete; CoW to tombstone if target is global |
+| `POST` | `/knowledge/save-summary` | Persist a conversation summary `{ user_id, session_id, summary_data }` |
+
+### User-authenticated (JWT)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/knowledge/insights` | List user's insights. `?global_insight_type`, `?max_insights`. Filters on `is_user_visible=true`. |
+| `GET` | `/knowledge/insights/{id}` | Fetch one |
+| `DELETE` | `/knowledge/delete_insight/{id}` | Delete |
+| `DELETE` | `/knowledge/insights/all` | Bulk delete (`?global_insight_type` filter) |
+
+## Agent retrieval
+
+<Note>
+**Retrieval is not automatic.** Despite what the old docs said, agents query the KB **explicitly** via `POST /knowledge/retrieve`. There is no implicit context injection during reasoning loops. The Evaluation Layer does auto-save insights after tasks via `TrajectoryEvaluator`, but retrieval is agent-initiated.
+</Note>
+
+Typical usage:
+
+```python
+# Inside the agent
+client = KnowledgeStorageClient(base_url=..., token=AGENT_API_TOKEN)
+hits = await client.retrieve(
+    query="How did I deploy to staging last time?",
+    agent_type="orchestrator",
+    insight_type="deployment_runbook",
+    user_id=session.user_id,
+    num_insights=5,
+)
+for hit in hits:
+    # hit.content, hit.metadata, hit.distance
+    ...
+```
+
+## Scope
+
+- **User isolation**: enforced by `user_id` equality. Global (`"global"`) is readable by everyone.
+- **Organization scope**: not implemented. There is no org table, no `org_id` field. Single-tenant within a user.
+- **Session scope**: not a KB concept — session-specific notes belong in `ChatMessage.meta_data` or `conversation_summaries`.
+
+## Limits and knobs
+
+- **Max document size**: not enforced at the KB layer. `FILE_PARSE_MAX_SIZE_MB` (default 100 MB) gates upstream file ingestion.
+- **Max docs per user**: no quota.
+- **Rate limits**: none on KB endpoints.
+- **Dedup threshold**: 0.08 cosine distance (hardcoded).
+- **Soft-forget threshold**: 0.15 ranking score (agent-side policy, not backend-enforced).
+- **Hard-forget threshold**: 0.05 ranking score (agent-side).
+
+## Working example
+
+```bash
+# Save
+curl -X POST https://api.skygen.ai/knowledge/save \
+  -H "Authorization: Bearer $AGENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_type": "orchestrator",
+    "insight_type": "deployment_runbook",
+    "global_insight_type": "TECHNICAL",
+    "user_id": "user_123",
+    "content": "To deploy staging: push to `develop`, watch GitHub Actions, verify at dev.skygen.ai."
+  }'
+
+# Retrieve
+curl -X POST https://api.skygen.ai/knowledge/retrieve \
+  -H "Authorization: Bearer $AGENT_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "how do I deploy",
+    "agent_type": "orchestrator",
+    "insight_type": "deployment_runbook",
+    "user_id": "user_123",
+    "num_insights": 3
+  }'
+
+# User lists their own
+curl https://api.skygen.ai/knowledge/insights \
+  -H "Authorization: Bearer $USER_JWT"
+```
+
+## See also
+
+- [Authentication](/guides/authentication) — API key management
+- [Chat sessions](/concepts/chat-sessions) — session summaries via `save-summary`

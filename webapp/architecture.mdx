@@ -1,0 +1,114 @@
+---
+title: "WebApp architecture"
+description: "Platform shell pattern — thin WebApp wrapper, shared ui-shared-tauri submodule, cross-platform adapter."
+---
+
+Skygen's web and desktop clients share 95% of their code through a **platform shell pattern**. `WebApp/` is a thin ~50-line wrapper that bootstraps `ui-shared-tauri/` — the git submodule that holds all pages, stores, API clients, components, and hooks. Desktop variants (`AppDemo-MacOS`, `AppDemo-Win`) follow the same pattern.
+
+## Three variants, one core
+
+| | WebApp | AppDemo-MacOS | AppDemo-Win |
+|---|--------|---------------|-------------|
+| Platform | Browser | Tauri + Swift | Tauri + Rust |
+| Desktop automation | No | CGEvent, CGImage | SendInput, DXGI |
+| Secure storage | localStorage | Keychain | Windows Credential Manager |
+| OAuth window | Same-tab redirect | Native Safari window | Native browser |
+| UI layer | React 18 + Vite → ui-shared-tauri | → ui-shared-tauri | → ui-shared-tauri |
+
+All three share pages, Zustand stores, HTTP + Socket.IO clients, Stripe integration, and theme.
+
+## Folder layout
+
+```
+WebApp/
+├── src/                          # Thin wrapper, ~50 lines
+│   ├── main.tsx                  # Bootstrap + render
+│   ├── config/api.ts             # BACKEND_URL, WS_URL from VITE_* envs
+│   ├── platform/
+│   │   └── webPlatformAdapter.ts # IPlatformAdapter for browser
+│   └── styles/globals.css
+├── ui-shared-tauri/              # Git submodule (separate repo)
+│   └── src/
+│       ├── init/bootstrap.ts     # Stores global config + platform
+│       ├── api/                  # HTTP client + Socket.IO manager
+│       ├── store/                # 10 Zustand slices
+│       ├── pages/                # All page components
+│       ├── components/           # Reusable UI
+│       ├── hooks/                # Custom hooks
+│       └── types/                # TypeScript interfaces
+├── index.html
+├── vite.config.ts
+└── tailwind.config.js            # content: ["./ui-shared/**"]
+```
+
+## Entry point flow
+
+**`WebApp/src/main.tsx`** is the entire web-side bootstrap:
+
+```tsx
+import { bootstrap, App } from "../ui-shared-tauri/src";
+import { API_CONFIG } from "./config/api";
+import { webPlatformAdapter } from "./platform/webPlatformAdapter";
+
+bootstrap({
+  apiConfig: {
+    BACKEND_URL: API_CONFIG.BACKEND_URL,
+    WS_URL: API_CONFIG.WS_URL,
+    STRIPE_PUBLISHABLE_KEY: API_CONFIG.STRIPE_PUBLISHABLE_KEY,
+  },
+  platform: webPlatformAdapter,
+});
+
+ReactDOM.createRoot(document.getElementById("root")!).render(<App />);
+```
+
+**`ui-shared-tauri/src/init/bootstrap.ts`** stores the config globally. `getApiConfig()` and `getPlatform()` are used by the HTTP client, Socket.IO manager, secure storage, and desktop automation. Deferred access prevents circular imports.
+
+## Environment variables (WebApp)
+
+Vite requires `VITE_` prefix for client-exposed vars. Changes require a rebuild:
+
+| Var | Purpose |
+|-----|---------|
+| `VITE_BACKEND_URL` | Backend API (e.g. `https://api.skygen.ai`) |
+| `VITE_WS_URL` | Socket.IO endpoint (e.g. `wss://api.skygen.ai`) |
+| `VITE_STRIPE_PUBLISHABLE_KEY` | Stripe publishable (`pk_live_…`) |
+| `VITE_GTM_ID` | Google Tag Manager container ID |
+| `VITE_GOOGLE_ADS_ID` | Google Ads conversion tracking ID |
+
+Resolved in `src/config/api.ts` with sensible defaults.
+
+## What's shared vs platform-specific
+
+**Shared (ui-shared-tauri):**
+- Pages: `LoginPage`, `RegisterPage`, `ChatPage`, `PricingPage`, `HomeUpdated`, `HelpdeskPage`, all the rest
+- Zustand stores: auth, sessions, messages, devices, billing, UI, notifications, helpdesk, cloud-pc, scheduled-tasks
+- HTTP modules: `authApi`, `sessionApi`, `deviceApi`, `billingApi`, `connectorsApi`, and more
+- Socket.IO client with namespace subscriptions
+- Stripe Elements wiring
+- Dark/light theme, form validation, error handling
+
+**Platform-specific (per wrapper):**
+- Desktop automation (macOS/Windows only)
+- Secure token storage (native keychains vs localStorage)
+- Auto-update mechanism
+- System overlay for desktop actions
+- Device websocket (broker) connection
+
+## Adding a new platform
+
+Create a sibling wrapper (e.g. `ElectronApp/`) that:
+
+1. Defines an `IPlatformAdapter` implementation (see [Platform adapter](/webapp/platform-adapter))
+2. Imports `bootstrap` and `App` from the `ui-shared-tauri` submodule
+3. Passes its adapter into `bootstrap({ platform: ... })`
+4. Handles its own packaging and deploy pipeline
+
+That is the full integration work. Pages, API calls, and state all come from the submodule.
+
+## See also
+
+- [State management](/webapp/state-management) — Zustand slices
+- [API client](/webapp/api-client) — HTTP + Socket.IO
+- [Platform adapter](/webapp/platform-adapter) — interface + implementations
+- [Pages](/webapp/pages) — every route

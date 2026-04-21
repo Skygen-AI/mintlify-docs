@@ -1,0 +1,168 @@
+---
+title: "Authentication"
+description: "JWT tokens, Google OAuth (web + mobile), email verification, invites, and admin auth."
+---
+
+Skygen has three kinds of credentials, each for a different surface:
+
+- **User JWT** — how your app calls the REST API.
+- **API key** — how agent/KB endpoints authenticate (via `AGENT_API_TOKEN`).
+- **Device KID** — a Key ID bound to a registered device, used in Socket.IO handshakes.
+
+## Token lifecycle
+
+<Warning>
+**No refresh tokens.** Skygen issues long-lived 30-day access tokens and does not implement a separate refresh flow. Users log back in when the token expires, or after a password change (which invalidates all tokens issued before `password_changed_at`).
+</Warning>
+
+- **Algorithm**: HS256
+- **Expiry**: 30 days (43,200 minutes) from `ACCESS_TOKEN_EXPIRE_MINUTES`
+- **Payload**: `{ sub: user_id, email, is_admin, exp, iat }`
+- **Secret**: `SECRET_KEY` env var, minimum 32 chars (enforced by settings validator)
+
+## Sign up
+
+```bash
+curl -X POST https://api.skygen.ai/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "you@example.com",
+    "password": "strong-password",
+    "invite_code": "optional-required-if-invite-mode"
+  }'
+```
+
+- If `REGISTRATION_MODE=invite_only`, `invite_code` is required and validated (active, unused, not expired).
+- A 24-hour verification token is emailed on success.
+- Response: `UserRead` (201 Created).
+
+<Info>
+**Email verification is optional.** Users can log in immediately after signup; `is_email_verified` is a flag, not a gate.
+</Info>
+
+## Log in
+
+```bash
+curl -X POST https://api.skygen.ai/auth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=you@example.com&password=strong-password"
+# → { "access_token": "eyJ...", "token_type": "bearer" }
+```
+
+Rate-limited to 20 requests per 15 minutes per IP.
+
+## Password reset
+
+```bash
+# Step 1 — request a reset link (always 202, never leaks whether the email exists)
+curl -X POST https://api.skygen.ai/auth/forgot-password \
+  -d '{"email": "you@example.com"}'
+
+# Step 2 — reset with the token from the email (15-minute TTL)
+curl -X POST https://api.skygen.ai/auth/reset-password \
+  -d '{"token": "eyJ...", "new_password": "new-strong-password"}'
+```
+
+Rate limits: forgot-password 3/hour, reset-password 5/hour, both per IP.
+
+## Google OAuth
+
+### Web (redirect flow)
+
+<Steps>
+  <Step title="Start">
+    `POST /auth/google` → redirect to Google consent with a 10-minute state token and `scope=openid email profile`.
+  </Step>
+  <Step title="Callback">
+    `GET /auth/google/callback?code=&state=` — backend exchanges the code for an ID token, verifies it against `GOOGLE_CLIENT_ID`, matches or creates the user, then redirects to `FRONTEND_URL/auth/google/callback?token={jwt}&is_new={bool}`.
+  </Step>
+  <Step title="Attach tracking (new users only)">
+    Your frontend calls `PATCH /auth/update-registration-meta` with GA/UTM data collected pre-redirect so analytics attribution is preserved.
+  </Step>
+</Steps>
+
+### Mobile (ID token flow)
+
+```bash
+curl -X POST https://api.skygen.ai/auth/google-mobile/token \
+  -d '{"id_token": "raw-google-id-token-from-sdk"}'
+# → { "access_token": "eyJ...", "token_type": "bearer" }
+```
+
+The backend validates the ID token's `aud` against any of `GOOGLE_CLIENT_ID`, `GOOGLE_ANDROID_CLIENT_ID`, or `GOOGLE_IOS_CLIENT_ID`, so one endpoint serves both Android and iOS apps.
+
+## Invite system
+
+When `REGISTRATION_MODE=invite_only`, users must supply a valid `invite_code` at signup. Any authenticated user can issue invites for others.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/invites/my` | Create invite (`expires_at`, `note`) |
+| `GET` | `/invites/my` | List own invites. `?is_active`, `?used` filters. |
+| `GET` | `/invites/my/{code}` | Details (creator only) |
+| `POST` | `/invites/my/{code}/deactivate` | Revoke (creator only) |
+
+## User endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/users/me` | Current user |
+| `PATCH` | `/users/me` | Update (privilege-escalation-safe: admin flags stripped) |
+| `DELETE` | `/users/me` | Soft-delete own account (sets `is_active=false`) |
+
+## Device KID
+
+Devices authenticate Socket.IO sessions with a `device_token_kid` assigned by `POST /devices`. The KID is rotatable via `POST /devices/{id}/rotate` (rate-limited to once per 5 minutes). See [Devices](/concepts/devices) for the full model.
+
+<Note>
+The device KID is not a standalone credential — Socket.IO connections still require a valid user JWT. The KID identifies the device session but does not authorize it.
+</Note>
+
+## API key (agent/KB)
+
+Agent-side services use a shared bearer token from `AGENT_API_TOKEN`:
+
+```bash
+curl https://api.skygen.ai/knowledge/retrieve \
+  -H "Authorization: Bearer $AGENT_API_TOKEN"
+```
+
+Generated and managed out of band (env var / secret manager). See [Knowledge base](/guides/knowledge-base).
+
+## Admin auth
+
+Admins log in through a separate endpoint:
+
+```bash
+curl -X POST https://api.skygen.ai/admin/api/auth/login \
+  -d '{"login": "admin-email@skygen.ai", "password": "..."}'
+```
+
+Two auth paths:
+
+- **Superadmin** — static credentials from env (`SUPERADMIN_LOGIN` fixed to `"admin"`, `SUPERADMIN_PASSWORD` from `$DOCS_PASSWORD` or `$PROD_ADMIN_PASS`). Token flags `is_superadmin: true`. No DB user record.
+- **DB admin** — email + password, user must have `is_admin=true` or a non-null `admin_role_id`. Token includes `role` (e.g. `admin`, custom role name).
+
+Admin tokens expire in **24 hours** (not 30 days).
+
+## 2FA
+
+Endpoint stubs exist (`/auth/setup-2fa`, `/auth/verify-2fa`, `/auth/2fa-status`) for backward compatibility but are **disabled** — status always returns `is_enabled: false`. Preserved for future re-enablement.
+
+## Rate limits summary
+
+| Endpoint | Limit | Window |
+|----------|-------|--------|
+| `POST /auth/token` | 20 | 15 min / IP |
+| `POST /auth/google-mobile/token` | 20 | 15 min / IP |
+| `POST /auth/forgot-password` | 3 | 1 hour / IP |
+| `POST /auth/reset-password` | 5 | 1 hour / IP |
+| `POST /files/parse` | 30 | 1 min / user |
+
+Limits are disabled in dev (`ENVIRONMENT` check in `rate_limit.py`).
+
+## See also
+
+- [Devices](/concepts/devices) — device KID
+- [Errors](/errors) — `401` and `403` responses
+- [Knowledge base](/guides/knowledge-base) — API key usage

@@ -1,0 +1,213 @@
+---
+title: "Automate a Cloud PC from Python"
+description: "Full end-to-end script — auth, provision, stream, send prompt, retrieve screenshots."
+---
+
+This tutorial shows the full flow to drive a Cloud PC from a Python script. You will authenticate, create a Cloud PC, link it as a device, open a session, send a prompt ("open Firefox and go to example.com"), watch the agent work in real time, and retrieve screenshots.
+
+<Info>
+**Prereqs.** Python 3.10+, `httpx` and `python-socketio>=5`. A Skygen account with billing (Cloud PC is paid). `CLOUD_PC_ENABLED=true` on the deployment.
+</Info>
+
+Install:
+
+```bash
+pip install httpx python-socketio
+```
+
+## 1. Authenticate
+
+```python
+import httpx
+
+API = "https://api.skygen.ai"
+EMAIL = "you@example.com"
+PASSWORD = "strong-password"
+
+res = httpx.post(
+    f"{API}/auth/token",
+    data={"username": EMAIL, "password": PASSWORD},
+    headers={"Content-Type": "application/x-www-form-urlencoded"},
+)
+TOKEN = res.json()["access_token"]
+```
+
+## 2. Create the Cloud PC
+
+```python
+res = httpx.post(
+    f"{API}/cloud-pc/connect",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"name": "Python automation"},
+)
+body = res.json()
+cloud_pc_id = body["cloud_pc_id"]
+stream_url = body["stream_url"]
+```
+
+## 3. Wait for `ACTIVE`
+
+```python
+import time
+
+while True:
+    res = httpx.get(
+        f"{API}/cloud-pc/status?cloud_pc_id={cloud_pc_id}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    status = res.json()["status"]
+    if status == "active":
+        break
+    if status in {"error", "terminated"}:
+        raise RuntimeError(f"Cloud PC failed: {status}")
+    time.sleep(2)
+```
+
+## 4. Link as a device
+
+```python
+res = httpx.post(
+    f"{API}/cloud-pc/link-device",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"cloud_pc_id": cloud_pc_id},
+)
+device_id = res.json()["device_id"]
+```
+
+## 5. Create a session bound to the device
+
+```python
+res = httpx.post(
+    f"{API}/sessions",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"title": "Firefox demo", "device_id": device_id},
+)
+session_id = res.json()["id"]
+```
+
+## 6. Subscribe to progress (Socket.IO)
+
+```python
+import asyncio
+import socketio
+
+sio = socketio.AsyncClient()
+
+@sio.on("agent_response", namespace="/user")
+async def on_response(data):
+    print(f"assistant: {data['message']['content']}")
+
+@sio.on("ui_meta_update", namespace="/user")
+async def on_update(data):
+    p = data.get("payload", {})
+    print(f"[{p.get('mode')}/{p.get('stage')}] {p.get('title', '')}")
+
+@sio.on("mode_progress", namespace="/user")
+async def on_mode_progress(data):
+    print(f"mode={data['mode']} stage={data['stage']} progress={data.get('progress')}")
+
+async def main():
+    await sio.connect(
+        API.replace("https://", "wss://"),
+        auth={"token": TOKEN},
+        namespaces=["/user"],
+        transports=["websocket"],
+    )
+    await sio.wait()
+
+asyncio.run(main())
+```
+
+## 7. Send the prompt (from another process or thread)
+
+```python
+res = httpx.post(
+    f"{API}/sessions/{session_id}/messages",
+    headers={
+        "Authorization": f"Bearer {TOKEN}",
+        "agent_mode": "cua",
+    },
+    json={
+        "role": "user",
+        "content": "Open Firefox and navigate to example.com. Take a screenshot when the page finishes loading.",
+    },
+)
+```
+
+The agent picks up the message, opens Firefox on the Cloud PC, navigates, screenshots, and replies.
+
+## 8. Retrieve screenshots
+
+Agent screenshots upload directly to S3. Fetch the list:
+
+```python
+res = httpx.get(
+    f"{API}/screenshots/agent/session/{session_id}",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+)
+for s in res.json()["items"]:
+    print(s["step_number"], s["url"])  # presigned download URLs
+```
+
+## 9. Heartbeat (if the Cloud PC runs longer than a minute)
+
+While you're interacting, hit heartbeat every 60 seconds to keep the sandbox alive:
+
+```python
+httpx.post(
+    f"{API}/cloud-pc/heartbeat",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"cloud_pc_id": cloud_pc_id, "is_active": True},
+)
+```
+
+Each heartbeat deducts 1 token (~0.0069 USD).
+
+## 10. Pause and terminate
+
+```python
+# Pause (backs up state, keeps backup for 30 days)
+httpx.post(
+    f"{API}/cloud-pc/disconnect",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"cloud_pc_id": cloud_pc_id},
+)
+
+# ... later, resume is fast (3-10s)
+httpx.post(
+    f"{API}/cloud-pc/connect",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    json={"cloud_pc_id": cloud_pc_id},
+)
+
+# Or terminate permanently
+httpx.delete(
+    f"{API}/cloud-pc/{cloud_pc_id}",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+)
+```
+
+## Common mistakes
+
+<Warning>
+**402 on `POST /cloud-pc/connect`.** Your account lacks a payment method or has insufficient tokens. Add a card and buy credit, or set a subscription override as admin.
+</Warning>
+
+<Note>
+**Status stuck at `CREATING` > 5 minutes.** Background recovery marks stale transitions as `TERMINATED` after 5 minutes. Retry the connect call — you'll get a fresh instance.
+</Note>
+
+<Note>
+**No `ui_meta_update` events.** Verify your Socket.IO connection is in the `/user` namespace and authenticated with a valid token. WebSocket disconnects on token expiry.
+</Note>
+
+<Note>
+**"Operation already in progress" (409).** Another connect or disconnect is running. The lock self-releases after 60 seconds. Wait and retry.
+</Note>
+
+## What to read next
+
+- [Cloud PC](/concepts/cloud-pc) — full lifecycle and pricing
+- [Devices](/concepts/devices) — device model
+- [Chat sessions](/concepts/chat-sessions) — Socket.IO event catalog
+- [Agent modes](/concepts/agent-modes) — when to use `cua` vs `auto`

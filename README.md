@@ -1,55 +1,89 @@
-# Mintlify Starter Kit
+# Skygen Documentation
 
-Use the starter kit to get your docs deployed and ready to customize.
+Public documentation for Skygen — an AI agent automation platform. Deployed via Mintlify.
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+## Structure
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+```
+mintlify-docs/
+├── docs.json               # Mintlify site config (nav, theme, openapi wiring)
+├── index.mdx               # Landing page
+├── quickstart.mdx          # 5-minute onboarding
+├── errors.mdx              # Stripe-style error reference
+├── concepts/               # Core concept explanations
+│   ├── devices.mdx
+│   ├── chat-sessions.mdx
+│   ├── agents.mdx
+│   ├── confirmations.mdx
+│   ├── cloud-pc.mdx
+│   ├── billing.mdx
+│   ├── safety.mdx
+│   └── mcp-integrations.mdx
+├── guides/                 # How-to pages
+│   ├── authentication.mdx
+│   ├── connecting-integrations.mdx
+│   ├── custom-connectors.mdx
+│   ├── triggers.mdx
+│   ├── knowledge-base.mdx
+│   ├── scheduled-tasks.mdx
+│   └── screenshots.mdx
+├── api-reference/
+│   ├── introduction.mdx    # API reference intro
+│   └── (auto-generated from openapi.json by Mintlify at build time)
+├── openapi.json            # Exported from Backend (DO NOT edit by hand)
+└── AUDIT.md                # Backend annotation audit + fix roadmap
+```
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
-
-## AI-assisted writing
-
-Set up your AI coding tool to work with Mintlify:
+## Local development
 
 ```bash
-npx skills add https://mintlify.com/docs
-```
-
-This command installs Mintlify's documentation skill for your configured AI tools like Claude Code, Cursor, Windsurf, and others. The skill includes component reference, writing standards, and workflow guidance.
-
-See the [AI tools guides](/ai-tools) for tool-specific setup.
-
-## Development
-
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
-
-```
 npm i -g mint
-```
-
-Run the following command at the root of your documentation, where your `docs.json` is located:
-
-```
 mint dev
 ```
 
-View your local preview at `http://localhost:3000`.
+Opens a local preview at http://localhost:3000. Changes to MDX files hot-reload.
 
-## Publishing changes
+## OpenAPI reference
 
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
+The API Reference tab is **auto-generated from `openapi.json`**. That file is exported from the FastAPI backend.
 
-## Need help?
+### Re-generate locally
 
-### Troubleshooting
+```bash
+cd ../Backend
+poetry run python scripts/export_openapi.py
+```
 
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
+The script writes `../mintlify-docs/openapi.json`.
 
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
+### CI sync
+
+`Backend/.github/workflows/sync-openapi-docs.yml` runs on every push to `main`/`develop` that touches routers, schemas, or the export script. It exports `openapi.json` and commits it to this repo. A `DOCS_REPO_TOKEN` secret (a PAT with `contents: write` on this repo) must be configured in the Backend repo.
+
+## Annotation audit
+
+See [AUDIT.md](./AUDIT.md) for the prioritized list of Backend files that need annotation work to reach Stripe-level API docs. The short version: we are at ~20% coverage today; target is ≥ 90%.
+
+## Deployment
+
+Mintlify deploys automatically on push to `main` via the GitHub App installed on `skygen-ai/mintlify-docs`. Preview branches get their own URLs for review before merge.
+
+## Writing conventions
+
+Follow the Mintlify skill installed at `.agents/skills/mintlify/SKILL.md`:
+
+- Second-person voice ("you")
+- Sentence case headings
+- No marketing language ("powerful", "seamless", "robust")
+- Code blocks must have language tags
+- Internal links are root-relative without extension: `/concepts/devices`
+- Add new pages to `docs.json` navigation or they stay hidden
+
+## AI-assisted writing
+
+This repo has 3 Mintlify skills installed (`mintlify`, `mintlify-api`, `mintlify-docs`) via `npx skills add`. They work with Claude Code, Cursor, Copilot, Windsurf, and others. See `.agents/skills/` for the skill content.
+
+## Support
+
+- Docs issues: open a PR or issue on `skygen-ai/mintlify-docs`
+- Product support: support@skygen.ai

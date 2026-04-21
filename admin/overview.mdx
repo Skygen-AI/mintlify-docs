@@ -1,0 +1,234 @@
+---
+title: "Admin overview"
+description: "The Admin API surface — auth, users, billing overrides, plans, roles, helpdesk, landing views, and system health."
+---
+
+The `/admin/*` API is for platform operators (self-hosted deployments + Skygen staff). It covers 100+ endpoints across 18 sub-routers and is exposed through the separate `skygen-adminpanel` React app, not the user-facing WebApp. This page is the map.
+
+<Warning>
+Admin endpoints can grant tokens, override subscriptions, soft-delete users, and proxy to prod. Treat admin credentials like a root password. No Swagger UI is exposed by default; the admin panel is the only client.
+</Warning>
+
+## Authentication
+
+Two paths, both end with a 24-hour JWT:
+
+**Superadmin** (hardcoded):
+- Login: `admin` / `$PROD_ADMIN_PASS`
+- Token payload has `is_superadmin: true`, no DB user record
+- Cannot use features that require a real user (password reset, role assignment)
+
+**DB admin**:
+- Email + password, user must have `is_admin=true` or a non-null `admin_role_id`
+- Password checked with bcrypt + `secrets.compare_digest`
+
+```bash
+curl -X POST https://api.skygen.ai/admin/api/auth/login \
+  -d '{"login": "admin@skygen.ai", "password": "..."}'
+# → { "access_token": "eyJ...", "token_type": "bearer", "user": {...} }
+```
+
+<Note>
+Some older admin routers (users, subscriptions, analytics) still accept **HTTP Basic Auth** (`ADMIN_USERNAME`/`ADMIN_PASSWORD` env vars) as a fallback. Newer routers (billing, helpdesk, plans, library) are JWT-only.
+</Note>
+
+## Endpoint map
+
+### Authentication
+
+| Path | Purpose |
+|------|---------|
+| `POST /admin/api/auth/login` | Issue 24h JWT |
+| `POST /admin/api/auth/refresh` | Stub, 501 Not Implemented |
+| `GET /admin/api/auth/me` | Stub, 501 Not Implemented |
+
+### Users
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/users` | Paginated list, filters for email/active/admin/subscribed |
+| `POST /admin/api/users` | Create user (auto-verifies email) |
+| `PATCH /admin/api/users/{id}` | Toggle is_active, is_admin, is_email_verified |
+| `PATCH /admin/api/users/{id}/role` | Assign AdminRole |
+| `DELETE /admin/api/users/{id}` | Soft-delete (is_active=false) |
+| `DELETE /admin/api/users/{id}/permanent?confirm=true` | Hard-delete user + API costs + invites |
+| `GET /admin/api/users/{id}/details` | Full profile + recent 50 sessions |
+| `POST /admin/api/users/{id}/reset-password` | Force password change, invalidates existing tokens |
+| `DELETE /admin/api/users/{id}/sessions` | Soft-delete all user's chat sessions |
+
+### Billing
+
+| Path | Purpose |
+|------|---------|
+| `POST /admin/billing/set-subscription` | Bypass Stripe, set tier + days + plan_id |
+| `POST /admin/billing/grant` | Add tokens to balance |
+| `POST /admin/billing/deduct` | Subtract tokens |
+| `GET /admin/billing/user/{id}/status` | Tier, balance, stripe_id |
+| `GET /admin/billing/user/{id}/transactions` | Token transaction history |
+
+See [Billing](/concepts/billing) for the user-facing side.
+
+### Costs (LLM spend)
+
+| Path | Purpose |
+|------|---------|
+| `POST /admin/costs/record` | Log an API call + auto-deduct tokens (called by agent) |
+| `GET /admin/costs/user/{id}/summary` | Total calls, cost by model, over N days |
+| `GET /admin/costs/user/{id}/records` | Paginated call list |
+| `GET /admin/costs/session/{id}` | All calls in a session |
+| `GET /admin/costs/users/top` | Top N users by cost |
+| `GET /admin/costs/daily` | Daily cost breakdown |
+| `GET /admin/costs/stats/global` | Cluster-wide stats |
+
+### Plans
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/plans` | List (include_inactive filter) |
+| `POST /admin/api/plans` | Create plan (validates free-plan invariants, Stripe price uniqueness) |
+| `PUT /admin/api/plans/{id}` | Partial update |
+| `DELETE /admin/api/plans/{id}?hard_delete=false` | Soft or hard delete |
+| `GET /admin/api/plans/available-profiles` | Model profile options |
+| `GET /admin/api/plans/public/active` | Public (no auth): active + non-hidden plans |
+
+### Roles
+
+`AdminRole` supports wildcard permissions (`["*"]`) and granular (`["users:read", "billing:write"]`). **Currently not enforced at endpoint level** — all admins bypass checks. The framework is in place for future permission gating.
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/roles` | List roles with user counts |
+| `POST /admin/api/roles` | Create `{name, description, permissions}` |
+| `PUT /admin/api/roles/{id}` | Update |
+| `DELETE /admin/api/roles/{id}` | Delete (detaches from users first) |
+
+### Analytics
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/stats` | Counts (users, sessions, billing, plan breakdown) |
+| `GET /admin/analytics/charts?days=30` | Daily users/messages/sessions/subscriptions |
+| `GET /admin/analytics/retention` | Cohort retention (day 1, 7, 14, 30) |
+
+### System
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/health/status` | DB + Redis + RabbitMQ + WebSocket ping |
+| `GET /admin/api/health/metrics` | Messages/sessions last hour, load-test data |
+| `POST /admin/api/cache/clear?pattern=*` | Flush Redis keys |
+| `GET /admin/api/cache/stats` | Redis memory, keys, hit rate |
+| `GET /admin/api/db/connections` | Pool stats |
+| `GET /admin/api/logs/recent` | Placeholder (returns CloudWatch instructions) |
+| `/admin/api/prod/*` | Proxy any request to prod API (uses `PROD_ADMIN_USER`/`PROD_ADMIN_PASS`) |
+| `GET /admin/api/prod-status` | Check prod /health and /admin/api/stats |
+
+### Notifications
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/api/notifications` | List sent notifications with read counts |
+| `POST /admin/api/notifications/send` | Broadcast to all or specific user_ids, delivered via Socket.IO |
+| `GET /admin/api/notifications/{id}` | Delivery/read status per recipient |
+
+### Invites
+
+| Path | Purpose |
+|------|---------|
+| `POST /admin/invites` | Create single invite |
+| `POST /admin/invites/batch` | Bulk create (1–100) |
+| `GET /admin/invites` | List with filters |
+| `POST /admin/invites/{code}/deactivate` | Soft-deactivate |
+
+### Helpdesk
+
+20+ endpoints covering tickets, messages, SLA policies, KB articles, canned responses, attachments. See `admin/helpdesk.py` and [Helpdesk](/concepts/helpdesk).
+
+### Library (landing cards)
+
+| Path | Purpose |
+|------|---------|
+| `GET/POST/PUT/DELETE /admin/api/library/categories` | CRUD categories |
+| `GET/POST/PUT/DELETE /admin/api/library/cards` | CRUD cards (title, prompt, image, badge) |
+
+### Landing views (page constructor)
+
+`/admin/api/views/*` — ~20 endpoints for the landing-page constructor: views, templates, widgets, legal pages, deploy, video uploads. Configs are JSON; changes are pushed to landing backend via `POST /admin/api/views/deploy`.
+
+### Model profiles
+
+| Path | Purpose |
+|------|---------|
+| `GET/POST/PUT/DELETE /admin/api/model-profiles` | Customize model display names, badges, sort order |
+
+### System settings
+
+| Path | Purpose |
+|------|---------|
+| `GET /admin/system-settings` | Read runtime config |
+| `PUT /admin/system-settings/file-parse-max-size` | Change upload cap (1–100 MB) |
+
+### Landing stats, prompt stats, message ratings, session logs
+
+Per-domain read-only dashboards. `/admin/api/landing-stats`, `/admin/api/prompt-stats`, `/admin/api/message-ratings`, `/admin/api/sessions/{id}` + `/logs` (Loki query).
+
+## Common gotchas
+
+<Note>
+**Cascading hard delete.** `DELETE /admin/api/users/{id}/permanent?confirm=true` deletes the user + APICost + invites they created, but leaves chat sessions and messages as orphans. Handle carefully.
+</Note>
+
+<Note>
+**Billing dual-path.** `/admin/billing/grant` and `/admin/api/users/{id}/grant-tokens` do the same thing (backward compatibility). Prefer the newer `/admin/billing/` path.
+</Note>
+
+<Note>
+**Superadmin limits.** Synthetic user cannot be assigned roles, cannot reset own password, cannot own helpdesk tickets. Notes admins make get a `[superadmin]` prefix for audit.
+</Note>
+
+<Note>
+**No OpenAPI schema.** The admin panel calls endpoints directly; FastAPI's Swagger UI shows them but is not meant for external use. Treat the code as the source of truth.
+</Note>
+
+## Typical workflows
+
+### Grant promo tokens to a cohort
+
+```bash
+# Find users
+curl "$API/admin/api/users?search=@domain.com&limit=50" -H "Authorization: Bearer $TOKEN"
+
+# Grant each
+for user_id in $(...); do
+  curl -X POST "$API/admin/billing/grant" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"user_id\": \"$user_id\", \"amount\": 5000, \"description\": \"Promo Q1\"}"
+done
+```
+
+### Override subscription (bypass Stripe)
+
+```bash
+curl -X POST "$API/admin/billing/set-subscription" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"user_id": "...", "plan_id": "plan-uuid", "days": 30}'
+```
+
+### Send a broadcast
+
+```bash
+curl -X POST "$API/admin/api/notifications/send" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "title": "Maintenance window",
+    "message": "Upgrading infra Fri 2-3 UTC",
+    "category": "updates",
+    "target_type": "all"
+  }'
+```
+
+## See also
+
+- [Authentication](/guides/authentication) — admin vs user auth
+- [Billing](/concepts/billing) — what admin overrides affect
+- [Errors](/errors) — admin-specific status codes

@@ -1,0 +1,57 @@
+/* Skygen brand — matches ui-shared-tauri design tokens */
+
+:root {
+  --skygen-gradient: linear-gradient(90deg, #FF6863 0%, #D474E3 50%, #11A4FF 100%);
+  --skygen-slate-900: #0f172a;
+  --skygen-slate-800: #1e293b;
+  --skygen-slate-100: #f1f5f9;
+  --skygen-border: #e2e8f0;
+  --skygen-border-dark: #334155;
+  --skygen-radius: 0.5rem;
+}
+
+/* Hero-style gradient text on landing headings */
+.mintlify-hero h1,
+h1:has(+ p > em:first-child) {
+  background: var(--skygen-gradient);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-size: 200% auto;
+}
+
+/* Thin brand scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Slightly tighter card radius to match product */
+.card,
+[class*="card"] {
+  border-radius: var(--skygen-radius);
+}
+
+/* Inline code: subtle brand tint */
+:not(pre) > code {
+  border-radius: 4px;
+  padding: 0.125em 0.375em;
+  font-size: 0.9em;
+}

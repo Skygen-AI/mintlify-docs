@@ -1,0 +1,220 @@
+---
+title: "Environment variables"
+description: "Every setting the backend, worker, and agent read at startup — grouped by domain."
+---
+
+All configuration lives in `Backend/app/settings.py` as Pydantic `BaseSettings`, loaded from `.env` or real env vars in production. Prod secrets are synced from AWS Secrets Manager via ExternalSecrets.
+
+## Required in production
+
+These MUST be set or the service will not start correctly.
+
+| Var | Purpose |
+|-----|---------|
+| `SECRET_KEY` | JWT signing key, minimum 32 chars |
+| `AGENT_API_TOKEN` | Backend ↔ Agent shared bearer token |
+| `MCP_CRYPTO_KEY` | AES key for encrypting custom-connector secrets |
+| `DATABASE_URL` | PostgreSQL async connection string |
+| `RABBITMQ_URL` | RabbitMQ broker URL |
+| `REDIS_URL` | Redis for Socket.IO + caching |
+| `API_BASE_URL` | Public backend URL (for OAuth redirects) |
+| `BACKEND_URL` | Internal backend URL (worker → backend) |
+| `ALLOWED_ORIGINS` | CORS allowlist |
+| `ENVIRONMENT` | `development` or `production` |
+| `INTERNAL_SERVICE_TOKEN` | Inter-service auth (backend ↔ worker) |
+
+## Authentication
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `SECRET_KEY` | — | HS256 signing |
+| `ALGORITHM` | `HS256` | JWT algorithm |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `43200` (30 days) | Token TTL |
+| `REGISTRATION_MODE` | `open` | `open` or `invite_only` |
+| `CLIENT_VERSION_CHECK_ENABLED` | `true` | Enforce `MIN_CLIENT_VERSION` header |
+| `MIN_CLIENT_VERSION` | `1.0.0` | Minimum semver |
+
+### OAuth providers
+
+Google:
+
+| Var | Purpose |
+|-----|---------|
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Web OAuth |
+| `GOOGLE_ANDROID_CLIENT_ID` | Android app |
+| `GOOGLE_IOS_CLIENT_ID` | iOS app |
+
+Per-integration MCP OAuth clients (one pair each): `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `CALENDAR_*`, `DRIVE_*`, `DOCS_*`, `SHEETS_*`, `CONTACTS_*`, `YOUTUBE_*`.
+
+Also `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`, `SLACK_CLIENT_ID`/`SLACK_CLIENT_SECRET`/`SLACK_SIGNING_SECRET`, `MICROSOFT_CLIENT_ID`/`MICROSOFT_CLIENT_SECRET`.
+
+## Database and queues
+
+| Var | Purpose |
+|-----|---------|
+| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:5432/db` |
+| `RABBITMQ_URL` | `amqp://user:pass@host:5672/` |
+| `REDIS_URL` | `redis://host:6379/0` |
+| `SEND_MESSAGE_TO_AGENT_QUEUE` | Queue name, supports `{device_id}` placeholder |
+| `ANSWER_AGENT_QUEUE` | Response queue name |
+| `QUEUE_METRICS_ENABLED` | `true` in prod, disable locally to reduce noise |
+
+## Email
+
+Resend is preferred (set `RESEND_API_KEY`); SMTP is the fallback.
+
+| Var | Purpose |
+|-----|---------|
+| `MAIL_ENABLED` | Toggle all email sending |
+| `RESEND_API_KEY` | Resend API key |
+| `MAIL_SERVER` | SMTP host (MailHog local, `email-smtp.us-east-1.amazonaws.com` SES prod) |
+| `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD` | SMTP credentials |
+| `MAIL_FROM`, `MAIL_FROM_NAME` | Sender display |
+| `MAIL_STARTTLS`, `MAIL_SSL_TLS`, `USE_CREDENTIALS` | Transport options |
+| `FRONTEND_URL` | For password reset + verification links |
+
+### Resend campaigns
+
+| Var | Purpose |
+|-----|---------|
+| `RESEND_TRIGGERS_ENABLED` | Toggle campaign logic |
+| `RESEND_AUDIENCE_ID` | Main audience |
+| `RESEND_INACTIVE_AUDIENCE_ID` | Inactive users |
+| `RESEND_CHURNED_AUDIENCE_ID` | Churned users |
+| `USER_INACTIVITY_THRESHOLD_DAYS` | Days before inactive (default 3) |
+
+## Billing (Stripe)
+
+| Var | Purpose |
+|-----|---------|
+| `BILLING_ENABLED` | Toggle paywalls and token deduction |
+| `STRIPE_SECRET_KEY` | Server-side (`sk_live_…`) |
+| `STRIPE_PUBLISHABLE_KEY` | Client-side (`pk_live_…`), exposed to WebApp |
+| `STRIPE_WEBHOOK_SECRET` | For HMAC verification of Stripe webhooks |
+| `STRIPE_PRICE_ID_STANDARD` | Monthly subscription price ID |
+| `STRIPE_PRICE_ID_OVERAGE` | Metered overage price ID |
+| `STRIPE_METER_EVENT_NAME` | `token_overage` |
+| `SUBSCRIPTION_PRICE_USD` | Default `14.99` |
+| `MONTHLY_TOKENS_INCLUDED` | Default `2000` |
+| `TOKEN_MARGIN_MULTIPLIER` | Default `1.5` |
+| `TOKENS_PER_DOLLAR` | Default `131.58` |
+| `OVERAGE_PRICE_PER_TOKEN` | Default `0.0075` |
+
+## MCP / Integrations
+
+| Var | Purpose |
+|-----|---------|
+| `COMPOSIO_API_KEY` | Composio integration |
+| `COMPOSIO_WEBHOOK_SECRET` | HMAC for Composio webhooks |
+| `COMPOSIO_ENABLED` | Feature flag |
+| `KB_ENABLED` | Knowledge base toggle |
+| `SAFETY_ENABLED` | Safety checks toggle |
+
+### Telegram (custom provider)
+
+`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
+
+## Cloud PC
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `CLOUD_PC_ENABLED` | `false` | Feature gate |
+| `CLOUD_PC_S3_BUCKET` | `skygen-cloudpc-profiles` | Backup bucket |
+| `CLOUD_PC_TEMPLATE_ID` | `desktop` | E2B template |
+| `CLOUD_PC_AUTO_PAUSE_MINUTES` | `5` | Inactivity threshold |
+| `CLOUD_PC_MAX_IDLE_MINUTES` | `30` | Max idle before forced pause |
+| `CLOUD_PC_MAX_BACKUP_SIZE_MB` | `500` | Backup size cap |
+| `CLOUD_PC_COST_PER_HOUR_USD` | `0.1656` | Per-hour compute cost |
+| `CLOUD_PC_MARGIN_MULTIPLIER` | `2.5` | Markup |
+
+### E2B
+
+`E2B_API_KEY`, `E2B_DEFAULT_TIMEOUT` (default `3600s`).
+
+## Storage (S3/MinIO)
+
+| Var | Purpose |
+|-----|---------|
+| `MINIO_ENDPOINT` | S3 API endpoint |
+| `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | Credentials |
+| `MINIO_BUCKET` | Main artifacts bucket |
+| `ATTACHMENTS_BUCKET` | User files bucket |
+| `MINIO_PUBLIC_URL` | Public CDN URL |
+| `AWS_S3_REGION` | Default `us-east-1` |
+| `FILE_PARSE_MAX_SIZE_MB` | Default `10` |
+
+## Audio (RunPod Whisper)
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `RUNPOD_API_KEY` | — | RunPod API |
+| `RUNPOD_ENDPOINT_ID` | `worker-faster_whisper` | Endpoint |
+| `WHISPER_MODEL` | `turbo` | Model size |
+| `WHISPER_TRANSCRIPTION_FORMAT` | `plain_text` | Output format |
+| `WHISPER_ENABLE_VAD` | `true` | Voice activity detection |
+| `WHISPER_COST_PER_SECOND` | `0.0004` | Cost for billing |
+
+## Agent and Knowledge
+
+| Var | Purpose |
+|-----|---------|
+| `GEMINI_API_KEY` | Gemini 768-dim embeddings for KB |
+| `AGENT_API_TOKEN` | Backend ↔ Agent auth |
+| `AGENT_INTERNAL_URL` | Internal agent URL (playbook extraction) |
+
+## Analytics
+
+| Var | Purpose |
+|-----|---------|
+| `ANALYTICS_ENABLED` | Master toggle |
+| `GA4_MEASUREMENT_ID` | GA4 `G-XXXXXXXXXX` |
+| `GA4_API_SECRET` | Measurement Protocol |
+| `GA4_DEBUG_MODE` | Debug events |
+| `YANDEX_COUNTER_ID` | Yandex Metrica ID |
+| `AMPLITUDE_API_KEY` | Amplitude |
+
+## Monitoring / Logging
+
+| Var | Purpose |
+|-----|---------|
+| `ENABLE_METRICS` | Prometheus endpoint on `/metrics` |
+| `LOKI_URL` | `http://loki.monitoring.svc.cluster.local:3100` |
+| `GRAFANA_URL` | Public Grafana URL |
+| `LOG_LEVEL` | Default `INFO` |
+| `JSON_LOGS` | `true` in prod for Loki parsing |
+
+## Alerts
+
+| Var | Purpose |
+|-----|---------|
+| `RATING_ALERT_TELEGRAM_BOT_TOKEN` | Bot token |
+| `RATING_ALERT_TELEGRAM_CHAT_ID` | Chat ID for low ratings (≤2) |
+| `HELPDESK_TELEGRAM_CHAT_ID` | Chat ID for helpdesk alerts |
+
+## WebApp build-time vars (Vite)
+
+These compile into the bundle; changing them requires a rebuild.
+
+| Var | Purpose |
+|-----|---------|
+| `VITE_BACKEND_URL` | API host |
+| `VITE_WS_URL` | Socket.IO host |
+| `VITE_STRIPE_PUBLISHABLE_KEY` | Stripe.js |
+| `VITE_GTM_ID` | Google Tag Manager |
+| `VITE_GOOGLE_ADS_ID` | Google Ads tracking |
+
+## Secrets management
+
+Production: AWS Secrets Manager via ExternalSecrets operator.
+
+- `skygen/{env}/backend-secrets-us` — DB/Redis/RabbitMQ URLs, OAuth client pairs, billing keys
+- `skygen/{env}/backend-secrets-eu` — `SECRET_KEY`, `AGENT_API_TOKEN`, `MCP_CRYPTO_KEY`, `GEMINI_API_KEY`, `E2B_API_KEY`, `COMPOSIO_API_KEY`, MinIO, Stripe, Resend, Telegram
+- `skygen/{env}/monitoring-*` — Grafana admin, Alertmanager SMTP
+
+ExternalSecret CRDs sync changes into Kubernetes Secrets; pods pick them up on restart.
+
+## See also
+
+- [Deployment overview](/deployment/overview) — services and clusters
+- [Monitoring](/deployment/monitoring) — what these metrics feed
+- [Kubernetes](/deployment/k8s) — how secrets plug into pods

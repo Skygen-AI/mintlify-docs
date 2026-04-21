@@ -1,0 +1,200 @@
+---
+title: "Page catalog"
+description: "Every route in the WebApp — purpose, auth requirements, key state."
+---
+
+Every page in Skygen is a React component under `ui-shared-tauri/src/pages/`. Routes are declared in `App.tsx`. Public pages (login, register, OAuth callback) render directly. Protected pages wrap in `<ProtectedRoute><MainLayout>…</MainLayout></ProtectedRoute>`.
+
+## Public routes
+
+### `/login` — LoginPage
+
+**Component**: `src/pages/LoginPage.tsx`
+
+- Email + password form
+- "Forgot password?" opens `ForgotPasswordModal`
+- Google OAuth button (redirect via `IPlatformAdapter.openOAuthWindow`)
+- OTP challenge if the user has 2FA enabled
+
+**Flow**: email + password → `useAuth().login()` → store token via platform adapter → fetch `/users/me` → connect Socket.IO → redirect to `/`.
+
+### `/register` — RegisterPage
+
+**Component**: `src/pages/RegisterPage.tsx`
+
+Email, password, display name. Signup auto-logs in. Redirects to `/home` with `needsOTPSetup: true` to prompt 2FA configuration.
+
+### `/reset-password` — ResetPasswordPage
+
+User enters email → backend emails reset link → user clicks link → lands here with `?token=…` → enters new password → `POST /auth/reset-password?token=…`.
+
+### `/auth/google/callback` — GoogleCallbackPage
+
+Extracts `?code=…&state=…` from the URL, calls the backend, redirects to `/home`. On error stores `google_error` in the URL so `LoginPage` can surface it.
+
+## Protected routes
+
+All wrapped in `MainLayout` (sidebar + header + notifications bell).
+
+### `/` or `/home` — HomeUpdated (Dashboard)
+
+**Component**: `src/pages/HomeUpdated.tsx` (900+ lines)
+
+Session list + "new session" CTA + device picker (desktop only) + suggested prompts.
+
+Reads: `sessions`, `currentSessionId` from `useStore`. Loads sessions in `useEffect`.
+
+### `/sessions/:id` — ChatPage (main interface)
+
+**Component**: `src/pages/ChatPage.tsx` (2200+ lines)
+
+This is the hot path.
+
+```typescript
+const { messages, taskStatus, agentSteps, plan } = useStore((s) => ({
+  messages: s.messagesBySession[sessionId],
+  taskStatus: s.taskStatusBySession[sessionId],
+  agentSteps: s.agentStepsBySession[sessionId],
+  plan: s.planBySession[sessionId],
+}));
+```
+
+Real-time updates via Socket.IO:
+
+- `new_message` → append to `messagesBySession`
+- `task_progress` → update progress bar
+- `ui_meta_update` → show current action ("Running Python", "Creating file")
+- `agent_typing` → typing indicator
+
+UI components:
+
+- **TaskInput** — textarea + send + file upload
+- **UserMessage** / **AgentMessage** — chat bubbles
+- **AgentStepsProgress** — live action list (accordion)
+- **PlanProgress** — todo list
+- **ChooseDeviceModal** / **AddDeviceModal** — device picker
+- **ConfirmationsModal** — agent asks for approval
+- **McpConnectPrompt** — "Connect your Slack to use this tool"
+
+Message sending:
+
+```typescript
+const { success, error } = await useChat().sendMessage(
+  sessionId, content, otpCode, deviceId, isSandbox, agentMode,
+);
+```
+
+<Note>
+Messages are rendered as they arrive. The UI batches renders every 100ms to prevent jank during fast agent streams.
+</Note>
+
+### `/pricing` — PricingPage
+
+**Component**: `src/pages/PricingPage.tsx` (470 lines)
+
+Subscription plans grid. Clicking a plan calls `billingApi.createPaymentIntent(planId)` → loads Stripe Elements → user enters card → Stripe redirects back to success URL.
+
+### `/notifications` — NotificationsPage
+
+List of in-app notifications (from Socket.IO + `GET /notifications/all`). Mark-read and delete.
+
+### `/library` — LibraryPage
+
+Browse curated task templates. Click a card → opens a new session pre-filled with the template's prompt.
+
+### `/helpdesk` — HelpdeskPage
+
+**Component**: `src/pages/HelpdeskPage.tsx` (475 lines)
+
+Ticket list + create ticket + thread view. Real-time updates via `ticket_created` and `ticket_reply` Socket.IO events.
+
+### `/ui-kit` — UiKitPlayground
+
+Component showcase (1600+ lines). Buttons, inputs, modals, badges, every variant in both themes. Use this as a reference when building new UI.
+
+### `/logout` — LogoutPage
+
+Clears token, disconnects Socket.IO, resets Zustand, redirects to `/login`.
+
+## MainLayout structure
+
+```
+<div className="flex h-screen">
+  <Sidebar />                   {/* left rail */}
+  <div className="flex-1 flex flex-col">
+    <Header />                  {/* device picker, theme, bell, user menu */}
+    <main>{children}</main>     {/* page */}
+  </div>
+  <PaywallModal />              {/* conditional */}
+  <UpdateNotification />        {/* desktop auto-update */}
+</div>
+```
+
+Sidebar items: Home, Sessions (recent), Pricing, Settings, Helpdesk, Logout.
+
+## Notable UX patterns
+
+### Device affinity
+
+Sessions can bind to a device. If `session.device_id` is set but no device is selected, `ChooseDeviceModal` blocks chat until the user picks one:
+
+```typescript
+if (session.device_id && !selectedDeviceId) {
+  return <ChooseDeviceModal devices={devices} onSelect={setSelectedDevice} />;
+}
+```
+
+### Confirmation UX
+
+The agent sends `confirmation_request` events:
+
+```typescript
+wsClient.on("confirmation_request", (req) => {
+  useStore.getState().setConfirmationRequest(req);
+  // UI opens modal with "Yes" / "No" buttons
+});
+```
+
+User clicks → `POST /agent/confirmations/{id}/approve` → agent resumes.
+
+### Paywall gating
+
+When a user hits their limit, `billingApi.getBillingInfo()` returns `can_access: false`. `BillingSlice.setPaywallTrigger("limit_reached")` signals `MainLayout` to render `PaywallModal`.
+
+## Query parameters
+
+**ChatPage**:
+
+```typescript
+const { id } = useParams<{ id: string }>();
+```
+
+**HomeUpdated** extracts landing attribution:
+
+```typescript
+const params = new URLSearchParams(location.search);
+const prompt = params.get("prompt");
+if (prompt) sessionStorage.setItem("pendingPrompt", JSON.stringify({ prompt }));
+```
+
+The next session created pre-fills its `TaskInput` from `pendingPrompt`.
+
+## Gotchas
+
+<Note>
+**Session switch doesn't navigate.** Clicking a session in the sidebar calls `setCurrentSessionId()`, not React Router `navigate()`. For full-page transitions use `<Link to={`/sessions/${id}`}>`. Otherwise UI state may leak between sessions.
+</Note>
+
+<Note>
+**Message pagination.** ChatPage loads the last 50 messages on mount. Scroll to top triggers `loadMessages(sessionId, offset)` with the next page.
+</Note>
+
+<Note>
+**Socket.IO reconnect replays but may miss.** If the user was offline during an event, Socket.IO reconnects and the backend replays from Redis (30s window per task). On long outages, messages are refetched from the API on reconnect.
+</Note>
+
+## See also
+
+- [State management](/webapp/state-management) — which slice each page reads
+- [API client](/webapp/api-client) — Socket.IO events and HTTP modules
+- [Chat sessions](/concepts/chat-sessions) — backend-side mechanics

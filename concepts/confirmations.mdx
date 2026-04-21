@@ -1,0 +1,137 @@
+---
+title: "Confirmations"
+description: "How an agent pauses for user approval before a sensitive action executes."
+---
+
+A confirmation is a **blocking ask** from an agent to a user: "should I proceed?" The agent parks until the user approves or declines (or the timeout expires), then resumes. The flow is entirely Redis-based — no DB writes on the critical path — for sub-100ms latency.
+
+## When confirmations fire
+
+Two mechanisms trigger them:
+
+- **Agent-initiated**: the agent's built-in safety layer flags a destructive class of action (file delete, payment, outbound message) and calls `request_confirmation` before proceeding. See [Safety](/concepts/safety).
+- **User input requests**: the `ask_human` mode uses the same plumbing to collect free-form input (e.g., "what phone number should I use?").
+
+## The flow
+
+<Steps>
+  <Step title="Agent requests">
+    Agent calls `POST /agent/confirmations/request` with action_type, description, parameters, and timeout.
+  </Step>
+  <Step title="Backend queues in Redis">
+    A Redis record is created with TTL = `timeout_seconds` (default 300, range 10–3600). Response includes `confirmation_id`, `action_id`, `expires_at`.
+  </Step>
+  <Step title="User notified">
+    A `confirmation_request` event fires on the `/user` Socket.IO namespace. An `ask_human` message is also saved to the session for audit.
+  </Step>
+  <Step title="User decides">
+    `POST /agent/confirmations/{id}/respond` with `{ approved, message? }`. Agent's pending Future resolves via a backend-emitted Socket.IO event.
+  </Step>
+  <Step title="Agent resumes">
+    `request_confirmation_and_wait` returns `{ status: approved | rejected, user_message, confirmation_id, action_id }`. Agent either executes or returns a graceful "action declined" message.
+  </Step>
+</Steps>
+
+## Redis state
+
+- `confirmation_detail:{confirmation_id}` — the full record, TTL = timeout.
+- `user_confirmations:{user_id}:pending` — set of the user's pending confirmation IDs.
+
+All workers share the same Redis so a confirmation created on pod A is visible on pod B instantly.
+
+## Request schema
+
+```python
+class ConfirmationRequestSchema(BaseModel):
+    device_id: Optional[str]        # Device where action will execute
+    action_type: str                # "payment", "order_food", "user_input_phone", ...
+    action_description: str         # Human-readable prompt text
+    action_parameters: Dict         # Context: amount, vendor, session_id for web flows, ...
+    timeout_seconds: int = 300      # 10–3600
+```
+
+**Validation**: either `device_id` is set (backend resolves the user by device ownership) or `action_parameters.session_id` is set (backend resolves the user by chat session). Web-only flows use `session_id`.
+
+## User decision
+
+```python
+class UserConfirmationDecision(BaseModel):
+    approved: bool
+    message: Optional[str] = None   # Free-form input for `user_input_*` actions
+```
+
+For `user_input_*` action types, providing a non-empty `message` is treated as implicit approval — the presence of a value is the decision.
+
+## Endpoints
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `POST` | `/agent/confirmations/request` | Agent token | Create a new confirmation |
+| `GET` | `/agent/confirmations/pending` | User JWT | List user's pending confirmations |
+| `GET` | `/agent/confirmations/status/{id}` | User JWT | Fetch raw confirmation state |
+| `POST` | `/agent/confirmations/{id}/respond` | User JWT | Approve or decline |
+
+## Timeout behavior
+
+<Warning>
+If the user does not respond before `timeout_seconds`, the agent's wait coroutine raises `TimeoutError`. The Redis record **expires** and `respond` starts returning `404`. If a response arrives just after expiry, the agent has already given up — the decision lands in a dead record. Always treat timeouts as "decline" and design around them.
+</Warning>
+
+## Chat history integration
+
+Every confirmation leaves an audit trail in the session transcript:
+
+- **On request** — an assistant message is saved with `meta_data.type = "ask_human"`, `ask_human_action = "request"`, plus the confirmation id and status `waiting`.
+- **On respond** — a user message is saved with `meta_data.type = "ask_human"`, `ask_human_action = "response"`, plus the `approved` flag.
+
+The UI can render these inline with the conversation so a user re-reading the transcript sees exactly which actions were proposed and which were approved.
+
+## Working example (agent side)
+
+```python
+result = await agent_confirmation_service.request_confirmation_and_wait(
+    action_type="payment",
+    action_description="Confirm payment of $25.00 to Amazon?",
+    action_parameters={"amount": 25.00, "vendor": "Amazon", "session_id": session_id},
+    timeout_seconds=300,
+)
+
+if result["status"] == "approved":
+    await execute_payment(...)
+else:
+    return {"error": "User declined payment"}
+```
+
+## Working example (user side)
+
+```bash
+# List pending
+curl https://api.skygen.ai/agent/confirmations/pending \
+  -H "Authorization: Bearer $TOKEN"
+
+# Approve
+curl -X POST https://api.skygen.ai/agent/confirmations/conf_abc/respond \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"approved": true}'
+
+# Decline with reason
+curl -X POST https://api.skygen.ai/agent/confirmations/conf_abc/respond \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"approved": false, "message": "Not this vendor"}'
+```
+
+## Gotchas
+
+<Note>
+**Legacy polling mode.** Confirmations where `action_parameters.legacy_source` is set or `agent_id` starts with `safety_` do not receive Socket.IO push — the agent polls Redis directly. Normal agents use the push path.
+</Note>
+
+<Note>
+**Numeric coercion.** If the user submits a number as `message`, it is coerced to string. `{ "message": 123 }` becomes `"123"`. Parse on the agent side if you need numeric values.
+</Note>
+
+## See also
+
+- [Agents](/concepts/agents) — the reasoning loop that requests confirmations
+- [Safety](/concepts/safety) — the rules that trigger them
+- [Chat sessions](/concepts/chat-sessions) — where the audit trail lives

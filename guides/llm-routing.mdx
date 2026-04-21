@@ -1,0 +1,191 @@
+---
+title: "LLM routing"
+description: "ModelRouter, tiers, circuit breakers, per-session premium caps, and every provider adapter."
+---
+
+Every LLM call from the Agent runtime goes through **ModelRouter.choose_model_route()**. It picks a provider, a model, and reports a tier back. This page explains the selection logic and every provider Skygen can route to.
+
+## The registry
+
+`Agent/Utilities/ModelRouter.py` maintains a `MODEL_REGISTRY` list. Each entry has:
+
+- Model ID (e.g. `anthropic/claude-sonnet-4.6:nitro`)
+- Provider (`openrouter`, `anthropic`, `google`, `groq`, `cerebras`)
+- Tier: `premium`, `balanced`, `economy`
+- Max context tokens
+- Flags: `supports_vision`, `supports_tools`
+- Approximate cost per 1k input tokens
+
+Representative entries:
+
+| Model | Provider | Tier | Context | Vision | ~$/1k in |
+|-------|----------|------|---------|--------|---------|
+| `anthropic/claude-opus-4.7` | Anthropic | premium | 200k | yes | 0.015 |
+| `anthropic/claude-sonnet-4.6:nitro` | OpenRouter | premium | 1M | yes | 0.003 |
+| `qwen/qwen3-vl-235b-a22b-thinking` | OpenRouter | premium | 131k | yes | 0.003 |
+| `groq/gpt-oss-120b` | Groq | premium | 131k | no | 0.003 |
+| `google/gemini-2.5-pro` | Google | balanced | 1M | yes | 0.001 |
+| `google/gemini-2.5-flash` | Google | balanced | 1M | yes | 0.0005 |
+| `cerebras/llama-3.3-70b` | Cerebras | balanced | 131k | no | 0.0005 |
+| `google/gemini-2.5-flash-lite` | Google | economy | 1M | no | 0.00005 |
+| `groq/qwen-3-32b` | Groq | economy | 131k | no | 0.0001 |
+
+Adjust the registry to add a new model; no other code needs changing.
+
+## Selection algorithm
+
+`choose_model_route(params)` returns `ModelRouteDecision { model, provider, tier, context_tokens, reason }`.
+
+```
+1. Start with candidate list built from params:
+   - Explicit config model (e.g., config.cua_orchestrator_model) always goes first
+   - Then task-driven ordering:
+       long_context → [Claude Sonnet 4.6, Gemini 2.5 Pro, Gemini Flash, ...]
+       economy priority → [Flash Lite, Qwen 32B, ...]
+       heavy_reasoning → [Claude Sonnet 4.6, Qwen thinking, Claude Opus, ...]
+       default → [Gemini Flash, Claude Sonnet, Gemini Flash Lite, ...]
+
+2. For each candidate, check filters:
+   - skip_models (passed in after earlier failures)
+   - supports_vision if requires_vision=true
+   - Gemini circuit breaker (see below)
+   - max_context_tokens ≥ requested tokens
+   - premium cap (see below)
+
+3. First candidate that passes all filters wins.
+4. If no candidate, fall back to config.default_model, then any from registry, then raise.
+```
+
+## Tiers
+
+- **premium** — heavy reasoning, complex multi-step tasks, vision-heavy. Most expensive per token.
+- **balanced** — general-purpose default.
+- **economy** — batch work, simple classification, high-volume low-value.
+
+The router biases toward economy unless the task declares `heavy_reasoning=true` or `requires_long_context=true`.
+
+## Per-session premium cap
+
+Every agent session tracks `stats["premium_calls"]`. The cap is `MODEL_ROUTER_PREMIUM_LIMIT` (env var, default 3).
+
+If a task is not marked `heavy_reasoning=true` and the cap is reached, the router skips premium candidates and drops to balanced or economy. This prevents one user session from burning the month's budget on expensive models.
+
+<Note>
+**`heavy_reasoning=true` bypasses the cap.** Reserve it for truly hard tasks. Tagging everything heavy defeats the purpose.
+</Note>
+
+## Gemini circuit breaker
+
+Gemini occasionally throttles even when quota looks fine. Skygen tracks consecutive failures in the `GeminiProvider` instance. After N failures, `is_gemini_circuit_open()` returns `true` and ModelRouter skips all Gemini models until the circuit resets.
+
+Reset happens on successful fallback-path calls elsewhere (not Gemini), or after a cooldown window.
+
+## Model profile system
+
+`config.model_profile` values: `fast`, `balanced`, `powerful`. Profile is plan-gated — `fast` works for free users, `powerful` requires a paid plan.
+
+The router reads the profile and restricts candidates:
+
+- `fast` → only economy
+- `balanced` → balanced + economy
+- `powerful` → premium + balanced + economy
+
+Admins configure which profiles each plan allows via `SubscriptionPlan.allowed_model_profiles`.
+
+## Provider adapters
+
+`Agent/Utilities/LLM_Providers/` contains one adapter per provider. All implement the same abstract interface (`call(prompt, tools, model, ...)`). The adapter handles auth, request formatting, streaming, cost tracking, and error normalization.
+
+### OpenAICompatibleProvider
+
+Base class used by providers that speak OpenAI's Chat Completions schema: OpenRouter, Groq, Cerebras. Shared HTTP client pool, streaming parser, tool-call handling.
+
+**Env**:
+
+- `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`)
+- `GROQ_API_KEY`, `GROQ_BASE_URL`
+- `CEREBRAS_API_KEY`, `CEREBRAS_BASE_URL`
+
+### GeminiProvider
+
+Google's Generative AI API. Handles Google-specific quirks: nested content format, function-calling schema differences, `responseSchema` for structured output.
+
+**Env**:
+
+- `GEMINI_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service account JSON)
+
+Circuit breaker state stored on the provider instance.
+
+### AnthropicProvider
+
+Claude-native API with Anthropic's message format. Supports prompt caching (cache-control annotations) and extended thinking for reasoning models.
+
+**Env**: `ANTHROPIC_API_KEY`.
+
+### CerebrasProvider
+
+Extends `OpenAICompatibleProvider` with Cerebras-specific models (`llama-3.3-70b`, `qwen-3-235b-a22b-instruct-2507`). Cerebras is fast but its tool-calling support varies per model — the provider only exposes models known to work with tools.
+
+### ProviderFactory
+
+Maps matcher functions to provider instances. Lazy instantiation on first use. Unknown model IDs fall back to OpenRouter.
+
+```python
+PROVIDER_REGISTRY = [
+    (lambda m: m.startswith("anthropic/"), AnthropicProvider),
+    (lambda m: m.startswith("google/"), GeminiProvider),
+    (lambda m: m.startswith("cerebras/"), CerebrasProvider),
+    (lambda m: m.startswith("groq/"), GroqProvider),
+    (lambda m: True, OpenRouterProvider),  # fallback
+]
+```
+
+## Cost tracking
+
+After every call, `track_api_cost()` records input/output/cache tokens and USD cost. The cost tracker:
+
+1. Calculates cost using `model_pricing.yaml` (per-model rates)
+2. Writes a local `APICallCost` record
+3. POSTs to `/admin/costs/record` on the backend
+4. Backend deducts from `TokenBalance`
+5. If backend returns 402 → raises `BillingLimitReached` → agent halts
+
+On network failure, costs fall back to local JSONL storage and retry later.
+
+Prometheus metrics per call:
+
+```
+skygen_cost_usd{provider, model, agent_type}
+skygen_llm_tokens{provider, model, agent_type, token_type}
+```
+
+## Fallback chain on errors
+
+If a call fails mid-stream:
+
+1. Add the model to `skip_models` for the session
+2. Call `choose_model_route()` again with updated `skip_models`
+3. Retry with the next candidate
+4. Give up after N retries → raise
+
+Errors that trigger skip: rate limit (429), provider-side 5xx, timeout, tool-call parse error.
+
+## Gotchas
+
+<Note>
+**Model aliases can rot.** Anthropic deprecated `claude-2.1`; Gemini renamed several versions. Always test a new alias in `model_pricing.yaml` before routing real traffic to it.
+</Note>
+
+<Note>
+**Tool-calling isn't universal.** Some models (Gemini Flash Lite, smaller Qwens) don't reliably honor the tool schema. The adapter flags unsupported-tool errors and the router downgrades to a tool-capable model next attempt.
+</Note>
+
+<Note>
+**Long context isn't free.** Claude Sonnet 4.6 at 1M context has ~3× the per-token cost of Gemini Flash at the same ceiling. Let the router pick unless you have a specific reason.
+</Note>
+
+## See also
+
+- [Agents](/concepts/agents) — where the router is called
+- [Agent modes](/concepts/agent-modes) — mode-specific biases
+- [Billing](/concepts/billing) — how token costs flow to invoices

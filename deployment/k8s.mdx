@@ -1,0 +1,199 @@
+---
+title: "Kubernetes"
+description: "Cluster specifics — rolling updates, HPAs, Karpenter pools, Fargate quirks, Redis pub/sub for horizontal scaling."
+---
+
+Skygen runs on AWS EKS with Karpenter auto-scaling. This page covers the deployment specifics: replica strategy, service discovery, how Socket.IO scales horizontally, and the Fargate / DaemonSet workaround.
+
+## Rolling updates
+
+All workloads use `RollingUpdate`:
+
+| Deployment | `maxSurge` | `maxUnavailable` |
+|------------|------------|------------------|
+| backend | 1 | 0 |
+| worker | 1 | 0 |
+| agent (prod) | 2 | 0 |
+
+Zero-downtime deploys. Deploys fail fast on readiness probe failure.
+
+## HPA (prod only)
+
+Horizontal Pod Autoscalers manage prod replicas based on CPU and memory utilization targets:
+
+| Deployment | Min | Max | Scaling metric |
+|------------|-----|-----|----------------|
+| backend | 3 | 30 | CPU 70%, memory 80% |
+| agent | 3 | 100 | CPU 70% |
+| worker | 2 | 20 | CPU 70%, memory 80% |
+
+Dev uses fixed replicas (backend 2, worker 2). No HPA.
+
+## Service discovery
+
+- `backend-service:8000` in `skygen-agent` (dev) or `skygen-prod` namespace
+- `worker:8080` (health), `worker:8001` (metrics)
+- `agent-service:8080` (Agent service)
+
+Pods resolve each other via in-cluster DNS: `<service>.<namespace>.svc.cluster.local`.
+
+## Ingress (AWS ALB Controller)
+
+```yaml
+annotations:
+  alb.ingress.kubernetes.io/scheme: internet-facing
+  alb.ingress.kubernetes.io/target-type: ip
+  alb.ingress.kubernetes.io/ssl-redirect: "443"
+  alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:...
+  # Socket.IO requires session stickiness + long idle timeout
+  alb.ingress.kubernetes.io/target-group-attributes: |
+    stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=86400
+  alb.ingress.kubernetes.io/idle-timeout: "3600"
+```
+
+Stickiness keeps a WebSocket client glued to the pod holding its SID. Idle timeout must be ≥ the app's ping interval (30s) × 2, so 1 hour is safe.
+
+Healthcheck:
+
+```yaml
+alb.ingress.kubernetes.io/healthcheck-path: /health
+alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+```
+
+Preview environments in dev share ALB group `skygen-dev-shared` via `alb.ingress.kubernetes.io/group.name`.
+
+## Redis pub/sub for Socket.IO scaling
+
+Socket.IO caches session IDs in memory. If Alice's SID lives on pod A and Bob's device sends a message to Alice while connecting to pod B, pod B needs to reach pod A.
+
+Skygen uses Socket.IO's Redis adapter (`python-socketio` with `AsyncRedisManager`). Messages published to `device:{device_id}` or `user:{user_id}` channels reach whichever pod holds that SID. See [Chat sessions](/concepts/chat-sessions) for the event catalog.
+
+`REDIS_URL` is shared across all backend pods.
+
+## Fargate and DaemonSets
+
+Fargate does not support DaemonSets. Two consequences:
+
+1. **node-exporter disabled.** Prod monitoring relies on kube-state-metrics and application-level metrics only.
+2. **Promtail as StatefulSet.** One Promtail pod per cluster region (not per node). Still tails container logs via Kubernetes API.
+
+`Backend/k8s/monitoring/install-monitoring.sh` handles the disabled settings.
+
+## Karpenter node pools
+
+Three node pools, each with a taint matching a `role` label:
+
+| Node pool | Taint | Workloads | Resources (requests) |
+|-----------|-------|-----------|----------------------|
+| nodepool-backend | `role=backend:NoSchedule` | backend pods | 300m CPU, 768Mi memory |
+| nodepool-worker | `role=worker:NoSchedule` | worker pods | 150m CPU, 256Mi memory |
+| nodepool-agent | `role=agent:NoSchedule` | agent pods | varies |
+| nodepool-monitoring (prod) | — | prometheus/grafana/loki | higher |
+
+Pods must set matching tolerations and `nodeSelector.role`:
+
+```yaml
+tolerations:
+  - key: role
+    operator: Equal
+    value: backend
+    effect: NoSchedule
+nodeSelector:
+  role: backend
+```
+
+Worker pods also have pod anti-affinity to spread replicas across nodes:
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: worker
+          topologyKey: kubernetes.io/hostname
+```
+
+## Security and RBAC
+
+Each deployment has its own ServiceAccount:
+
+- `backend-sa`
+- `worker-sa`
+- `agent-sa`
+- `external-secrets-sa` (for ExternalSecrets operator)
+
+Pods run non-root:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+containers:
+  - securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+```
+
+ExternalSecrets use IRSA (IAM Roles for Service Accounts) to pull from AWS Secrets Manager.
+
+## Init container + migrations
+
+Every backend deploy runs an init container:
+
+```yaml
+initContainers:
+  - name: migrate
+    image: skygen/backend:{env}
+    command: ["/bin/sh", "-c"]
+    args:
+      - "alembic upgrade heads && python -m scripts.create_admin"
+```
+
+Idempotent; ensures the DB schema matches the deployed code and that the default admin user exists.
+
+## Probes
+
+```yaml
+startupProbe:
+  httpGet: { path: /health, port: 8000 }
+  failureThreshold: 30
+  periodSeconds: 10    # allows up to 300s startup
+
+readinessProbe:
+  httpGet: { path: /ready, port: 8000 }
+  initialDelaySeconds: 30
+  periodSeconds: 10    # ALB waits for this
+
+livenessProbe:
+  httpGet: { path: /health, port: 8000 }
+  periodSeconds: 30
+  failureThreshold: 3  # 90s unresponsive → restart
+```
+
+`/ready` returns 503 if DB or Redis are unavailable. `/health` returns 200 as long as the process is up.
+
+## Graceful shutdown
+
+Worker pods set `terminationGracePeriodSeconds: 60` so in-flight RabbitMQ messages finish before SIGKILL. Backend uses the default 30s — Socket.IO clients reconnect to a new pod on disconnect.
+
+## Persistence
+
+Stateless deployments (backend, worker, agent). Persistent components:
+
+- PostgreSQL, RabbitMQ: EBS-backed PVCs in dev; managed (RDS, on-cluster persistent) in prod
+- Redis: ephemeral in dev (data loss acceptable), ElastiCache or on-cluster with persistence in prod
+- Prometheus: 20Gi
+- Loki: 10Gi
+- Grafana: 5Gi
+
+## See also
+
+- [Deployment overview](/deployment/overview) — what runs where
+- [Monitoring](/deployment/monitoring) — Loki datasource quirk, alertmanager setup
+- [Environment variables](/deployment/environment) — secrets management via ExternalSecrets

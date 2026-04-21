@@ -1,0 +1,119 @@
+---
+title: "MCP integrations"
+description: "The three-tier model behind 500+ third-party services, custom connectors, and event triggers."
+---
+
+Skygen's integration layer ties agents to third-party services. There are two sources:
+
+- **Composio** — a catalog of 500+ pre-built OAuth integrations (Gmail, Slack, GitHub, Notion, Linear, HubSpot, Jira, Salesforce, and many more).
+- **Custom connectors** — HTTP APIs you define yourself for internal or proprietary services. See [Custom connectors](/guides/custom-connectors).
+
+Plus **Telegram**, a non-OAuth provider using MTProto, exposed through its own `/mcp/telegram/*` endpoints.
+
+## The three-tier hierarchy
+
+Skygen's mental model (three distinct concepts, exact terminology from the schema):
+
+<CardGroup cols={3}>
+  <Card title="Toolkit" icon="box">
+    A service category from Composio (e.g. `gmail`, `slack`). Contains tools, an auth scheme, and metadata. Browsable via `GET /mcp/toolkits`.
+  </Card>
+  <Card title="Connection" icon="link">
+    A (user, toolkit, composio_account_id) tuple with `status ∈ {pending, connected, revoked}`. Multiple per toolkit allowed (personal + work Gmail).
+  </Card>
+  <Card title="Trigger" icon="bell">
+    Event subscription: `(toolkit, trigger_name, config, action_prompt)`. Fires on Composio webhook → spawns a new agent session.
+  </Card>
+</CardGroup>
+
+## Key fields
+
+- **`account_label`** — user-renamable string ("Work Gmail"). Takes priority over Composio's `email`/`display_name` in list responses.
+- **`is_active`** — boolean toggle on a connection. When `false` the toolkit is hidden from the agent but the OAuth grant is preserved; flip back to `true` without re-auth.
+- **`connected_accounts`** — array per toolkit, exposing multi-account state.
+
+## Endpoints
+
+### Browse
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/mcp/toolkits` | Search catalog. Query: `q`, `category`, `page`, `per_page`. Response includes per-toolkit `connected_accounts`. |
+| `GET` | `/mcp/toolkits/{slug}` | Toolkit details + auth schemes. |
+| `GET` | `/mcp/toolkits/categories` | All categories with counts. |
+
+### Connections
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/mcp/integrations/available` | User's integrations, both Composio and legacy (Telegram). |
+| `GET` | `/mcp/integrations/connected` | Detailed list filtered by `status`. |
+| `GET` | `/mcp/integrations/connect-url/{toolkit}` | OAuth redirect URL (**no DB persist** until webhook callback). `?add_another=true` allows a second account for a toolkit already connected. `?subdomain=...` for Jira/Zendesk. |
+| `POST` | `/mcp/integrations/connect/{provider}` | Legacy: persists a `pending` row immediately. Prefer `connect-url`. |
+| `POST` | `/mcp/integrations/disconnect/{provider}` | Revoke OAuth grant. Body: `{ account_id? }` (omit to disconnect first match). |
+| `PATCH` | `/mcp/integrations/connections/{id}/label` | Rename the account. Auto-creates the DB row if missing (lazy sync). |
+| `PATCH` | `/mcp/integrations/{toolkit}/active` | Toggle `is_active` per account (`{ is_active, account_id }`) or for all accounts if `account_id` is omitted. |
+
+### Triggers (see [Triggers](/guides/triggers))
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/mcp/triggers` | Create a trigger |
+| `GET` | `/mcp/triggers` | List user's triggers |
+| `GET` | `/mcp/triggers/types` | Available trigger types for a toolkit |
+| `PATCH` | `/mcp/triggers/{id}` | Update `action_prompt` or `is_active` |
+| `DELETE` | `/mcp/triggers/{id}` | Unsubscribe and remove |
+| `GET` | `/mcp/triggers/{id}/runs` | Execution history with agent reasoning, tools used, actions taken |
+
+### Webhooks
+
+- **`POST /mcp/webhooks/composio`** — Composio posts OAuth callbacks and trigger events here. HMAC-SHA256 verified using `COMPOSIO_WEBHOOK_SECRET`. See [Triggers](/guides/triggers) for payload shape.
+
+## Connection flow
+
+```
+  User clicks "Connect Gmail"
+            │
+            │ GET /mcp/integrations/connect-url/gmail
+            ▼
+  Backend calls Composio SDK → returns redirect_url
+            │
+            ▼
+  Frontend opens redirect_url in a popup
+            │
+            │ User consents in Google
+            ▼
+  Composio → POST /mcp/webhooks/composio  (signed)
+            │
+            ▼
+  Backend verifies signature, parses event,
+  creates ComposioConnection(status=connected, is_active=true),
+  emits Socket.IO event to the user
+            │
+            ▼
+  Frontend refreshes; toolkit now shows connected_accounts[0]
+```
+
+## Gotchas
+
+<Note>
+**`connect-url` vs `connect`.** `connect-url` is the right choice for in-chat flows — no database row until the user actually completes OAuth, so abandoned attempts leave no residue. `connect` is the legacy variant that persists a `pending` row immediately.
+</Note>
+
+<Note>
+**Entity ID prefix stripping.** Composio's webhook payload may include an environment prefix in `entityId` (e.g. `prod_user_123`). The parser strips it before lookup.
+</Note>
+
+<Note>
+**Environment gate for webhook verification.** If `COMPOSIO_WEBHOOK_SECRET` is unset (typical in dev), the verifier logs a warning and accepts anyway. Set it in production.
+</Note>
+
+## Telegram (non-Composio)
+
+Telegram uses MTProto instead of OAuth. Connect through `/mcp/telegram/*` — bot token management, message routing — rather than the generic `/mcp/integrations/connect/*`. Everything else (agents see it as a tool, same session model) is identical.
+
+## See also
+
+- [Connecting integrations](/guides/connecting-integrations) — step-by-step
+- [Custom connectors](/guides/custom-connectors) — bring your own HTTP API
+- [Triggers](/guides/triggers) — event-driven automation

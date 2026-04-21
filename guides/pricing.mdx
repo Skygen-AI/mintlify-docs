@@ -1,0 +1,129 @@
+---
+title: "Pricing (public endpoint)"
+description: "Display-safe subscription plans for landing pages and pricing tables."
+---
+
+The public pricing endpoint serves subscription plan details without requiring auth. Use it to render pricing pages, feature comparisons, and CTAs. Stripe price IDs are stripped from responses — they stay server-side.
+
+## Endpoint
+
+### `GET /pricing/plans`
+
+All active, non-hidden plans.
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "plan-uuid",
+      "name": "Standard",
+      "description": "For power users",
+      "price_usd": 14.99,
+      "old_price_usd": null,
+      "billing_period_days": 30,
+      "billing_period_unit": "DAYS",
+      "monthly_tokens": 2000,
+      "sort_order": 1,
+      "is_featured": true,
+      "badge_text": "Most Popular",
+      "button_text": "Get Started",
+      "credits_label": "tokens/month",
+      "per_month_text": "/mo",
+      "features": [
+        { "text": "2000 tokens/month", "tooltip": null, "muted": false },
+        { "text": "Cloud PC included", "tooltip": "2vCPU, 4GB RAM", "muted": false },
+        { "text": "Priority support", "tooltip": null, "muted": true }
+      ]
+    }
+  ],
+  "total": 1
+}
+```
+
+### `GET /pricing/plans/{plan_id}`
+
+Single plan. 404 if not found or inactive.
+
+## Fields
+
+| Field | Purpose |
+|-------|---------|
+| `price_usd` | Current price |
+| `old_price_usd` | Strikethrough price for discounts (nullable) |
+| `billing_period_days` | Default 30 |
+| `billing_period_unit` | `DAYS` / `MONTHS` / `YEARS` |
+| `monthly_tokens` | Token quota |
+| `sort_order` | Rendering order |
+| `is_featured` | Highlight this plan |
+| `badge_text` | Free-form ("Most Popular", "Best Value") |
+| `button_text` | CTA label |
+| `credits_label` | "tokens/month" |
+| `per_month_text` | "/mo" |
+| `features` | Array of `{ text, tooltip?, muted? }` |
+
+## Features format (legacy + new)
+
+The `features` JSON can be:
+
+- **Legacy**: list of strings. `["2000 tokens/month", "Cloud PC"]`
+- **New**: list of objects. `[{"text": "...", "tooltip": "...", "muted": false}]`
+
+The endpoint normalizes both to the new shape in responses. Backend stores whichever was submitted by the admin.
+
+## What's excluded from responses
+
+The backend holds additional fields used by Stripe integration and admin workflows that are **deliberately stripped** from the public response:
+
+- `stripe_price_id` — don't expose, clients use plan_id + backend initiates checkout
+- `features_config` JSON — internal feature flags (Cloud PC enabled, max_cloud_pcs, etc.)
+- `allowed_model_profiles` — plan-gated model routing
+- `created_at` / `updated_at`
+
+## Example: rendering a pricing table
+
+```typescript
+const { items } = await fetch("/pricing/plans").then(r => r.json());
+
+return (
+  <div className="grid grid-cols-3 gap-4">
+    {items.map(plan => (
+      <PlanCard key={plan.id} plan={plan}>
+        {plan.badge_text && <Badge>{plan.badge_text}</Badge>}
+        <h3>{plan.name}</h3>
+        <p>${plan.price_usd}{plan.per_month_text}</p>
+        {plan.old_price_usd && <s>${plan.old_price_usd}</s>}
+        <ul>
+          {plan.features.map((f, i) => (
+            <li key={i} className={f.muted ? "opacity-60" : ""}>
+              {f.text}
+              {f.tooltip && <Tooltip>{f.tooltip}</Tooltip>}
+            </li>
+          ))}
+        </ul>
+        <button>{plan.button_text}</button>
+      </PlanCard>
+    ))}
+  </div>
+);
+```
+
+## Gotchas
+
+<Note>
+**Features JSON parsed on every request.** No caching. If your pricing table renders 10 times per page load, that's 10 parses. CDN-cache the response if it becomes a bottleneck.
+</Note>
+
+<Note>
+**`old_price_usd` is free-form.** Nothing validates it's greater than `price_usd`, or that a discount makes sense. Admin has to be careful.
+</Note>
+
+<Note>
+**`badge_text` has no enum.** You can misspell "Most Populaar" and it ships. Consider an admin-side validator.
+</Note>
+
+## See also
+
+- [Billing](/concepts/billing) — subscription lifecycle + Stripe integration
+- [Admin overview](/admin/overview) — how plans are created

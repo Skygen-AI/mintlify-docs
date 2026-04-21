@@ -1,33 +1,54 @@
 ---
-title: 'Introduction'
-description: 'Example section for showcasing API endpoints'
+title: "API Reference"
+description: "REST API for the Skygen platform. Every endpoint, request shape, and response example."
 ---
 
-<Note>
-  If you're not looking to build API reference documentation, you can delete
-  this section by removing the api-reference folder.
-</Note>
+The Skygen API is organized around REST. It uses predictable resource-oriented URLs, returns JSON, and uses standard HTTP response codes and verbs. All requests are authenticated with a Bearer JWT access token (see [Authentication](/guides/authentication)) unless the endpoint is explicitly public.
 
-## Welcome
+## Base URL
 
-There are two ways to build API documentation: [OpenAPI](https://mintlify.com/docs/api-playground/openapi/setup) and [MDX components](https://mintlify.com/docs/api-playground/mdx/configuration). For the starter kit, we are using the following OpenAPI specification.
+```
+https://api.skygen.ai
+```
 
-<Card
-  title="Plant Store Endpoints"
-  icon="leaf"
-  href="https://github.com/mintlify/starter/blob/main/api-reference/openapi.json"
->
-  View the OpenAPI specification file
-</Card>
+{/* TODO: confirm production host; some endpoints may currently live on api-dev.skygen.ai */}
 
 ## Authentication
 
-All API endpoints are authenticated using Bearer tokens and picked up from the specification file.
+Every authenticated request must include an access token in the `Authorization` header.
 
-```json
-"security": [
-  {
-    "bearerAuth": []
-  }
-]
+```http
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 ```
+
+Access tokens expire after 60 minutes. Use the refresh flow to obtain a new one. See [Authentication](/guides/authentication) for the full flow, including OAuth, email verification, password reset, and device KID rotation.
+
+## Content type
+
+All request bodies must be JSON with `Content-Type: application/json`, except the login endpoint, which uses `application/x-www-form-urlencoded` (OAuth2 password flow).
+
+## Pagination
+
+List endpoints support `limit` and `offset` query parameters. Maximum page size is typically 100. Check the per-endpoint reference for exact bounds.
+
+```http
+GET /sessions?limit=20&offset=40
+```
+
+## Versioning
+
+Skygen maintains a single stable API. Breaking changes will be announced via the [changelog](https://skygen.ai/changelog) and gated behind a `v2` path prefix (see `/billing/v2` for the first example).
+
+## Errors
+
+See the [Errors reference](/errors) for status codes, response format, and retry strategy.
+
+## Real-time events
+
+Some flows rely on Socket.IO for real-time updates (message streaming, device status, agent progress). Connect to the `/user` namespace with your access token. See [Agents](/concepts/agents) for subscription patterns.
+
+## SDKs
+
+{/* TODO: add SDK links once client libraries are published */}
+
+Official SDKs are on the roadmap. For now, use any standard HTTP client (cURL, `httpx`, `fetch`, `requests`).

@@ -1,0 +1,132 @@
+---
+title: "Triggers"
+description: "Fire an agent run automatically when something happens in a connected integration."
+---
+
+A **trigger** binds an event in an integration — "new email", "PR opened", "Slack message in channel" — to an **action prompt** the agent runs when the event fires. Triggers turn Skygen from a chat tool into always-on automation.
+
+## Anatomy
+
+- **`toolkit`** — which service (`gmail`, `slack`, `github`, ...).
+- **`trigger_name`** — the event (e.g. `GMAIL_NEW_EMAIL`, `SLACK_NEW_MESSAGE`, `GITHUB_PULL_REQUEST_OPENED`).
+- **`config`** — event-specific filter (`{ "label": "important" }`, `{ "channel": "C01234" }`). Passed as-is to Composio.
+- **`action_prompt`** — what the agent should do. Sent as the first user message in the spawned session.
+- **`account_id`** — which connected account to use (optional; defaults to the first active).
+- **`is_active`** — enable/disable without deletion.
+
+## Common trigger types
+
+Query per-toolkit via `GET /mcp/triggers/types?toolkit=gmail`. Examples:
+
+- **Gmail**: `GMAIL_NEW_EMAIL`, `GMAIL_NEW_UNREAD_EMAIL`, `GMAIL_EMAIL_MARKED_AS_IMPORTANT`
+- **Slack**: `SLACK_NEW_MESSAGE`, `SLACK_CHANNEL_CREATED`, `SLACK_REACTION_ADDED`
+- **GitHub**: `GITHUB_PULL_REQUEST_OPENED`, `GITHUB_ISSUE_CREATED`, `GITHUB_COMMIT_PUSHED`
+- **Linear**: `LINEAR_ISSUE_CREATED`, `LINEAR_ISSUE_UPDATED`
+- **Notion**: `NOTION_DATABASE_ITEM_CREATED`
+
+## Create a trigger
+
+```bash
+curl -X POST https://api.skygen.ai/mcp/triggers \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "toolkit": "gmail",
+    "trigger_name": "GMAIL_NEW_EMAIL",
+    "config": {"label": "important"},
+    "action_prompt": "Summarize and post to Slack #inbox",
+    "device_id": "dev_123"
+  }'
+# → { "trigger_id": "tr_...", "status": "active", "is_active": true, ... }
+```
+
+Composio subscribes to the event stream immediately. From that moment on, every matching event fires your trigger.
+
+## What happens on fire
+
+<Steps>
+  <Step title="Event arrives at Composio">
+    Gmail delivers an email; Composio's trigger infrastructure detects the match.
+  </Step>
+  <Step title="Composio posts the webhook">
+    `POST /mcp/webhooks/composio` with `X-Composio-Signature` (HMAC-SHA256).
+  </Step>
+  <Step title="Skygen verifies and parses">
+    Signature checked against `COMPOSIO_WEBHOOK_SECRET`. Payload parsed into `WebhookEvent { event_type, trigger_id, user_id, payload }`. Environment prefix stripped from `entityId` if present.
+  </Step>
+  <Step title="Lookup the trigger config">
+    Find `TriggerConfiguration` where `trigger_id` matches.
+  </Step>
+  <Step title="Spawn a session">
+    Create a new chat session bound to `device_id`, save the `action_prompt` as the first user message, publish to RabbitMQ.
+  </Step>
+  <Step title="Log to TriggerEvent">
+    Record `{ event_type, payload, status=dispatched, agent_reasoning, tools_used, actions_taken }` for audit.
+  </Step>
+  <Step title="Return 200 OK to Composio">
+    Must respond within 30 seconds or Composio marks the webhook as failed and retries.
+  </Step>
+</Steps>
+
+## Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/mcp/triggers` | Create |
+| `GET` | `/mcp/triggers` | List user's triggers |
+| `GET` | `/mcp/triggers/apps` | Apps with trigger support, with counts |
+| `GET` | `/mcp/triggers/types?toolkit=` | Available trigger types |
+| `PATCH` | `/mcp/triggers/{id}` | Update `action_prompt`, `is_active` |
+| `DELETE` | `/mcp/triggers/{id}` | Unsubscribe and remove |
+| `GET` | `/mcp/triggers/{id}/runs` | Execution history with agent reasoning and tools used |
+
+## Inspect a run
+
+```bash
+curl https://api.skygen.ai/mcp/triggers/tr_xyz/runs \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response:
+
+```json
+{
+  "runs": [
+    {
+      "id": "run_abc",
+      "trigger_id": "tr_xyz",
+      "event_type": "gmail.new_email",
+      "status": "completed",
+      "agent_reasoning": "The email is marked important, so I'll create a Linear issue.",
+      "tools_used": ["create_linear_issue"],
+      "actions_taken": [{"tool": "create_linear_issue", "title": "Q2 roadmap", "status": "success"}],
+      "created_at": "2026-04-20T10:01:30Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+## Billing reminder
+
+Every fire is a full agent run — prompt, reasoning, tool calls, output. **Filter aggressively** or you will burn tokens on noisy event streams. A Gmail "all-inbox" trigger on a busy account can easily fire hundreds of times a day; a "label=important" filter cuts that to a handful.
+
+## Gotchas
+
+<Warning>
+**Webhook timeout is 30 seconds.** Long agent runs do not block the webhook — Skygen dispatches and returns immediately. But if the dispatch itself is slow (DB contention, RabbitMQ lag), Composio will retry. Ensure your backend stays healthy.
+</Warning>
+
+<Note>
+**No explicit idempotency key.** If Composio retries a webhook due to a transient error, the same event may fire twice. Your action prompts should be idempotent — "create or update the Linear issue" rather than "create a new issue".
+</Note>
+
+<Note>
+**`action_prompt` is a user message, not a system message.** It goes into the session as `role=user`. Agents may be lenient but if you need strict instructions consider passing them in a custom `meta_data` field that the agent is configured to read as a system directive.
+</Note>
+
+## See also
+
+- [MCP integrations](/concepts/mcp-integrations) — the catalog
+- [Scheduled tasks](/guides/scheduled-tasks) — time-driven vs event-driven
+- [Billing](/concepts/billing) — per-fire cost

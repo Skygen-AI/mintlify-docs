@@ -1,0 +1,144 @@
+---
+title: "Notifications"
+description: "In-app alerts — admin broadcasts, user-specific notifications, unread counts, mark-as-read."
+---
+
+Skygen's notification system is for in-app alerts: product updates, system announcements, low-stock warnings, admin messages. No push to mobile or email — purely in-app polling and real-time delivery via Socket.IO.
+
+## Model
+
+**AdminNotification** (the source):
+
+```python
+class AdminNotification(Base):
+    id: UUID
+    title: str
+    message: str
+    category: Enum  # "updates" | "messages"
+    icon: Enum      # "info" | "success" | "warning" | "error" | "gift" | "star" | "bell" | "message"
+    target_type: Enum  # "all" | "selected"
+    target_user_ids: Optional[list[UUID]]  # for "selected"
+    created_by: FK → users
+    created_at
+```
+
+**UserNotification** (per-recipient):
+
+```python
+class UserNotification(Base):
+    id: UUID
+    notification_id: FK → AdminNotification
+    user_id: FK → users
+    is_read: bool
+    read_at: Optional[datetime]
+    created_at
+```
+
+Composite indexes on `(notification_id, user_id)`, `(user_id, is_read)`, `(user_id, created_at)` for fast unread-count and list queries.
+
+## User endpoints
+
+### `GET /notifications/unread?limit=50`
+
+Unread for the current user. Ordered by `created_at DESC`.
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "user-notif-123",
+      "notification_id": "admin-notif-456",
+      "title": "New feature released",
+      "message": "Check out our improved interface!",
+      "category": "updates",
+      "icon": "star",
+      "is_read": false,
+      "created_at": "2026-04-20T15:30:00",
+      "read_at": null
+    }
+  ],
+  "total": 1,
+  "unread_count": 3
+}
+```
+
+`total` = items in this response. `unread_count` = global count (not just this page).
+
+### `GET /notifications/all?skip=0&limit=50`
+
+All notifications (read and unread) with pagination.
+
+### `GET /notifications/count`
+
+Lightweight — just `{ "unread_count": N }`. Use for the bell badge.
+
+### `POST /notifications/{id}/read`
+
+Mark one as read. Idempotent.
+
+### `POST /notifications/read-all`
+
+Bulk mark all unread as read for the current user. Returns `{ "count": N }`.
+
+## Admin endpoints
+
+See [Admin overview](/admin/overview) for the full list. Key endpoints:
+
+- `POST /admin/api/notifications/send` — broadcast to all or specific user_ids
+- `GET /admin/api/notifications` — list sent notifications with read counts
+- `GET /admin/api/notifications/{id}` — per-recipient delivery status
+
+## Real-time delivery
+
+When an admin sends a notification with `target_type=all`, the backend:
+
+1. Creates one `AdminNotification` row
+2. Creates one `UserNotification` row per user (bulk insert)
+3. Emits `admin_notification` event on the `/user` Socket.IO namespace for users currently online
+4. Offline users discover it on next poll to `/notifications/unread` or `/notifications/count`
+
+## Frontend patterns
+
+**Badge** (cheap poll every 30s):
+
+```typescript
+const { data } = useQuery("unread-count", () =>
+  fetch("/notifications/count").then(r => r.json()),
+  { refetchInterval: 30_000 }
+);
+```
+
+**Real-time updates**:
+
+```typescript
+socket.on("admin_notification", () => {
+  queryClient.invalidateQueries("unread-count");
+  queryClient.invalidateQueries("notifications");
+  toast.info("New notification");
+});
+```
+
+## Gotchas
+
+<Warning>
+**No push notifications.** Users only discover new notifications when they open the app. For critical alerts, use the email path (Resend campaigns) instead or in addition.
+</Warning>
+
+<Note>
+**`target_user_ids` is JSON array.** No denormalized delivery count; query `UserNotification` by `notification_id` to count.
+</Note>
+
+<Note>
+**Read state is per-user.** A single `AdminNotification` has N `UserNotification` rows. Marking one as read doesn't affect others.
+</Note>
+
+<Note>
+**No delete endpoint for users.** Read notifications stay in the DB. Add a cleanup job if you need retention limits.
+</Note>
+
+## See also
+
+- [Chat sessions](/concepts/chat-sessions) — Socket.IO event catalog
+- [Admin overview](/admin/overview) — admin broadcast endpoints

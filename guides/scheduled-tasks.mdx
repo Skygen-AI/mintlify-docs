@@ -1,0 +1,117 @@
+---
+title: "Scheduled tasks"
+description: "Cron-like recurring agent runs — daily digests, periodic checks, weekly reports."
+---
+
+Scheduled tasks fire agent runs on a schedule you define. Daily summaries, Monday standup reports, "every 15 minutes check the site", "once at 9 AM Friday". Skygen runs the scheduler inline in the backend with a distributed lock, so horizontal scaling is safe.
+
+## Schedule model
+
+No raw cron expression — Skygen uses a declarative model:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `frequency` | `once` \| `hourly` \| `daily` \| `weekly` \| `monthly` | Recurrence mode |
+| `time_of_day` | `HH:MM` | Anchor time (in user's timezone) |
+| `timezone` | IANA name (e.g. `America/New_York`) | Validated against `zoneinfo.ZoneInfo` |
+| `day_of_week` | 0–6 (Monday=0) | For weekly frequency |
+| `day_of_month` | 1–31 | For monthly frequency (clamped to last day of short months) |
+| `next_run_at` | UTC datetime, indexed | Next computed fire time |
+| `last_run_at` | UTC datetime | Most recent execution |
+| `is_enabled` | bool | Skip without deleting |
+| `expires_at` | UTC datetime \| null | Optional auto-disable cutoff |
+| `run_count` | int | Total dispatches |
+| `max_concurrent_runs` | int (default 1) | Concurrency gate |
+| `device_id` | FK \| null | Which device runs the task |
+| `computer_use` | bool | Auto-provision E2B if true |
+| `playbook_data` | JSONB | Pre-built automation plan `{ command_name, description, variables, tasks }` |
+| `variables` | JSON | Template params substituted into the prompt |
+
+## Timezones and DST
+
+Skygen computes next-fire times in the **user's local timezone** via `zoneinfo.ZoneInfo`, then stores UTC in `next_run_at`. `zoneinfo` handles DST transitions transparently — no explicit rule in code.
+
+Frequency rules:
+
+- **`once`** — today at `time_of_day` if still in the future, else tomorrow.
+- **`hourly`** — next full hour at `:MM` (minute from `time_of_day`).
+- **`daily`** — next occurrence of `HH:MM`.
+- **`weekly`** — next occurrence of `day_of_week` at `HH:MM`.
+- **`monthly`** — `day_of_month` clamped via `calendar.monthrange()` (e.g. 31 in February becomes 28 or 29).
+
+## Execution
+
+<Note>
+**Inline scheduler, not a separate worker.** The scheduler runs in the main backend process, gated by a **distributed Redis lock** (`SETNX` with 120s TTL, renewed every 30s). Only one pod runs scheduler iterations at a time. When a task fires, the scheduler creates a session, saves a user message, publishes to RabbitMQ, and returns — the agent worker handles the actual agent loop.
+</Note>
+
+Each task also has an execution lock: `sched_task:exec:{task.id}` with 300s TTL, preventing overlap between the scheduler and manual `POST /scheduled-tasks/{id}/run` triggers.
+
+## Catch-up policy
+
+<Warning>
+**Late runs are skipped, not caught up.** If a task was supposed to fire 2 hours ago (> `_MAX_LATE_SECONDS=3600`), the scheduler logs `scheduled_task_skipped_too_late`, creates a `ScheduledTaskRun` record with status=`skipped`, and advances `next_run_at` to the next natural occurrence. Daily task missed at 9 AM because the backend was down? It fires tomorrow at 9, not late today.
+</Warning>
+
+`once` tasks that are skipped or fail are **disabled** (`is_enabled=false`, `next_run_at=null`) so they do not hang around. Recurring tasks advance to the next occurrence regardless of outcome.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/scheduled-tasks` | Create. Validates device ownership and parses `time_of_day`. Initial `next_run_at` computed immediately. |
+| `GET` | `/scheduled-tasks` | List. `?is_enabled`, `?limit`, `?offset`. |
+| `GET` | `/scheduled-tasks/{id}` | Fetch one with connector metadata. |
+| `PATCH` | `/scheduled-tasks/{id}` | Update. Recomputes `next_run_at` if schedule params changed. |
+| `PATCH` | `/scheduled-tasks/{id}/toggle` | Enable/disable. Preserves future `next_run_at` if still valid. |
+| `POST` | `/scheduled-tasks/{id}/run` | **Manual trigger** — bypasses scheduler, hits concurrency check. |
+| `DELETE` | `/scheduled-tasks/{id}` | Soft-delete. |
+| `GET` | `/scheduled-tasks/{id}/runs` | Execution history for this task. |
+| `GET` | `/scheduled-tasks/runs/completed` | Completed runs across all your tasks (UI dashboard). |
+| `POST` | `/scheduled-tasks/extract-playbook` | Extract a reusable automation from a past session. |
+
+## Working example
+
+```bash
+# Monday 9 AM America/New_York
+curl -X POST https://api.skygen.ai/scheduled-tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "name": "Monday standup summary",
+    "frequency": "weekly",
+    "day_of_week": 0,
+    "time_of_day": "09:00",
+    "timezone": "America/New_York",
+    "prompt": "Summarize my open GitHub PRs and post to Slack #standup.",
+    "device_id": "dev_123"
+  }'
+
+# Toggle off temporarily
+curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID/toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"is_enabled": false}'
+
+# Manual fire now
+curl -X POST https://api.skygen.ai/scheduled-tasks/$TASK_ID/run \
+  -H "Authorization: Bearer $TOKEN"
+
+# Inspect runs
+curl https://api.skygen.ai/scheduled-tasks/$TASK_ID/runs \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Gotchas
+
+<Note>
+**Billing per fire.** Each execution consumes tokens like any agent run. Use event [Triggers](/guides/triggers) for sparse, event-driven automations to avoid burning tokens on polls.
+</Note>
+
+<Note>
+**Playbooks, not cron strings.** If you are used to `0 9 * * 1`, translate to `frequency=weekly`, `day_of_week=0`, `time_of_day=09:00`. There is no cron expression field to paste.
+</Note>
+
+## See also
+
+- [Triggers](/guides/triggers) — event-driven alternative
+- [Devices](/concepts/devices) — the target device for each task
+- [Billing](/concepts/billing) — per-run token cost

@@ -1,0 +1,106 @@
+---
+title: "Safety"
+description: "Violation logging, unified confirmations, and why Skygen's safety layer is intentionally thin."
+---
+
+Skygen's Safety layer is **transparency-focused, not constraint-focused**. There is no user-configurable rule engine on the backend. Instead, agents implement their own safety checks and the backend provides two primitives:
+
+1. A violation log — agents write to it when they flag unsafe content.
+2. A unified confirmation channel — agents ask the user when in doubt (same plumbing as [Confirmations](/concepts/confirmations)).
+
+That is the entire safety surface. If you expected a rule editor, see the section at the bottom — it is intentional.
+
+## Verdicts
+
+Only two canonical values ever appear in logs:
+
+- **`UNSAFE`** — the agent's safety checker classified the content as a hard violation.
+- **`NEED_HUMAN_CLARIFICATION`** — the agent is unsure and wants user input.
+
+Stored with `reason`, the context (`user_id`, `task_id`, `device_id`), `triggered_by` (list of checker names like `["regex_checker", "permission_blocker"]`), the raw `user_input` and `agent_output`, and `user_approved` (nullable boolean).
+
+## Endpoints
+
+### Agent-authenticated
+
+<ParamField path="POST /safety/request-confirmation" type="legacy">
+Legacy alias for the unified confirmations flow. Body: `{ device_id, reason, timeout, session_id? }`. Creates a Redis confirmation with TTL, polls every 500ms until the user responds or the timeout fires. Returns `{ approved, message }`. Kept for backward compatibility — new code should use `/agent/confirmations/request`.
+</ParamField>
+
+<ParamField path="POST /safety/log-violation" type="agent">
+Log a safety violation after the agent flags content. Body: `{ verdict, reason, user_id?, task_id?, device_id?, triggered_by?, user_input?, agent_output? }`. Returns `{ violation_id, message }`.
+</ParamField>
+
+### User-authenticated
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/safety/violations?verdict=&limit=&offset=` | The current user's violations |
+| `GET` | `/safety/violations/stats?days=30` | Personal counts by verdict |
+
+### Admin-only
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/safety/violations/global-stats?days=7` | Platform-wide aggregates with affected-user count |
+
+## Violation retrieval
+
+```bash
+curl "https://api.skygen.ai/safety/violations?verdict=UNSAFE&limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+# → { "violations": [{ id, verdict, reason, triggered_by, user_approved, created_at, ... }], "total": 5, ... }
+```
+
+Violations are indexed on `user_id`, `task_id`, `device_id`, `verdict`, `created_at`. Users see their own; admins see global aggregates.
+
+## Integration with confirmations
+
+When a safety checker fires `NEED_HUMAN_CLARIFICATION`, the agent calls `POST /safety/request-confirmation` (or the newer `/agent/confirmations/request`). The rest is identical to a normal confirmation:
+
+```
+Agent detects uncertain action
+   │
+   ▼
+POST /safety/request-confirmation
+   │
+   ▼
+Backend creates Redis confirmation (TTL 300s default)
+   │
+   ▼
+Socket.IO `confirmation_request` event on /user
+   │
+   ▼
+User decides via POST /agent/confirmations/{id}/respond
+   │
+   ▼
+Agent resumes. Violation logged with user_approved=true|false
+```
+
+See [Confirmations](/concepts/confirmations) for the full protocol.
+
+## Why there is no rule editor
+
+Skygen's backend deliberately does not host safety rule configuration. The reasoning:
+
+- **Safety lives where it enforces.** The agent has direct access to the full context (proposed action, history, screenshots) — a server-side rule engine cannot reproduce that fidelity without becoming the agent.
+- **Audit, not override.** The backend's job is to provide transparent records of what the agent flagged and what the user decided. Editing the rules is the agent's job.
+- **Confirmation is the escape valve.** If an action is borderline, ask. That covers the 5% of cases a rigid ruleset cannot.
+
+If you need user-level configuration (e.g., "always require confirmation for shell commands containing `sudo`"), that lives in the agent's own safety profile, not in this API.
+
+## Default checkers
+
+There is no canonical list of default rules stored in the Backend — agents define their own. Typical classes of checks an agent will flag:
+
+- Destructive file operations outside a scratch directory
+- Outbound messages from connected integrations (email, Slack)
+- Reading sensitive file types (`.pem`, `.env`, `.kdbx`)
+- Financial transactions
+
+Each agent version may add or remove checks. Track the agent's release notes, not this page.
+
+## See also
+
+- [Confirmations](/concepts/confirmations) — the flow that every safety ask uses
+- [Agents](/concepts/agents) — where safety checkers actually run

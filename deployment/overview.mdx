@@ -1,0 +1,131 @@
+---
+title: "Deployment overview"
+description: "Services, data stores, clusters, and CI/CD from commit to production."
+---
+
+Skygen runs on AWS EKS with Karpenter auto-scaling. Code flows through GitHub Actions → ECR → EKS. Two clusters separate environments (`skygen-us-dev` and `skygen-us-prod`, both `us-east-1`).
+
+## Services
+
+| Service | Purpose | Image | Port |
+|---------|---------|-------|------|
+| **backend** | FastAPI + Socket.IO HTTP API | `skygen/backend:{env}` | 8000 |
+| **worker** | RabbitMQ consumer (message handlers) | `skygen/backend-worker:{env}` | 8080 health / 8001 metrics |
+| **webapp** | Frontend (Nginx serving Vite build) | `skygen/webapp:{env}` | 80 |
+| **agent** | Python AI agent runtime (separate repo) | `skygen/agent:{env}` | 8080 metrics |
+
+Backend runs single-worker Uvicorn (`--workers 1 --timeout-keep-alive 300 --ws-ping-interval 30 --ws-ping-timeout 30`). Single worker because Socket.IO keeps SID maps in memory; horizontal scaling is handled by replicating pods, with Redis pub/sub as the cross-pod bus.
+
+## Data stores
+
+| Store | Purpose | Local | Prod |
+|-------|---------|-------|------|
+| **PostgreSQL** | Users, sessions, messages, devices, billing, KB embeddings | `pgvector/pgvector:pg15` container | RDS with pgvector |
+| **Redis** | Socket.IO distributed state, caching, pub/sub for horizontal scaling | `redis:7-alpine` | ElastiCache |
+| **RabbitMQ** | Task queues (`SEND_MESSAGE_TO_AGENT_QUEUE`, `ANSWER_AGENT_QUEUE`) | `rabbitmq:3-management-alpine` | self-hosted on EKS |
+| **S3 / MinIO** | Screenshots, attachments, Cloud PC backups | MinIO container | AWS S3 |
+
+S3 buckets (prod):
+
+- `skygen-screenshots-us` — main artifacts
+- `skygen-files-us` — user attachments
+- `skygen-cloudpc-profiles` — Cloud PC snapshots (30-day retention)
+
+## Clusters
+
+### Dev — `skygen-us-dev`
+
+- Namespace: `skygen-agent` (backend + worker + agent), `monitoring` (Prometheus/Grafana/Loki)
+- Replicas: fixed (backend 2, worker 2, agent 2)
+- Ingress: shared ALB group `skygen-dev-shared` (preview environments reuse it)
+- Domain: `dev.skygen.ai` → ALB → `backend-service:8000`
+
+### Prod — `skygen-us-prod`
+
+- Namespace: `skygen-prod`
+- Replicas: HPA-managed
+  - Backend: 3 → 30 (CPU 70%, memory 80%)
+  - Agent: 3 → 100
+  - Worker: 2 → 20
+- Fargate-compatible: DaemonSets removed (node-exporter), Promtail as StatefulSet
+- Domains: `api.skygen.ai`, `app.skygen.ai`
+
+## CI/CD
+
+**GitHub Actions** workflow triggers on push:
+
+- Push to `develop` → build + push to ECR → deploy to dev cluster
+- Push to `main` → build + push → deploy to prod
+- User cannot push directly to `main` or `develop` (protected branches, PR required)
+
+Images go to ECR: `118183257315.dkr.ecr.us-east-1.amazonaws.com/skygen/{backend,backend-worker,webapp,agent}:{dev,prod}`.
+
+Deploy uses `kubectl rollout` with `RollingUpdate` strategy, zero downtime. An init container on every deploy runs `alembic upgrade heads && python -m scripts.create_admin` to ensure schema and default admin exist.
+
+## Deployment topology
+
+```
+                   ┌──────────────────┐
+                   │  GitHub Actions  │
+                   └────────┬─────────┘
+                            │  push image
+                            ▼
+                       ┌─────────┐
+                       │   ECR   │
+                       └────┬────┘
+                            │  pull
+                            ▼
+    ┌───────────────────────────────────────────┐
+    │         EKS (Karpenter autoscaling)       │
+    │                                           │
+    │   ┌──────────┐    ┌────────┐   ┌───────┐ │
+    │   │ backend  │◄──►│ redis  │◄─►│rabbit │ │
+    │   └────┬─────┘    └────────┘   └───┬───┘ │
+    │        │                           │     │
+    │   ┌────▼─────┐              ┌──────▼───┐ │
+    │   │ postgres │              │  worker  │ │
+    │   └──────────┘              └──────────┘ │
+    │                                           │
+    │   ┌──────────┐    ┌─────────────────┐    │
+    │   │  agent   │    │ monitoring ns   │    │
+    │   └──────────┘    │ (prometheus,    │    │
+    │                   │  grafana, loki) │    │
+    │                   └─────────────────┘    │
+    └───────────────────────────────────────────┘
+                            │
+                            ▼
+                      ┌──────────┐
+                      │   ALB    │
+                      └────┬─────┘
+                           │
+                    skygen.ai domains
+```
+
+## Local development
+
+`docker-compose-local.yml` at the monorepo root spins up: PostgreSQL, Redis, RabbitMQ, MinIO, MailHog. Backend runs with `uvicorn app.main:socket_app --reload --port 8000`.
+
+```bash
+# Bring up dependencies
+docker compose -f docker-compose-local.yml up -d
+
+# Backend
+cd Backend && poetry install && poetry run uvicorn app.main:socket_app --reload
+
+# WebApp
+cd WebApp && npm install && npm run dev
+```
+
+Reset DB from scratch:
+
+```bash
+docker compose -f docker-compose-local.yml down
+docker volume rm monorepo_postgres_data
+docker compose -f docker-compose-local.yml up -d
+```
+
+## See also
+
+- [Environment variables](/deployment/environment) — every setting
+- [Monitoring](/deployment/monitoring) — Prometheus / Grafana / Loki
+- [Kubernetes](/deployment/k8s) — cluster specifics

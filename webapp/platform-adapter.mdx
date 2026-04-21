@@ -1,0 +1,263 @@
+---
+title: "Platform adapter"
+description: "IPlatformAdapter interface and how to add a new platform wrapper (Electron, mobile, etc.)."
+---
+
+ui-shared-tauri never imports platform-specific code. Instead it depends on the **`IPlatformAdapter`** interface — a contract that every wrapper (web, macOS, Windows) implements and passes to `bootstrap()` at startup.
+
+## The interface
+
+From `ui-shared-tauri/src/types/platform.ts`:
+
+```typescript
+export interface IPlatformAdapter {
+  platform: "macos" | "windows" | "web";
+
+  capabilities: {
+    hasDesktopAutomation: boolean;
+    hasSecureStorage: boolean;
+    hasOverlay: boolean;
+    canOpenOAuthWindow: boolean;
+  };
+
+  storage: {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+    remove(key: string): Promise<void>;
+  };
+
+  desktop?: {
+    startDeviceWebSocket(): Promise<void>;
+    stopDeviceWebSocket(): Promise<void>;
+    checkDeviceWebSocketStatus(): Promise<boolean>;
+    getDeviceId(): Promise<string | null>;
+  };
+
+  updater?: IUpdaterService;
+
+  analytics?: {
+    identify(userId: string): void;
+    track(event: string, properties?: Record<string, unknown>): void;
+  };
+
+  openOAuthWindow(url: string): Promise<void>;
+}
+```
+
+## Web implementation
+
+**`WebApp/src/platform/webPlatformAdapter.ts`**:
+
+```typescript
+export const webPlatformAdapter: IPlatformAdapter = {
+  platform: "web",
+
+  capabilities: {
+    hasDesktopAutomation: false,
+    hasSecureStorage: false,  // localStorage is not secure
+    hasOverlay: false,
+    canOpenOAuthWindow: true,
+  },
+
+  storage: {
+    get: async (key) => localStorage.getItem(key),
+    set: async (key, value) => localStorage.setItem(key, value),
+    remove: async (key) => localStorage.removeItem(key),
+  },
+
+  openOAuthWindow: async (url) => {
+    window.location.href = url;  // Same-tab redirect
+  },
+
+  desktop: undefined,  // no desktop domain on web
+
+  analytics: {
+    identify: (userId) => {
+      window.dataLayer?.push({ event: "identify", userId });
+    },
+    track: (event, properties) => {
+      const mapped = mapEventName(event);
+      window.dataLayer?.push({ event: mapped, ...properties });
+      if (mapped === "registration_completed") {
+        window.gtag?.("event", mapped, properties);
+      }
+    },
+  },
+};
+```
+
+Analytics push into the GTM `dataLayer`. GTM owns the dispatch to GA4, Google Ads, Yandex Metrica.
+
+## Desktop (Tauri) implementation
+
+Conceptual shape for `AppDemo-MacOS`:
+
+```typescript
+export const macOsPlatformAdapter: IPlatformAdapter = {
+  platform: "macos",
+
+  capabilities: {
+    hasDesktopAutomation: true,
+    hasSecureStorage: true,
+    hasOverlay: true,
+    canOpenOAuthWindow: true,
+  },
+
+  storage: {
+    get: (key) => invoke("plugin:keychain|get", { key }),
+    set: (key, value) => invoke("plugin:keychain|set", { key, value }),
+    remove: (key) => invoke("plugin:keychain|delete", { key }),
+  },
+
+  openOAuthWindow: async (url) => {
+    // Native Safari window; callback via skygen:// URL scheme
+    await invoke("open_oauth_window", { url });
+  },
+
+  desktop: {
+    startDeviceWebSocket: () => invoke("start_device_ws"),
+    stopDeviceWebSocket: () => invoke("stop_device_ws"),
+    checkDeviceWebSocketStatus: () => invoke("check_device_ws_status"),
+    getDeviceId: () => invoke("get_device_id"),
+  },
+
+  updater: {
+    checkForUpdates: () => tauri.updater.check(),
+    installUpdate: () => tauri.updater.downloadAndInstall(),
+  },
+
+  analytics: {
+    identify: (userId) => { /* Mixpanel */ },
+    track: (event, props) => { /* Mixpanel */ },
+  },
+};
+```
+
+## Using the adapter from ui-shared-tauri
+
+Never import platform code directly. Call `getPlatform()`:
+
+```typescript
+import { getPlatform } from "../../init/bootstrap";
+
+const platform = getPlatform();
+const token = await platform.storage.get("auth_token");
+
+if (platform.capabilities.hasDesktopAutomation) {
+  await platform.desktop!.startDeviceWebSocket();
+}
+```
+
+Forbidden in ui-shared-tauri:
+
+```typescript
+import { invoke } from "@tauri-apps/api";  // Tauri-specific, don't
+```
+
+## Capability gating in components
+
+```typescript
+function DeviceSelector() {
+  const { platform } = usePlatform();
+  if (!platform.capabilities.hasDesktopAutomation) return null;
+  return <DeviceDropdown />;
+}
+```
+
+The `usePlatform()` hook reads from React context, populated by `bootstrap()`.
+
+## Adding a new platform (Electron example)
+
+<Steps>
+  <Step title="Create the wrapper repo">
+    ```
+    ElectronApp/
+    ├── src/
+    │   ├── main.tsx
+    │   ├── config/api.ts
+    │   └── platform/electronPlatformAdapter.ts
+    ├── main.js            # Electron main process
+    ├── preload.js         # IPC bridge
+    └── ui-shared/         # submodule → ui-shared-tauri
+    ```
+  </Step>
+  <Step title="Implement IPlatformAdapter">
+    ```typescript
+    export const electronPlatformAdapter: IPlatformAdapter = {
+      platform: "electron" as any,  // extend the type
+      capabilities: {
+        hasDesktopAutomation: true,
+        hasSecureStorage: true,
+        hasOverlay: true,
+        canOpenOAuthWindow: true,
+      },
+      storage: {
+        get: (k) => ipcRenderer.invoke("storage:get", k),
+        set: (k, v) => ipcRenderer.invoke("storage:set", k, v),
+        remove: (k) => ipcRenderer.invoke("storage:remove", k),
+      },
+      openOAuthWindow: async (url) => {
+        return new Promise((resolve) => {
+          const child = new BrowserWindow({ parent: mainWindow, modal: true });
+          child.webContents.on("will-navigate", (e, newUrl) => {
+            if (newUrl.includes("electron://auth-callback")) {
+              child.close();
+              resolve();
+            }
+          });
+          child.loadURL(url);
+        });
+      },
+      desktop: {
+        startDeviceWebSocket: () => ipcRenderer.invoke("device:startWs"),
+        stopDeviceWebSocket: () => ipcRenderer.invoke("device:stopWs"),
+        checkDeviceWebSocketStatus: () => ipcRenderer.invoke("device:statusWs"),
+        getDeviceId: () => ipcRenderer.invoke("device:getId"),
+      },
+    };
+    ```
+  </Step>
+  <Step title="Bootstrap in main.tsx">
+    ```typescript
+    bootstrap({ apiConfig: API_CONFIG, platform: electronPlatformAdapter });
+    ReactDOM.createRoot(...).render(<App />);
+    ```
+  </Step>
+  <Step title="Handle IPC on the Electron main process">
+    ```javascript
+    ipcMain.handle("storage:get", async (e, key) => electronStore.get(key));
+    ipcMain.handle("device:startWs", async () => deviceWsManager.start());
+    // ...
+    ```
+  </Step>
+</Steps>
+
+## OAuth callback scheme per platform
+
+| Platform | Redirect URL |
+|----------|--------------|
+| Web | `https://app.skygen.ai/auth/callback` |
+| macOS Tauri | `skygen://auth-callback` |
+| Electron | `electron://auth-callback` |
+
+Register the URI scheme with the OS, then intercept it in the wrapper and close the OAuth window when it fires.
+
+## Gotchas
+
+<Warning>
+**Storage is always async.** Even web wraps localStorage in a Promise for consistency. Don't `await` inside a render — get the value in `useEffect` or at event-handler time.
+</Warning>
+
+<Note>
+**No user-agent sniffing in ui-shared-tauri.** If you need to branch on platform, use `platform.capabilities` or `platform.platform` from the adapter, never `navigator.userAgent` or `process.platform`.
+</Note>
+
+<Note>
+**Token expiration gotcha.** If keychain fails (locked, reset), `storage.get("auth_token")` returns `null` or throws. The auth layer treats this as "not logged in" and routes to `/login`.
+</Note>
+
+## See also
+
+- [WebApp architecture](/webapp/architecture) — where the adapter plugs in
+- [State management](/webapp/state-management) — store uses `getPlatform().storage`
+- [Authentication](/guides/authentication) — OAuth flows per platform

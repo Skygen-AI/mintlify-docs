@@ -1,0 +1,174 @@
+---
+title: "Handle Composio webhooks"
+description: "Verify HMAC signature, deduplicate, dispatch to agents — the full server-side receive flow."
+---
+
+This tutorial explains how Skygen receives webhooks from Composio when an integration event fires (new email, new Slack message, etc.), verifies authenticity, deduplicates retries, and dispatches the work to an agent.
+
+You do **not** need to implement any of this to use triggers — it's already in Skygen. This tutorial is for operators who want to understand the internals, or anyone building a similar system.
+
+## 1. Configure the secret
+
+Composio signs every webhook with a shared secret. Set it on both sides:
+
+```bash
+# Skygen backend
+COMPOSIO_WEBHOOK_SECRET=whsec_abcdef123...
+COMPOSIO_ENABLED=true
+```
+
+Matching secret lives in the Composio dashboard under "Webhooks" → "Signing secret".
+
+## 2. The webhook Skygen receives
+
+```http
+POST /mcp/webhooks/composio HTTP/1.1
+Host: api.skygen.ai
+Content-Type: application/json
+X-Composio-Signature: sha256=a3c1b5...
+
+{
+  "id": "webhook-event-123",
+  "type": "trigger.fire",
+  "triggerId": "tr_xyz",
+  "triggerName": "GMAIL_NEW_EMAIL",
+  "entityId": "user_456",
+  "appName": "gmail",
+  "data": {
+    "subject": "Q2 roadmap discussion",
+    "from": "alice@company.com",
+    "body": "..."
+  }
+}
+```
+
+## 3. Signature verification (inside Skygen)
+
+```python
+import hmac, hashlib
+
+def verify(payload: bytes, signature: str | None, secret: str) -> bool:
+    if not signature:
+        return False
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature)
+```
+
+The verifier uses `hmac.compare_digest` (timing-safe) and compares the full prefix, not just the hex digest.
+
+In dev, if `COMPOSIO_WEBHOOK_SECRET` is empty, the verifier logs a warning and accepts anyway — do **not** ship that to prod.
+
+## 4. Entity ID prefix stripping
+
+Composio may prefix `entityId` with an environment name: `prod_user_456` or `dev_user_456`. The parser strips the prefix based on `ENVIRONMENT` env var so downstream code sees a clean user ID.
+
+```python
+env_prefix = f"{env}_"
+if user_id.startswith(env_prefix):
+    user_id = user_id[len(env_prefix):]
+```
+
+## 5. Deduplication
+
+Composio retries failed webhooks. Without dedup, the same trigger fires twice → two agent sessions → double cost.
+
+Redis SETNX with an hour TTL, keyed on the webhook ID:
+
+```python
+redis = await get_redis_client()
+accepted = await redis.set(
+    f"composio:webhook:{event_id}",
+    "1",
+    nx=True,   # only if not exists
+    ex=3600,   # 1 hour
+)
+if not accepted:
+    return {"status": "ok", "duplicate": True}  # 200 to stop Composio retrying
+```
+
+Always return 200 for duplicates — Composio will retry on non-200 responses.
+
+## 6. Dispatch to agent
+
+The verified, parsed event becomes a synthetic `AgentProcessingPayload` and gets published to RabbitMQ. The broker:
+
+1. Loads the `TriggerConfiguration` by `trigger_id` to find the user's `action_prompt`
+2. Creates a new chat session prefixed `trigger_`
+3. Saves a user message combining the action prompt + event data
+4. Publishes to the agent's queue
+5. Reports progress back via Socket.IO `trigger_step` events
+
+The agent picks up the session like any normal chat message and runs its usual loop.
+
+## 7. Execution logging
+
+Every event, successful or failed, writes a `TriggerEvent` row:
+
+```
+{
+  id: UUID,
+  trigger_id: "tr_xyz",
+  event_type: "gmail.new_email",
+  payload: {...},            # full event data
+  status: "received" | "dispatched" | "completed" | "failed",
+  error_message: str | null,
+  agent_reasoning: dict,      # LLM reasoning trace (filled post-run)
+  tools_used: list,
+  actions_taken: list,
+  created_at: datetime
+}
+```
+
+Users see this via `GET /mcp/triggers/{id}/runs` — the full audit trail.
+
+## 8. Example end-to-end
+
+```
+Gmail delivers email → Composio detects →
+    POST /mcp/webhooks/composio with signature
+        ↓ (Skygen)
+    verify signature
+    check Redis dedup key
+        ↓
+    parse WebhookEvent, strip entityId prefix
+        ↓
+    look up TriggerConfiguration by trigger_id
+        ↓
+    create chat session, save action_prompt + event data as user message
+        ↓
+    publish to RabbitMQ
+        ↓ (agent worker)
+    consume, plan, call Linear MCP toolkit, create issue
+        ↓
+    complete run, log to TriggerEvent
+        ↓
+    emit trigger_step event to /user Socket.IO (progress UI)
+```
+
+## Common mistakes
+
+<Warning>
+**Timing-safe compare matters.** Using `==` instead of `hmac.compare_digest` leaks signature prefixes to timing attackers. Don't shortcut.
+</Warning>
+
+<Note>
+**Dev-mode accept-all is a footgun.** If you unset `COMPOSIO_WEBHOOK_SECRET` in prod by accident, the backend accepts every webhook. Guard your env.
+</Note>
+
+<Note>
+**Composio 30-second timeout.** If Skygen takes > 30s to respond 200, Composio marks the webhook as failed and retries. Keep the handler fast — dispatch to RabbitMQ, then return immediately.
+</Note>
+
+<Note>
+**No built-in idempotency on the agent side.** Dedup catches webhook-level duplicates but not logical ones. If your agent creates a Linear issue, use idempotency keys in the action prompt ("create or update the issue titled...") so retries don't duplicate.
+</Note>
+
+## What to read next
+
+- [Triggers](/guides/triggers) — user-facing trigger creation
+- [MCP integrations](/concepts/mcp-integrations) — toolkit catalog
+- [Agents](/concepts/agents) — RabbitMQ consumer details

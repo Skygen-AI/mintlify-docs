@@ -1,0 +1,217 @@
+---
+title: "Expose your HTTP API to the agent"
+description: "Define a custom_api connector with encrypted secrets, then let the agent call it as a tool."
+---
+
+This tutorial shows how to turn any internal HTTP API into a tool the agent can call. You'll define a connector, configure encrypted secrets, and use templated substitution so secrets never leave backend memory.
+
+## Scenario
+
+Your company runs an internal orders service at `https://orders.internal.acme.corp`. Authenticated with a bearer token. You want the agent to be able to fetch an order or cancel it on your behalf.
+
+## 1. Create the connector
+
+```bash
+curl -X POST https://api.skygen.ai/connectors/custom \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Internal Orders",
+    "slug": "internal-orders",
+    "type": "custom_api",
+    "description": "ACME internal orders service",
+    "config": {
+      "server_url": "https://orders.internal.acme.corp",
+      "timeout": 30,
+      "secrets": {
+        "API_KEY": "sk-real-key-abc123"
+      }
+    },
+    "tools": []
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "conn_xyz",
+  "type": "custom_api",
+  "slug": "internal-orders",
+  "config": {
+    "server_url": "https://orders.internal.acme.corp",
+    "timeout": 30,
+    "secrets": {
+      "API_KEY": "***"
+    }
+  },
+  "status": "connected"
+}
+```
+
+The secret is redacted in the response — stored encrypted with `MCP_CRYPTO_KEY` (Fernet) in the DB.
+
+## 2. How the agent sees the tool
+
+Custom-API connectors expose a single generic tool named `custom_api__<connector_id>`:
+
+```json
+{
+  "name": "custom_api__conn_xyz",
+  "description": "Custom API: Internal Orders\n\nAvailable secrets: API_KEY\nUse {{SECRET_NAME}} syntax in headers and body.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "method": {"type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE"]},
+      "url": {"type": "string"},
+      "headers": {"type": "object"},
+      "body": {"type": "object"}
+    },
+    "required": ["method", "url"]
+  }
+}
+```
+
+The agent reads this schema, plans a call, and uses `{{API_KEY}}` templates where it wants the secret substituted.
+
+## 3. Example agent call
+
+The agent, reasoning through "fetch order 42", emits a tool call like:
+
+```json
+{
+  "tool_name": "custom_api__conn_xyz",
+  "arguments": {
+    "method": "GET",
+    "url": "https://orders.internal.acme.corp/orders/42",
+    "headers": {
+      "Authorization": "Bearer {{API_KEY}}"
+    }
+  }
+}
+```
+
+Skygen's backend decrypts the connector config, substitutes `{{API_KEY}}` with the plaintext, and makes the HTTP request:
+
+```
+GET /orders/42 HTTP/1.1
+Host: orders.internal.acme.corp
+Authorization: Bearer sk-real-key-abc123
+```
+
+The response flows back to the agent as the tool result.
+
+<Warning>
+**The agent never sees the plaintext secret.** Substitution happens server-side, after the agent's tool-call arguments arrive. Logs show `{{API_KEY}}` not the resolved value.
+</Warning>
+
+## 4. Mark destructive tools
+
+For endpoints that mutate or destroy data, make the agent pause for user approval by tagging the tool with `requires_confirmation: true` in the connector's `tools` array. This triggers the [confirmations flow](/concepts/confirmations) and the agent won't run until the user clicks Approve.
+
+```json
+{
+  "tools": [
+    {
+      "name": "cancel_order",
+      "description": "Cancel an order by ID",
+      "input_schema": {
+        "type": "object",
+        "properties": { "order_id": {"type": "string"} },
+        "required": ["order_id"]
+      },
+      "action": {
+        "type": "http",
+        "method": "POST",
+        "path": "/orders/{order_id}/cancel",
+        "headers": {"X-API-Key": "{{API_KEY}}"},
+        "requires_confirmation": true
+      }
+    }
+  ]
+}
+```
+
+## 5. Upload an icon
+
+```bash
+# Get presigned URL
+curl -X POST https://api.skygen.ai/connectors/icon/presigned \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"content_type": "image/png", "file_extension": "png"}'
+# → { "upload_url": "https://s3.../presigned", "fields": {...}, "icon_key": "connector-icons/<user>/abc.png" }
+
+# Upload (multipart POST with fields + file) — done client-side
+
+# Attach to connector
+curl -X PATCH https://api.skygen.ai/connectors/custom/conn_xyz \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"icon_url": "https://minio.../connector-icons/<user>/abc.png"}'
+```
+
+Max 2 MB. Allowed types: PNG, JPEG, SVG, WebP. Presigned URL valid 5 minutes.
+
+## 6. Test the connector
+
+A simple session that exercises the new tool:
+
+```bash
+curl -X POST https://api.skygen.ai/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title": "Test orders connector"}'
+# → { "id": "sess_test" }
+
+curl -X POST https://api.skygen.ai/sessions/sess_test/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"role": "user", "content": "Using the internal-orders connector, fetch order 42 and tell me its status."}'
+```
+
+Watch the `/user` Socket.IO namespace for the tool call and result, or read the message history afterwards.
+
+## 7. Update or rotate secrets
+
+```bash
+curl -X PATCH https://api.skygen.ai/connectors/custom/conn_xyz \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "config": {
+      "server_url": "https://orders.internal.acme.corp",
+      "secrets": {"API_KEY": "sk-new-rotated-key"}
+    }
+  }'
+```
+
+Full `config` is re-encrypted. Old secret replaced.
+
+## 8. Delete
+
+```bash
+curl -X DELETE https://api.skygen.ai/connectors/custom/conn_xyz \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Any scheduled task or trigger referencing it will fail gracefully at execution ("connector not found").
+
+## Common mistakes
+
+<Warning>
+**URL rejected as SSRF.** Localhost, private IP ranges (`10.x.x.x`, `169.254.x.x`), `.local` TLDs all fail the SSRF check. For testing, configure a reachable dev URL or relax the validator in `services/url_validation.py` (not recommended for prod).
+</Warning>
+
+<Note>
+**MCP probe timeout 10 seconds.** For `custom_mcp` type, the probe runs synchronously at create. Slow-starting MCP servers fail. Either warm them up first or use `custom_api` if you don't need MCP specifics.
+</Note>
+
+<Note>
+**Slug normalization.** Non-alphanumeric chars become `-` and everything is lowercased. `"My Orders API"` → `"my-orders-api"`. Pass your own slug if you care about the exact form.
+</Note>
+
+<Note>
+**Secrets in `description` leak.** Don't write real credentials into `description` or `note`. Those fields are plaintext and returned verbatim.
+</Note>
+
+## What to read next
+
+- [Custom connectors](/guides/custom-connectors) — full schema reference
+- [MCP integrations](/concepts/mcp-integrations) — Composio comparison
+- [Confirmations](/concepts/confirmations) — gating destructive tools

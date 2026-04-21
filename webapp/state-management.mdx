@@ -1,0 +1,153 @@
+---
+title: "State management"
+description: "Zustand slice pattern — 10 slices composed into one store, with hydration, selectors, and persistence rules."
+---
+
+Skygen uses **Zustand** with a **slice pattern**. Each domain gets its own `createXSlice()` that returns partial state + actions. All slices compose into one `useStore()` hook.
+
+## Store composition
+
+**`ui-shared-tauri/src/store/useStore.ts`**:
+
+```typescript
+export type Store = AuthSlice & SessionSlice & MessageSlice & DeviceSlice
+  & BillingSlice & UISlice & NotificationsSlice & HelpdeskSlice
+  & CloudPcSlice & ScheduledTasksSlice;
+
+export const useStore = create<Store>()(
+  devtools(
+    (...a) => ({
+      ...createAuthSlice(...a),
+      ...createSessionSlice(...a),
+      ...createMessageSlice(...a),
+      // 7 more slices...
+    }),
+    { name: "SkygenStore" },
+  ),
+);
+```
+
+Each slice is a `StateCreator`: `(set, get) => ({ state, actions })`. Order in composition matters for slices that read each other at init time.
+
+## The 10 slices
+
+### AuthSlice — `store/slices/authSlice.ts`
+
+State: `user`, `isAuthenticated`, `isLoading`, `needsOTPSetup`, `_isLoggingOut`.
+
+Actions: `login(email, password)`, `signup(...)`, `logout()`, `refreshUser()`, `restoreSession()`.
+
+**Startup hydration**: `isAuthenticated` is initialized by a synchronous read of `auth_token` in storage, so the UI doesn't flash to `/login` before session restore completes.
+
+### SessionSlice — `store/slices/sessionSlice.ts`
+
+State: `sessions`, `currentSessionId`, `isCreatingSession`, `sessionTitle`.
+
+Actions: `loadSessions()`, `createSession(deviceId?, title)`, `setCurrentSession(id)`, `deleteSession(id)`.
+
+### MessageSlice — `store/slices/messageSlice.ts` (800+ lines, biggest)
+
+State keyed by `sessionId`:
+
+```typescript
+messagesBySession: Record<string, Message[]>
+typingBySession: Record<string, boolean>
+taskStatusBySession: Record<string, TaskStatus>
+agentStepsBySession: Record<string, AgentStep[]>
+planBySession: Record<string, PlanPayload | null>
+uiMetaBySession: Record<string, UiMetaUpdatePayload>
+mcpConnectPromptBySession: Record<string, McpConnectPromptData>
+_sendingSessionIds: Set<string>
+```
+
+Actions: `loadMessages(sessionId)`, `sendMessage(...)`, `cancelTask(...)`, `addAgentStep(...)`, `setPlan(...)`, `setUiMeta(...)`.
+
+**Why keyed by sessionId?** Users open multiple tabs/windows with different sessions. Reading `messagesBySession[currentSessionId]` is cheaper than filtering a global list.
+
+### DeviceSlice — `store/slices/deviceSlice.ts`
+
+State: `devices`, `selectedDeviceId`, `isLoadingDevices`.
+Actions: `loadDevices()`, `setSelectedDevice(id)`.
+
+### BillingSlice — `store/slices/billingSlice.ts`
+
+State: `plan`, `upcomingInvoice`, `paymentMethods`, `isLoadingBilling`, `paywallTrigger`.
+Actions: `loadBillingInfo()`, `createPaymentIntent(planId)`, `setPaywallTrigger(...)`.
+
+`paywallTrigger: 'login' | 'signup' | 'limit_reached' | null` signals `MainLayout` to render `PaywallModal`.
+
+### UISlice — `store/slices/uiSlice.ts`
+
+State: `theme`, `sidebarOpen`, `sidebarCollapsed`, `selectedConnector`, `showAudioSettings`.
+Actions: `setTheme(theme)`, `setSidebarOpen(open)`.
+
+### NotificationsSlice — `store/slices/notificationsSlice.ts`
+
+State: `notifications` (toasts), `unreadCount` (bell icon).
+Actions: `addNotification(...)`, `removeNotification(id)`, `loadUnreadNotifications()`.
+
+### HelpdeskSlice — `store/slices/helpdeskSlice.ts`
+
+State: `tickets`, `currentTicketId`, `isLoadingTickets`.
+Actions: `loadTickets()`, `createTicket(...)`, `replyToTicket(...)`.
+
+Real-time: Socket.IO `ticket_created` and `ticket_reply` events update the list and thread live.
+
+### CloudPcSlice — `store/slices/cloudPcSlice.ts` (1000+ lines)
+
+State: `cloudPCs`, `displayStatus`, `controllers`.
+Actions: `startCloudPc(id)`, `stopCloudPc(id)`, `mapToDisplayStatus(internal)`.
+
+### ScheduledTasksSlice — `store/slices/scheduledTasksSlice.ts`
+
+State: `tasks`, `isLoadingScheduledTasks`.
+Actions: `loadScheduledTasks()`, `createScheduledTask(config)`, `deleteScheduledTask(id)`.
+
+## Persistence strategy
+
+**Persisted** (via `IPlatformAdapter.storage`):
+- `auth_token`
+- `refresh_token`
+
+**Not persisted**: everything else. Sessions, messages, devices, billing are **rebuilt from API** on every app load.
+
+The backend is the truth. Local state is a cache. Reload = refresh.
+
+## Selectors
+
+Zustand re-renders any component subscribed to state that changed. Don't subscribe to the whole store — slice what you need.
+
+Good:
+
+```typescript
+const { messages, isTyping, sendMessage } = useStore((s) => ({
+  messages: s.messagesBySession[sessionId] || [],
+  isTyping: s.typingBySession[sessionId] || false,
+  sendMessage: s.sendMessage,
+}));
+```
+
+Bad (re-renders on every store change):
+
+```typescript
+const store = useStore();  // Don't do this
+```
+
+## DevTools
+
+Zustand is wired to the Redux DevTools extension. Open browser DevTools → "Redux" tab to time-travel debug, see action names, diff state.
+
+## Gotchas
+
+<Warning>
+**Token refresh is not in AuthSlice.** If an access token expires mid-session, auth actions do not auto-refresh. The HTTP client catches 401s and triggers refresh. AuthSlice only runs on explicit login/logout.
+</Warning>
+
+<Note>
+**Slice composition order matters.** If a slice reads another slice's state at init time, the declaring order in `useStore` determines what's available. Keep initializations side-effect-free if possible.
+</Note>
+
+## See also
+
+- [API client](/webapp/api-client) — where store actions call the backend
+- [Pages](/webapp/pages) — which components read which slices

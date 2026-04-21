@@ -1,0 +1,175 @@
+---
+title: "Billing"
+description: "Tiers, token accounting, subscription states, and the Stripe integration."
+---
+
+Skygen bills on a **subscription plus metered usage** model. You pay for a tier (Free or a paid plan), every LLM call and tool invocation burns **tokens** from a monthly quota, and overage past the quota is charged through Stripe once you explicitly opt in.
+
+## Tiers
+
+Plans are configured in the database (`SubscriptionPlan` table), not hardcoded, so pricing can change without a release. As of this writing:
+
+| Tier | Price | Included tokens | Cloud PC | Overage | Notes |
+|------|-------|-----------------|----------|---------|-------|
+| **Free** | $0 | Calculated from `daily_usd_limit × renewal_period_days × tokens_per_dollar` | Depends on plan config | Hard block at exhaustion | Lazy-created on first API access |
+| **Paid plans** (Lite, Optima, Pro, etc.) | Per-plan `price_usd` | Per-plan `monthly_tokens` (default 2000) | Depends on `features_config.cloud_pc` | Optional, opt-in via `POST /billing/enable-overage` | Billed through Stripe |
+
+Subscription tiers are tracked by the `SubscriptionTier` enum: `FREE`, `STANDARD`, and a legacy `TRIAL` kept for backward compatibility.
+
+## Token accounting
+
+Every LLM call records a cost in USD, then converts to tokens:
+
+```
+raw_tokens = api_cost_usd × TOKEN_MARGIN_MULTIPLIER × TOKENS_PER_DOLLAR
+```
+
+Default multipliers: margin ≈ 1.2, `tokens_per_dollar` ≈ 400. Fractional amounts accumulate in `TokenBalance.fractional_tokens` and round up once they cross 1.0. Every deduction writes a `TokenTransaction` with `type=api_usage` and the resulting balance.
+
+**What happens when you run out:**
+
+- **Free tier** — hard block. `deduct_tokens_for_api_call` returns `False` with `"Free limit reached."` Service calls fail with HTTP 402.
+- **Paid tier** — Skygen calls `stripe_service.renew_subscription_early()`: cancel the current subscription, create a new one with `payment_behavior=default_incomplete`, pay the invoice, credit `monthly_tokens`. If renewal succeeds, the user continues without noticing. If it fails, HTTP 402.
+- **Paid tier with overage enabled** — usage past the monthly quota is metered to Stripe via `report_overage_usage()` and billed on the next invoice at `$0.0075 / token` by default.
+
+## Subscription state machine
+
+```
+(no subscription)
+      │  lazy-create free
+      ▼
+   FREE ACTIVE ─────(setup-card + subscribe)───▶ STANDARD ACTIVE
+                                                     │
+                               ┌──────invoice.paid───┤
+                               │                     │
+                               ▼                     ▼
+                         tokens renewed       cancel_at_period_end
+                                                     │
+                                                     ▼
+                                                  CANCELED
+                                                     │
+                                                     ▼
+                                        EXPIRED (tier=NONE, no access)
+```
+
+Status values come from `SubscriptionStatus`: `ACTIVE`, `PAST_DUE`, `INCOMPLETE`, `CANCELED`, `EXPIRED`, `TRIALING` (legacy).
+
+## Endpoints
+
+### Public
+
+<ParamField path="GET /billing/pricing" type="public">
+Returns current pricing parameters (`subscription_price_usd`, `monthly_tokens_included`, `overage_price_per_token`). No auth required. Safe to render on marketing pages.
+</ParamField>
+
+### User (Bearer JWT)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/billing/status` | Full billing state: tier, balance, plan, feature flags, period end |
+| `GET` | `/billing/balance` | Just the token balance and lifetime spent |
+| `GET` | `/billing/transactions` | Paginated transaction history |
+| `GET` | `/billing/transactions/grouped` | Transactions grouped by session for UI |
+| `PATCH` | `/billing/model-profile` | Switch model profile (`fast`, `balanced`, `powerful` — plan-gated) |
+| `POST` | `/billing/setup-card` | Create Stripe SetupIntent (desktop flow) |
+| `POST` | `/billing/confirm-card` | Confirm SetupIntent and activate subscription |
+| `POST` | `/billing/create-checkout-session` | Redirect-based Stripe Checkout (web flow) |
+| `GET` | `/billing/stripe/session` | Look up a Checkout session after redirect |
+| `POST` | `/billing/subscribe` | Start a subscription (requires payment method) |
+| `POST` | `/billing/change-plan` | Switch tier; Stripe handles proration automatically |
+| `POST` | `/billing/cancel` | Cancel at period end (default) or immediately |
+| `POST` | `/billing/enable-overage` | Turn on overage billing |
+| `POST` | `/billing/disable-overage` | Turn off overage billing |
+| `GET` | `/billing/portal` | Redirect URL to the Stripe Customer Portal |
+
+### v2 (cleaner two-step flow)
+
+`POST /billing/v2/setup-card` handles both phases of card setup in one endpoint — first call returns a `client_secret` to use with Stripe.js, second call (with the same `setup_intent_id`) completes the attach. `POST /billing/v2/subscribe` then activates or changes the plan. v2 responses use a structured `{error, message}` shape.
+
+## Stripe webhooks
+
+Events posted to `POST /webhooks/stripe`:
+
+| Event | Effect |
+|-------|--------|
+| `setup_intent.succeeded` | Create subscription, activate locally, credit monthly tokens |
+| `checkout.session.completed` | Activate subscription from the web checkout flow |
+| `subscription.updated` | Sync plan changes, trigger renewal if `billing_reason=subscription_update` |
+| `subscription.deleted` | Mark subscription as canceled |
+| `invoice.paid` | Credit `monthly_tokens` via `SUBSCRIPTION_TOPUP` transaction |
+| `invoice.payment_failed` | Mark subscription as `PAST_DUE` (user loses access) |
+
+Webhooks are idempotent: duplicate deliveries return `200 OK` with a `note: "duplicate"` field when a DB unique constraint rejects the double insert. Stripe retries failures for 3 days.
+
+If a webhook is lost and the state drifts, `GET /billing/status` has a fallback: it checks `user.preferences.pending_plan_id` and retries the Stripe plan change inline before returning.
+
+## Feature gates
+
+Plan features live in `SubscriptionPlan.features_config` (JSON):
+
+```json
+{
+  "cloud_pc": true,
+  "max_cloud_pcs": 3,
+  "scheduled_tasks": true,
+  "hide_token_balance": false
+}
+```
+
+Gate checks live in `plan_access_service.require_feature(db, user_id, "cloud_pc")` — used by Cloud PC endpoints, scheduled tasks, and others that are tier-sensitive.
+
+## End-to-end: subscribe in cURL
+
+<Steps>
+  <Step title="Check current state">
+    ```bash
+    curl https://api.skygen.ai/billing/status \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Step>
+  <Step title="Create a SetupIntent">
+    ```bash
+    curl -X POST "https://api.skygen.ai/billing/setup-card?plan_id=$PLAN_ID" \
+      -H "Authorization: Bearer $TOKEN"
+    # → { "client_secret": "seti_...", "setup_intent_id": "seti_..." }
+    ```
+  </Step>
+  <Step title="Collect card with Stripe.js on the client">
+    Use the `client_secret` with `stripe.confirmCardSetup()` in your frontend. Stripe attaches the card to the customer.
+  </Step>
+  <Step title="Confirm the card server-side">
+    ```bash
+    curl -X POST https://api.skygen.ai/billing/confirm-card \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"setup_intent_id": "seti_..."}'
+    ```
+    This starts the subscription and credits the monthly tokens.
+  </Step>
+  <Step title="Opt into overage (optional)">
+    ```bash
+    curl -X POST https://api.skygen.ai/billing/enable-overage \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Step>
+</Steps>
+
+## Known issues
+
+<Warning>
+**Duplicate operation ID.** There are two definitions of `GET /billing/stripe/session` in `billing_router.py`. FastAPI routes to the first; the second is dead code. Mintlify auto-generation warns about this. Pick one and remove the other.
+</Warning>
+
+<Note>
+**`overage_tokens_used` not incremented locally.** The field exists on `Subscription` but the deduction logic reports overage to Stripe without updating the local counter. `GET /billing/status` may report $0 overage while Stripe invoices show real charges. Bug — track the counter in code or drop the field.
+</Note>
+
+<Note>
+**Pending-plan retry is a workaround.** If a `change-plan` webhook is delayed, `GET /billing/status` retries the plan change inline. Users see errors from an unrelated endpoint. Better: return `202 Accepted` from `change-plan` with a clear pending-state response.
+</Note>
+
+## See also
+
+- [Cloud PC](/concepts/cloud-pc) — tier-gated feature
+- [Errors](/errors) — `402` and `403` responses
+- [Scheduled tasks](/guides/scheduled-tasks) — another gated feature

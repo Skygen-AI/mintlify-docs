@@ -1,0 +1,143 @@
+---
+title: "Analytics"
+description: "Event tracking — GA4, Yandex Metrica, Amplitude — with session stitching and DAU/MAU cohorts."
+---
+
+Skygen tracks user events through a unified pipeline that dispatches to multiple analytics providers. Events are enriched with attribution metadata and session identifiers, then fanned out to GA4, Yandex Metrica, and Amplitude (whichever are configured).
+
+## Providers
+
+| Provider | Env vars | What it's for |
+|----------|----------|---------------|
+| GA4 | `GA4_MEASUREMENT_ID`, `GA4_API_SECRET`, `GA4_DEBUG_MODE` | Web analytics, conversions, retention |
+| Yandex Metrica | `YANDEX_COUNTER_ID` | Regional analytics (RU audience) |
+| Amplitude | `AMPLITUDE_API_KEY` | Product analytics, funnels |
+| Resend campaigns | `RESEND_*_AUDIENCE_ID` | Reach users by lifecycle segment |
+
+Master toggle: `ANALYTICS_ENABLED`. If off, `track()` becomes a no-op.
+
+## Client-sent events
+
+### `POST /analytics/events`
+
+Whitelisted events the client can emit directly. Body:
+
+```json
+{
+  "event_name": "app_launched",
+  "client_id": "GA1.2.123456789.1234567890",
+  "ga_session_id": "sess_abc",
+  "properties": {"version": "2.1.0"}
+}
+```
+
+Whitelist:
+
+- `app_installed`, `app_launched`, `app_load_time`, `app_crash`, `app_uninstalled`
+- `session_started`, `session_ended`
+- `daily_active_user`, `monthly_active_user`
+- `device_installed`
+
+Backend-originated events (`registration_completed`, `subscription_started`, `purchase`) are not accepted here — they're emitted server-side to preserve integrity.
+
+### `POST /analytics/crash`
+
+Dedicated endpoint for app crashes. Fields: `error_type`, `error_message` (truncated 500 chars), `stack_trace` (2000 chars), `app_version`, `platform`.
+
+### `POST /analytics/load-time`
+
+`load_time_ms`, `startup_type` (`cold` / `warm` / `hot`).
+
+### `POST /analytics/session/start` and `.../end`
+
+Session lifecycle events. Start: `session_id`, `device_id`. End: also `duration_seconds`, `messages_count`.
+
+### `POST /analytics/uninstall`
+
+Fires when the desktop app is uninstalled. Side effect: triggers a Resend re-engagement campaign via `resend_triggers.on_app_uninstalled()`.
+
+### `GET /analytics/status`
+
+Returns which providers are enabled:
+
+```json
+{
+  "enabled": true,
+  "providers": {
+    "ga4": true,
+    "yandex_metrica": false,
+    "amplitude": true
+  },
+  "resend_triggers": true
+}
+```
+
+## Admin endpoints
+
+### Metrics dashboards
+
+```bash
+GET /analytics/admin/dau-mau?days=30
+# → { dau, wau, mau, total_users, new_users_last_n_days, dau_mau_ratio, wau_mau_ratio }
+
+GET /analytics/admin/retention
+# → { retention: { day_1: { cohort_size, retained, retention_rate }, day_7: ..., day_14: ..., day_30: ... } }
+
+GET /analytics/admin/config
+# Shows which providers are enabled and API keys present
+```
+
+### Re-engagement jobs (admin)
+
+```bash
+POST /analytics/admin/jobs/inactive-users?days_inactive=7&batch_size=100
+# Finds users inactive 7+ days, tracks analytics event, sends re-engagement email
+
+POST /analytics/admin/jobs/retention-tracking?retention_days=1,7,14,30&batch_size=100
+# Tracks retention at each milestone
+
+GET /analytics/admin/inactive-users?days_inactive=3&limit=50
+# Paginated list of inactive users + timestamps
+```
+
+## Enrichment pipeline
+
+Every event passes through `analytics_tracker.track()`:
+
+1. **Resolve user** from `user_id`
+2. **Attribute**: read `registration_meta` (`ga_client_id`, `utm_source`, `utm_campaign`, etc.) and attach to event
+3. **Session stitch**: for near-registration events (`registration_completed`, `card_added`), use `ga_client_id` + `ga_session_id` to stitch to the original browser session in GA4
+4. **Companion events**: `subscription_started` and `purchase` auto-emit a matching `all_purchases` event so multi-product funnels work
+5. **Strip reserved fields**: GA4 reserves `dclid`, `srsltid`, any field starting with `_`. The tracker strips these before dispatch
+6. **Fan out**: dispatch to every enabled provider
+
+## DAU / MAU tracking
+
+When any whitelisted event fires, the tracker updates the user's `last_active_at`. Every ~20 hours it also records a `daily_active_user` event, and every ~25 days a `monthly_active_user` event. This avoids spamming GA but ensures accurate DAU/MAU on the admin dashboard.
+
+## Rate limits
+
+None. Trust the UI not to spam.
+
+## Gotchas
+
+<Warning>
+**Resend triggers can fail silently.** The `/analytics/uninstall` endpoint returns `success: true` even if the Resend email campaign failed. If email follow-up is critical, instrument it yourself.
+</Warning>
+
+<Note>
+**DAU/MAU windowing is fixed 24-hour buckets** keyed on `last_active_at`. Users who never re-authenticate won't count. In multi-platform setups, ensure the client emits `app_launched` on open.
+</Note>
+
+<Note>
+**Whitelist is hardcoded.** Adding a new event requires a backend release. Not runtime-configurable.
+</Note>
+
+<Note>
+**Cohort calculation uses server-local UTC.** Users near midnight in their local timezone might land in unexpected cohorts.
+</Note>
+
+## See also
+
+- [Admin overview](/admin/overview) — admin analytics endpoints
+- [Billing](/concepts/billing) — Resend audience targeting

@@ -1,0 +1,73 @@
+---
+title: "Screenshots"
+description: "Capture and retrieve device screenshots for visual verification."
+---
+
+Agents take screenshots as part of normal operation — to see what is on screen before clicking, to verify a task succeeded, to keep an audit trail. You can also request screenshots explicitly.
+
+## Capture flow
+
+The device captures the image and uploads it **directly to S3** using a presigned POST URL. The backend never proxies the image bytes.
+
+<Steps>
+  <Step title="Device requests a presigned URL">
+    The device (real or sandbox) calls the backend for an upload URL, passing `session_id`, `task_id`, `step_number`.
+  </Step>
+  <Step title="Backend returns presigned POST form">
+    Fields + URL with 300-second TTL. Object key: `screenshots/agent/{session_id}/step_{step_number:04d}_{screenshot_id}.png`.
+  </Step>
+  <Step title="Device multipart-POSTs the image">
+    Goes straight to S3. No backend bandwidth.
+  </Step>
+  <Step title="Fetch later via proxy">
+    `GET /screenshots/proxy/{object_path}` streams the image through the backend with ownership checks and 1-hour cache headers.
+  </Step>
+</Steps>
+
+## Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/screenshots` | Upload a user-captured screenshot |
+| `GET` | `/screenshots/{screenshot_id}` | Look up by ID (tries `.png`, `.jpg`, `.jpeg`). Returns a presigned download URL. |
+| `DELETE` | `/screenshots/{screenshot_id}` | Delete (tries all extensions) |
+| `GET` | `/screenshots/proxy/{object_path:path}` | Secure proxy. Streams from S3 with `Cache-Control: public, max-age=3600`. |
+| `GET` | `/screenshots/session/{session_id}` | All user-captured screenshots in the session |
+| `GET` | `/screenshots/agent/session/{session_id}` | All **agent-captured** screenshots in the session, sorted by step number |
+
+## Security
+
+Proxy enforces ownership: path is matched against `^[a-zA-Z0-9/_.\-]+$`, the session ID is parsed out, and the current user (or agent token) must own the session. Admins can view all.
+
+## Storage
+
+- **Bucket**: `MINIO_BUCKET` env var (S3 or MinIO).
+- **Object layout**:
+  - `screenshots/agent/{session_id}/step_{step:04d}_{id}.png` for agent captures
+  - `screenshots/{user_id}/{id}.png` for user uploads
+- **Metadata**: `user_id`, `session_id`, `task_id`, `step_number` (for agent captures) attached as S3 object metadata.
+- **Retention**: no explicit TTL in code. Apply a lifecycle policy at the bucket level if needed.
+- **No DB record**: screenshots are discovered by listing S3 prefixes. Deleting the object fully removes the screenshot.
+
+## Working example
+
+```bash
+# Upload (user-captured)
+curl -X POST https://api.skygen.ai/screenshots \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@my-screenshot.png"
+
+# List agent screenshots for a session
+curl https://api.skygen.ai/screenshots/agent/session/$SESSION_ID \
+  -H "Authorization: Bearer $TOKEN"
+
+# Proxy-download one
+curl "https://api.skygen.ai/screenshots/proxy/screenshots/agent/$SESSION_ID/step_0042_abc.png" \
+  -H "Authorization: Bearer $TOKEN" \
+  -o step_0042.png
+```
+
+## See also
+
+- [Devices](/concepts/devices) — where agent screenshots come from
+- [Cloud PC](/concepts/cloud-pc) — Cloud PC screenshots use the same flow

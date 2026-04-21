@@ -1,0 +1,139 @@
+---
+title: "Agents"
+description: "The runtime that turns a user message into actions on a device — planning, tool use, and streaming."
+---
+
+An **agent** is the reasoning loop between a user message and the actions Skygen performs on a device. The `BrokerAgent` process consumes jobs from RabbitMQ, picks the right specialist agent for the task, routes LLM calls to one of five providers, submits device actions, and streams progress back to the user in real time.
+
+## Architecture
+
+Skygen uses a **hierarchical dispatch pattern**:
+
+1. **`BrokerAgent`** — the main worker. Listens on RabbitMQ, maintains per-agent inboxes, and routes each incoming `AgentProcessingPayload` to a specialist based on `agent_mode`.
+2. **Specialist agents** — one per mode:
+   - **CUA_OrchestratorAgent** — computer-use automation (click, type, screenshot); may delegate to Supervisor → Performer.
+   - **PlannerAgent** — multi-step research; delegates to DataFetcher.
+   - **DataFetcherAgent** — structured API/web data retrieval.
+   - **MCPToolsAgent** — MCP tool calling (Composio toolkits, custom connectors).
+   - **ProjectSoftwareAgent** — code analysis, generation, refactoring.
+3. **`ModelRouter`** — picks the LLM based on task requirements (reasoning depth, context length, vision), model profile, and per-session premium-call budget.
+
+## Agent modes
+
+The `agent_mode` header on `POST /messages` picks the specialist:
+
+| Mode | What it does | Typical LLM |
+|------|--------------|-------------|
+| `auto` | Route by content; detect whether GUI, API, or code is needed | Adaptive |
+| `cua` | Computer-use: screenshots, clicks, typing on the device | Balanced (Claude Sonnet, GPT-4o) |
+| `deep_research` | Multi-step research, long context aggregation | Long-context model |
+| `mcp` | Run MCP tools against connected integrations | Tool-capable (Claude, GPT) |
+| `swe` | Code reading and generation | Heavy reasoning (Claude Opus, GPT-4.7) |
+| `ask_human` | Pause the worker and wait for user input | No LLM |
+
+## Multi-LLM routing
+
+`ModelRouter` classifies each call as **premium**, **balanced**, or **economy** based on what the caller asked for (`requires_heavy_reasoning`, `requires_long_context`, `requires_vision`) and the plan's model profile. Skygen supports:
+
+- **Anthropic** (Claude Opus, Sonnet)
+- **OpenAI** (GPT-4.7, GPT-4o family)
+- **Google** (Gemini 2.5 Pro, Flash, Flash Lite)
+- **Groq** (Qwen 3 32B, Llama)
+- **Cerebras**
+- **OpenRouter** (fallback for arbitrary models)
+
+Premium calls are capped (typically 3 per session) unless `heavy_reasoning=true`. A circuit breaker trips Gemini on repeated failures. If no candidate in the registry matches the requirements, the router falls through to a default.
+
+## Action lifecycle
+
+Device actions flow through Redis so any worker in a horizontally scaled deployment can observe state:
+
+```
+ PENDING ──(device acks + runs)──► RUNNING ──► COMPLETED
+                                           │
+                                           └──► FAILED
+```
+
+Redis keys (hash-tagged for cluster safety):
+
+| Key | TTL | Purpose |
+|-----|-----|---------|
+| `agent:action:{action_id}:pending` | 600s | Action in flight |
+| `agent:action:{action_id}:completed` | 300s | Result cached for agent poll |
+| `agent:action:{action_id}:failed` | 300s | Error cached for agent poll |
+| `agent:task_action:{task_id}` | 900s | Fallback task→action mapping |
+
+The hash tag `{action_id}` keeps all keys in the same Redis slot so a single pipeline updates them atomically.
+
+## Device action API
+
+Agents submit actions to the backend, which routes to the correct device backend.
+
+<ParamField path="POST /agent/device/execute" type="action">
+Execute an action. Body: `{ device_id, action_id, action_type, parameters, timeout }`.
+
+- `action_type` — one of `CLICK`, `TYPE`, `PRESS`, `HOTKEY`, `SCROLL`, `DRAG`, `HOVER`, `EXECUTE_COMMAND`, `SCREENSHOT`, `ACTIVATE_WINDOW`, `CLOSE_WINDOW`, `RUN_PYTHON`
+- Routes to Socket.IO (real devices), E2B SDK (sandboxes), or Cloud PC control layer based on `device.device_type`
+
+Response: `{ action_id, task_id?, status }` where `status` is `sent_to_device`, `completed`, `failed`, or `timeout`.
+</ParamField>
+
+<ParamField path="GET /agent/device/status/{action_id}" type="action">
+Poll for the result of a previously submitted action. Returns `{ status, result, execution_time, error }` once the device replies or the TTL expires.
+</ParamField>
+
+## Socket.IO `/agent` namespace
+
+Agents maintain a long-lived Socket.IO connection to coordinate with the backend.
+
+**Events the agent sends:**
+
+| Event | Purpose |
+|-------|---------|
+| `heartbeat` | Keep-alive |
+| `subscribe` | Subscribe to device or session events |
+| `execute_action` | Dispatch a device action |
+| `get_device_status` | Poll an action's status |
+| `new_message` | Push a chat message (usually final assistant reply) |
+| `trigger_step` | Report trigger execution progress |
+
+**Events the agent receives:**
+
+| Event | Envelope | Payload |
+|-------|----------|---------|
+| `event` | `confirmation_response` | User decision on a confirmation |
+| `event` | `action_result` | Device finished an action |
+| `event` | `task_completed` | Device finished a task |
+| `event` | `device_status_changed` | Device came online or went offline |
+
+## Hibernation
+
+When an agent has to wait for something it does **not** busy-wait. The `HibernateTool` parks execution and hands control back to the broker. Two modes:
+
+- **`visual_condition`** — poll the screen at an interval (e.g., every 10 seconds) until a condition matches ("login button appears", "progress bar hits 100%").
+- **`timer`** — sleep for a fixed duration without polling.
+
+The agent's state flips to `HIBERNATED` and the broker wakes it when the condition fires or the timer expires. For user input, a follow-up message on the inbox wakes the worker. This matters in multi-worker deployments because any worker can pick up the wake event, not just the one that started the job.
+
+For short waits (a few seconds) agents just call the `wait` tool and stay in the ReAct loop polling Redis.
+
+## Gotchas
+
+<Warning>
+**Device type detection is by enum, not status.** Real devices require `connection_status == "online"`. E2B sandboxes do not — they are always routable. If a real device is offline, action execution returns immediately with an error instead of queueing.
+</Warning>
+
+<Note>
+**Cloud PC control lock.** On a Cloud PC, the agent and the user cannot hold control at the same time. The agent renews the lock on every action; expired locks fail with "currently controlled by user". See [Cloud PC](/concepts/cloud-pc) for the take-control / resume-ai flow.
+</Note>
+
+<Note>
+**Task-to-action fallback mapping.** `agent:task_action:{task_id}` is only used when results arrive before the action was created — rare, but the mapping preserves correlation.
+</Note>
+
+## See also
+
+- [Chat sessions](/concepts/chat-sessions) — where agent work happens
+- [Confirmations](/concepts/confirmations) — how agents pause for user approval
+- [Devices](/concepts/devices) — where actions land
+- [MCP integrations](/concepts/mcp-integrations) — the tool catalog agents can call

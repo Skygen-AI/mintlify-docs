@@ -1,11 +1,15 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Skygen",
+  "description": "Skygen is a multi-platform AI agent automation platform. Build, connect, and run agents across real devices, Cloud PCs, and sandboxed environments.",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#0f172a",
+    "light": "#11A4FF",
+    "dark": "#0f172a"
+  },
+  "appearance": {
+    "default": "dark"
   },
   "favicon": "/favicon.svg",
   "navigation": {
@@ -14,55 +18,100 @@
         "tab": "Guides",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Getting Started",
             "pages": [
               "index",
               "quickstart",
-              "development"
+              "guides/authentication"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/devices",
+              "concepts/chat-sessions",
+              "concepts/agents",
+              "concepts/agent-modes",
+              "concepts/confirmations",
+              "concepts/cloud-pc",
+              "concepts/tasks",
+              "concepts/billing",
+              "concepts/safety",
+              "concepts/notifications"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "MCP & Integrations",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "concepts/mcp-integrations",
+              "guides/connecting-integrations",
+              "guides/custom-connectors",
+              "guides/triggers"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Advanced",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "guides/llm-routing",
+              "guides/knowledge-base",
+              "guides/scheduled-tasks",
+              "guides/screenshots",
+              "guides/audio",
+              "guides/action-history",
+              "guides/analytics",
+              "guides/library",
+              "guides/helpdesk",
+              "guides/pricing",
+              "errors"
+            ]
+          },
+          {
+            "group": "Tutorials",
+            "pages": [
+              "tutorials/slack-digest-bot",
+              "tutorials/cloud-pc-python",
+              "tutorials/composio-webhooks",
+              "tutorials/custom-api-connector"
+            ]
+          },
+          {
+            "group": "WebApp Architecture",
+            "pages": [
+              "webapp/architecture",
+              "webapp/state-management",
+              "webapp/api-client",
+              "webapp/platform-adapter",
+              "webapp/pages"
+            ]
+          },
+          {
+            "group": "Deployment & Operations",
+            "pages": [
+              "deployment/overview",
+              "deployment/environment",
+              "deployment/monitoring",
+              "deployment/k8s"
+            ]
+          },
+          {
+            "group": "Admin",
+            "pages": [
+              "admin/overview"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
+        "openapi": {
+          "source": "openapi.json",
+          "directory": "api-reference"
+        },
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Introduction",
             "pages": [
               "api-reference/introduction"
-            ]
-          },
-          {
-            "group": "Endpoint examples",
-            "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
             ]
           }
         ]
@@ -71,14 +120,19 @@
     "global": {
       "anchors": [
         {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
+          "anchor": "Status",
+          "href": "https://status.skygen.ai",
+          "icon": "signal-bars"
         },
         {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
+          "anchor": "Changelog",
+          "href": "https://skygen.ai/changelog",
           "icon": "newspaper"
+        },
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/skygen-ai",
+          "icon": "github"
         }
       ]
     }
@@ -91,32 +145,31 @@
     "links": [
       {
         "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "href": "mailto:support@skygen.ai"
       }
     ],
     "primary": {
       "type": "button",
       "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
+      "href": "https://skygen.ai"
     }
   },
   "contextual": {
     "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "x": "https://x.com/skygen_ai",
+      "github": "https://github.com/skygen-ai"
     }
   }
 }

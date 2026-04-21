@@ -1,0 +1,163 @@
+---
+title: "Helpdesk"
+description: "Support tickets with messages, attachments, satisfaction ratings, SLA policies, and a public KB."
+---
+
+Helpdesk is Skygen's support ticketing system. Users file tickets, reply with messages, attach files. Admins triage, assign, reply (including internal notes invisible to users), track SLA, and publish knowledge base articles.
+
+## Model
+
+**HelpdeskTicket**:
+
+- `id`, `ticket_number` (auto-increment, human-readable)
+- `user_id` FK, `assigned_to` FK (admin, nullable)
+- `title`, `description`
+- `category`: `bug` | `feature_request` | `billing` | `account` | `general`
+- `priority`: `low` | `normal` | `high` | `urgent`
+- `status`: `open` | `in_progress` | `resolved` | `closed` | `reopened`
+- `satisfaction_rating` (1–5, nullable), `satisfaction_comment`
+- `first_response_at`, `resolved_at`, `closed_at` (SLA timestamps)
+- `deleted_at` (soft delete)
+
+**HelpdeskMessage**: `ticket_id`, `author_id`, `content`, `is_internal` (admin-only note), `created_at`.
+
+**HelpdeskAttachment**: `ticket_id`, `message_id`, `uploader_id`, `filename`, `content_type`, `size_bytes`, `object_key` (S3).
+
+**HelpdeskStatusChange**: audit log of every status/priority/assignment change.
+
+**KBArticle**: `title`, `slug`, `content`, `category`, `tags[]`, `is_published`, `view_count`, `helpful_count`, `not_helpful_count`.
+
+## User endpoints
+
+### Tickets
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/helpdesk/tickets` | Create ticket (rate-limited: 10/hour per user) |
+| `GET` | `/helpdesk/tickets` | List own tickets. Filters: `status`, `search` |
+| `GET` | `/helpdesk/tickets/{id}` | Full detail (messages + attachments + status history) |
+| `PATCH` | `/helpdesk/tickets/{id}` | Edit title or description (open/reopened only) |
+| `DELETE` | `/helpdesk/tickets/{id}` | Soft-delete (open/reopened only) |
+| `POST` | `/helpdesk/tickets/{id}/messages` | Reply (rate-limited: 30/hour). `content` 1–10000 chars |
+| `POST` | `/helpdesk/tickets/{id}/rate` | Rating 1–5 + optional comment. Resolved/closed only. One-shot. |
+
+### Attachments
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/helpdesk/tickets/{id}/attachments/presigned` | Get S3 upload URL. `filename`, `content_type`, `size_bytes` (≤20 MB). Rate: 20/hour |
+| `GET` | `/helpdesk/tickets/{id}/attachments/{att_id}/download` | Presigned download + preview URLs |
+
+### Knowledge base (public, no auth)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/helpdesk/kb/articles` | List published. Filters: `category`, `search` |
+| `GET` | `/helpdesk/kb/articles/{slug}` | Read. Increments `view_count`. 404 if unpublished |
+| `POST` | `/helpdesk/kb/articles/{id}/feedback` | Vote `{helpful: bool}`. Auth required. One vote per user. |
+
+## Create a ticket
+
+```bash
+curl -X POST https://api.skygen.ai/helpdesk/tickets \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "title": "App crashes on login",
+    "description": "After entering credentials the app force-closes.",
+    "category": "bug",
+    "priority": "high"
+  }'
+# → 201 { "id": "...", "ticket_number": 1042, "status": "open", ... }
+```
+
+## Reply with an attachment
+
+<Steps>
+  <Step title="Get presigned URL">
+    ```bash
+    curl -X POST https://api.skygen.ai/helpdesk/tickets/$TID/attachments/presigned \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{"filename": "error.log", "content_type": "text/plain", "size_bytes": 2048}'
+    # → { "attachment_id": "...", "upload_url": "https://s3.../presigned" }
+    ```
+  </Step>
+  <Step title="Upload to S3">
+    ```bash
+    curl -X PUT "$PRESIGNED_URL" --data-binary @error.log
+    ```
+    Presigned URL expires in ~15 minutes (AWS default).
+  </Step>
+  <Step title="Reply referencing the attachment">
+    ```bash
+    curl -X POST https://api.skygen.ai/helpdesk/tickets/$TID/messages \
+      -H "Authorization: Bearer $TOKEN" \
+      -d '{"content": "Attached the error log from the crash"}'
+    ```
+  </Step>
+</Steps>
+
+## Rate a resolved ticket
+
+```bash
+curl -X POST https://api.skygen.ai/helpdesk/tickets/$TID/rate \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"rating": 4, "comment": "Quick turnaround, thanks"}'
+```
+
+Returns `409 Conflict` if already rated.
+
+## Real-time updates
+
+Socket.IO events on `/user`:
+
+- `ticket_created` — admin assigned a ticket to a team member (if user has admin role)
+- `ticket_reply` — new message in a ticket the user is involved in
+- `ticket_status_changed` — status transition
+
+Frontend `HelpdeskSlice` listens and updates the list/thread live.
+
+## KB browsing
+
+```bash
+# List articles in category
+curl "https://api.skygen.ai/helpdesk/kb/articles?category=troubleshooting&limit=10"
+
+# Read one (increments view_count)
+curl "https://api.skygen.ai/helpdesk/kb/articles/how-to-reset-password"
+
+# Vote helpful (auth required)
+curl -X POST https://api.skygen.ai/helpdesk/kb/articles/$ARTICLE_ID/feedback \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"helpful": true}'
+```
+
+## Gotchas
+
+<Note>
+**Ticket ID vs ticket number.** API uses `ticket_id` (UUID). Humans reference `ticket_number` (integer starting ~1001). Map between them in your support workflows.
+</Note>
+
+<Note>
+**First-response SLA only on user messages.** Admin replies don't set `first_response_at` if the ticket was created directly by an admin without a user message first.
+</Note>
+
+<Note>
+**Presigned URLs expire in ~15 min.** If your user takes longer to upload, regenerate the URL.
+</Note>
+
+<Note>
+**Rating is locked after first submission.** No edit, no delete. Design your UI around this.
+</Note>
+
+<Note>
+**Search uses ILIKE, not full-text search.** Substring matching on title/description. Not great on long corpuses. Consider adding pg_trgm or a vector search if it matters.
+</Note>
+
+## Admin
+
+See [Admin overview](/admin/overview) for the admin-side endpoints: ticket triage, assignment, internal notes, SLA policies, canned responses, KB management.
+
+## See also
+
+- [Errors](/errors) — helpdesk-specific error codes
+- [Admin overview](/admin/overview)

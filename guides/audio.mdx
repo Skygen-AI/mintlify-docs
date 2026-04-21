@@ -1,0 +1,103 @@
+---
+title: "Audio transcription"
+description: "Upload an audio clip, get text back — Whisper via RunPod with per-second cost tracking."
+---
+
+Skygen's audio service transcribes short audio clips using **Faster Whisper** hosted on RunPod. Upload an audio file, get the transcript, detected language, and cost. One endpoint, one response, no streaming.
+
+## Endpoint
+
+### `POST /audio/transcribe`
+
+Multipart form-data request.
+
+| Field | Type | Required | Purpose |
+|-------|------|----------|---------|
+| `file` | file | yes | Audio file |
+| `session_id` | string | no | Link to a chat session (context) |
+| `language` | string | no | ISO 639-1 hint (e.g. `en`, `es`) |
+| `model` | string | no | Whisper model override (default `WHISPER_MODEL`) |
+
+**Supported content types**: `audio/webm`, `audio/wav`, `audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/x-m4a`, `audio/mp4`.
+
+**Limits**: file > 0 bytes, ≤ 5 MB.
+
+**Response**:
+
+```json
+{
+  "transcription_id": "txn-abc-123",
+  "text": "Hello, this is a test recording.",
+  "detected_language": "en",
+  "processing_time_seconds": 1.234,
+  "cost": 0.0124,
+  "model": "turbo"
+}
+```
+
+**Errors**:
+
+- `400` — invalid content type, empty file, or size > 5 MB
+- `500` — RunPod transcription failed (network, model error)
+
+## Working example
+
+```bash
+curl -X POST https://api.skygen.ai/audio/transcribe \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@recording.wav" \
+  -F "session_id=sess_abc" \
+  -F "language=en"
+```
+
+## Cost model
+
+```
+cost_usd = audio_duration_seconds × WHISPER_COST_PER_SECOND
+```
+
+Default `WHISPER_COST_PER_SECOND = 0.0004`. A 10-second clip costs ~$0.004. The response includes the exact cost; the amount is also recorded in the `Transcription` DB row for downstream billing.
+
+## Storage
+
+Each transcription creates a `Transcription` row:
+
+- `id` UUID
+- `user_id` FK
+- `session_id` optional FK
+- `text` — the transcript
+- `detected_language` — ISO 639-1 from Whisper
+- `model` — which model was used
+- `processing_time_seconds`
+- `audio_duration_seconds`
+- `cost`
+- `created_at`
+
+Audio files themselves are **not stored** — only the transcript. If you need the original, upload it to your own storage before calling this endpoint.
+
+## When to use `language`
+
+Providing a hint speeds up Whisper and improves accuracy on short clips. If the user's primary language is known, always pass it. Leave it empty only when you genuinely need auto-detection.
+
+## Gotchas
+
+<Warning>
+**Max size 5 MB is hardcoded.** For longer recordings, chunk on the client and call multiple times, or lift the limit in `Backend/app/routers/audio/audio_router.py` and redeploy.
+</Warning>
+
+<Note>
+**No rate limit on this endpoint.** A runaway client can burn cost. Gate calls at the UI level and alert on spikes.
+</Note>
+
+<Note>
+**Audio duration fallback is crude.** If RunPod doesn't return `audio_duration_seconds`, Skygen falls back to `processing_time × 2` or `1.0`. In billing-critical flows, pre-compute duration client-side and pass it into `session_id` metadata.
+</Note>
+
+<Note>
+**`detected_language` is not validated.** Whisper returns free-form language labels. If your app routes on language, normalize first.
+</Note>
+
+## See also
+
+- [Chat sessions](/concepts/chat-sessions) — linking transcripts to sessions
+- [Billing](/concepts/billing) — where audio costs roll up

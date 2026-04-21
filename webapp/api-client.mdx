@@ -1,0 +1,225 @@
+---
+title: "API client"
+description: "HTTP modules, Socket.IO lifecycle, type system, and error handling."
+---
+
+The API layer in `ui-shared-tauri/src/api/` is two things: a tiny HTTP client (`httpClient`) used by per-domain modules, and a Socket.IO manager (`wsClient`) used by every real-time feature.
+
+## HTTP client
+
+**`src/api/http/httpClient.ts`**:
+
+```typescript
+export const httpClient = {
+  get: <T>(path, options?) => request<T>("GET", path, undefined, options),
+  post: <T>(path, body?, options?) => request<T>("POST", path, body, options),
+  patch: <T>(path, body?, options?) => request<T>("PATCH", path, body, options),
+  delete: <T>(path, options?) => request<T>("DELETE", path, undefined, options),
+};
+```
+
+### Auth headers
+
+Token is resolved **per-request** because storage is async on desktop:
+
+```typescript
+async function getAuthHeaders() {
+  const platform = getPlatform();
+  const token = await platform.storage.get("auth_token");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+```
+
+### Error extraction
+
+`HttpClientError` captures status + data. `extractErrorMessage(err)` normalizes three shapes into a string:
+
+1. FastAPI standard: `detail: "message"`
+2. Nested: `detail: { message: "..." }`
+3. Pydantic validation: `detail: [{ loc: [...], msg: "..." }]`
+
+```typescript
+export function extractErrorMessage(error: unknown): string {
+  if (!(error instanceof HttpClientError)) return String(error);
+  const errObj = error.data as Record<string, unknown>;
+  if (typeof errObj.detail === "string") return errObj.detail;
+  if (typeof errObj.detail === "object" && !Array.isArray(errObj.detail)) {
+    return (errObj.detail as any).message ?? "Unknown error";
+  }
+  if (Array.isArray(errObj.detail)) {
+    return errObj.detail.map((e: any) => `${e.loc.join(".")}: ${e.msg}`).join("; ");
+  }
+  return error.message;
+}
+```
+
+## Per-domain API modules
+
+All follow the same pattern: import `httpClient`, export namespaced methods. One file per domain:
+
+| Module | Responsibility |
+|--------|----------------|
+| `authApi` | signup, login, logout, refresh, OAuth, 2FA stubs |
+| `sessionApi` | sessions + messages CRUD, send message |
+| `deviceApi` | devices CRUD, register, delete, status |
+| `billingApi` | billing info, payment intent, plans, coupons |
+| `connectorsApi` | MCP integrations, OAuth initiate, disconnect |
+| `scheduledTasksApi` | scheduled tasks CRUD |
+| `helpdeskApi` | tickets, replies, attachments, KB articles |
+| `cloudPcApi` | Cloud PC lifecycle + files |
+| `notificationsApi` | in-app notifications, mark-read |
+
+### Example: login flow
+
+```typescript
+async login(email: string, password: string): Promise<TokenResponse> {
+  const body = new URLSearchParams();
+  body.append("username", email);
+  body.append("password", password);
+
+  const res = await fetch(`${getBackendUrl()}/auth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  const data: TokenResponse = await res.json();
+  await getPlatform().storage.set("auth_token", data.access_token);
+  return data;
+}
+```
+
+Note: the login endpoint uses form-encoded (OAuth2 spec), not JSON.
+
+## Socket.IO client
+
+**`src/api/websocket/wsClient.ts`** (singleton):
+
+```typescript
+const wsClient = SocketIOClient.getInstance();
+
+await wsClient.connect(userId, token);
+
+wsClient.on("agent_response", (msg) => { /* */ });
+wsClient.on("ui_meta_update", (data) => { /* */ });
+wsClient.on("task_progress", (p) => { /* */ });
+
+wsClient.disconnect();
+```
+
+### Connection details
+
+- **Namespace**: `/user` (authenticated user events)
+- **Transport**: WebSocket, falls back to HTTP long-polling
+- **Reconnection**: exponential backoff (1s → 2s → 4s → max 10s)
+- **Heartbeat**: 25-second ping/pong
+
+### Events you handle
+
+| Event | Payload | Notes |
+|-------|---------|-------|
+| `agent_response` | `{ session_id, message, status, tokens_remaining }` | Final assistant reply |
+| `ui_meta_update` | `{ session_id, payload: { type, ... } }` | Live agent progress |
+| `status_update` | `{ session_id, status, content? }` | "thinking", "executing", "hibernated" |
+| `plan_update` | `{ plan_version, steps[] }` | Step tree with statuses |
+| `mode_progress` | `{ mode, stage, status, progress, detail }` | Per-agent-mode progress |
+| `confirmation_request` | `{ input_config: { type, prompt, choices } }` | `ask_human` |
+| `task_progress` | `{ session_id, progress, status, message }` | Task execution % |
+| `device_status_update` | `{ device_id, status }` | Online / offline |
+| `attachments_ready` | `{ session_id, message_id, attachments[] }` | File upload complete |
+| `cloud_pc_status_changed` | `{ device_id, status }` | Cloud PC state change |
+| `admin_notification` | `{ type, content }` | System broadcast |
+
+<Note>
+**Skygen does not stream tokens for assistant replies.** A single `agent_response` event carries the complete message. Use `ui_meta_update`, `mode_progress`, and `status_update` for live progress indication.
+</Note>
+
+### Token refresh on reconnect
+
+```typescript
+wsClient.setTokenRefresher(() => platform.storage.get("auth_token"));
+```
+
+On connection loss, Socket.IO auto-reconnects and fetches the current token before reauthenticating. If the token expired, reconnect fails; the user must log in again.
+
+## Type system
+
+Types live in `ui-shared-tauri/src/types/api.ts` (plus `platform.ts`, `websocket.ts`).
+
+**Source of truth**: hand-written TypeScript. Types are manually kept in sync with backend Pydantic models. No code generation. Risk of drift is mitigated by:
+
+- Contract tests in CI
+- Runtime guards: `isDeviceBusyError(detail)`, `isValidationError(detail)`
+- Defensive error extraction (see above)
+
+Core shapes:
+
+```typescript
+interface User {
+  id: string;
+  email: string;
+  display_name: string;
+  is_active: boolean;
+  is_admin: boolean;
+  is_email_verified: boolean;
+  is_2fa_verified: boolean;
+  created_at: string;
+}
+
+interface Session {
+  id: string;
+  user_id: string;
+  device_id?: string;
+  title: string;
+  is_archived: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Message {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  meta_data?: MessageMetadata;
+  attachments?: AttachedFile[];
+  created_at: string;
+}
+```
+
+## Error type guards
+
+```typescript
+function isDeviceBusyError(detail: unknown): detail is DeviceBusyError {
+  return (
+    typeof detail === "object" && detail !== null
+    && (detail as any).error === "device_busy"
+  );
+}
+
+try {
+  await sessionApi.sendMessage(...);
+} catch (err) {
+  if (err instanceof HttpClientError && isDeviceBusyError(err.data?.detail)) {
+    showModal("Device busy with another task");
+  }
+}
+```
+
+## Mocking mode
+
+Both `httpClient.ts` and `authApi.ts` define:
+
+```typescript
+const USE_MOCKS = false;
+```
+
+Flip to `true` to short-circuit every network call with empty data. Useful for offline UI work.
+
+## See also
+
+- [State management](/webapp/state-management) — how store actions use these modules
+- [Chat sessions](/concepts/chat-sessions) — Socket.IO event catalog
+- [Errors](/errors) — HTTP status codes

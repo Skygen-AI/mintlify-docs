@@ -1,0 +1,127 @@
+---
+title: "Library"
+description: "Curated catalog of reusable use-case templates organized by category."
+---
+
+The library is a **public, no-auth** catalog of reusable "use case" templates. Each card bundles a title, description, prompt, image, and badge. Admins curate the content; users browse, click a card, and open a new session pre-filled with the template's prompt.
+
+## Model
+
+**LibraryCategory**:
+
+- `id` UUID
+- `slug` unique URL-safe string (e.g. `finance`, `research`)
+- `name`, `description`
+- `sort_order`
+- `is_active` (soft delete)
+
+**LibraryCard**:
+
+- `id` UUID
+- `category_id` FK
+- `title`, `subtitle`, `description`
+- `prompt` — the full instruction text
+- `image_base64` — PNG/JPG encoded for inline display
+- `badge_text` — "New", "Popular", etc.
+- `send_to_landing_main_screen` — boolean for homepage featuring
+- `is_active`, `sort_order`
+
+## Endpoints (public, no auth)
+
+### `GET /library/types`
+
+All active categories.
+
+Response:
+
+```json
+{
+  "items": [
+    { "id": "cat-1", "slug": "finance", "name": "Finance & Accounting", "description": "..." },
+    { "id": "cat-2", "slug": "research", "name": "Research", "description": "..." }
+  ],
+  "total": 2
+}
+```
+
+### `GET /library/cards`
+
+All cards, with optional filters.
+
+Query:
+
+- `type` — filter by category slug (e.g. `finance`)
+- `filter` — `send_to_landing_main_screen` to get homepage features
+- `ids` — comma-separated IDs; returns in specified order
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "card-1",
+      "title": "Generate Q1 financial report",
+      "subtitle": "From spreadsheet",
+      "description": "...",
+      "prompt": "Analyze the attached Q1 spreadsheet...",
+      "image_base64": "iVBORw0KGgo...",
+      "badge_text": "Popular"
+    }
+  ],
+  "total": 1
+}
+```
+
+### `GET /library/cards/{id}`
+
+Single card detail. 404 if not found or soft-deleted.
+
+## Working examples
+
+```bash
+# Browse finance cards
+curl "https://api.skygen.ai/library/cards?type=finance"
+
+# Homepage features
+curl "https://api.skygen.ai/library/cards?filter=send_to_landing_main_screen"
+
+# Specific cards in order
+curl "https://api.skygen.ai/library/cards?ids=card-1,card-2,card-3"
+
+# Single card
+curl "https://api.skygen.ai/library/cards/card-abc-123"
+```
+
+## Frontend integration
+
+In the WebApp, `LibraryPage` loads categories + cards at mount. Clicking a card:
+
+1. Saves `{ prompt: card.prompt }` to `sessionStorage.pendingPrompt`
+2. Navigates to `/` (HomeUpdated)
+3. HomeUpdated reads the pending prompt and pre-fills `TaskInput` in the next session
+
+## Gotchas
+
+<Note>
+**Image payload can be large.** `image_base64` is returned with every card. For a page with 50 cards, that's megabytes of JSON. Consider paginating or adding a separate endpoint that returns cards without images.
+</Note>
+
+<Note>
+**Prompt can be long.** Some templates are 2–10 KB of instructions. Fine for an API, but budget accordingly on the client.
+</Note>
+
+<Note>
+**Category slug is URL-safe but unvalidated at client.** A typo in `?type=finace` returns 404 with a generic message, not a typo hint.
+</Note>
+
+## Admin
+
+Categories and cards are created through the admin panel. See [Admin overview](/admin/overview). Key admin endpoints:
+
+- `GET/POST/PUT/DELETE /admin/api/library/categories`
+- `GET/POST/PUT/DELETE /admin/api/library/cards`
+
+## See also
+
+- [Chat sessions](/concepts/chat-sessions) — how a template becomes a session

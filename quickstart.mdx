@@ -1,80 +1,121 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Register, authenticate, connect a device, and run your first agent session."
 ---
 
-## Get started in three steps
+This guide walks you from a fresh account to a running agent in under five minutes. You will create a user, obtain an access token, register a device, start a chat session, and send a message.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- An email address for account verification
+- One of: the Skygen desktop app installed on your machine **or** access to create a Cloud PC
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+## 1. Create an account
 
-### Step 2: Deploy your changes
+Sign up through the web dashboard or via the API.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.skygen.ai/security/signup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "you@example.com",
+    "password": "your-strong-password"
+  }'
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```python Python
+import httpx
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+response = httpx.post(
+    "https://api.skygen.ai/security/signup",
+    json={"email": "you@example.com", "password": "your-strong-password"},
+)
+response.raise_for_status()
+```
+</CodeGroup>
 
-### Step 3: Go live
+Check your inbox for a verification email and confirm the address before continuing.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+## 2. Log in and get an access token
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.skygen.ai/security/login \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=you@example.com&password=your-strong-password"
+```
+</CodeGroup>
+
+The response contains an `access_token` (JWT). Use it as `Authorization: Bearer <token>` in every authenticated request. See [Authentication](/guides/authentication) for the refresh flow.
+
+## 3. Register a device
+
+Devices are the machines your agent will run on. They can be real (your laptop via the desktop app) or virtual (a Cloud PC or E2B sandbox).
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.skygen.ai/devices \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My MacBook",
+    "platform": "macos",
+    "device_type": "real_device"
+  }'
+```
+</CodeGroup>
+
+The response includes a `device_token_kid` which the desktop app uses to authenticate its websocket connection. See [Devices](/concepts/devices) for the full lifecycle.
+
+## 4. Start a chat session
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.skygen.ai/sessions \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "DEVICE_UUID_FROM_STEP_3",
+    "title": "First run"
+  }'
+```
+</CodeGroup>
+
+Sessions scope agent memory and tool access. Learn more in [Chat sessions](/concepts/chat-sessions).
+
+## 5. Send a message
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.skygen.ai/messages \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "SESSION_UUID_FROM_STEP_4",
+    "role": "user",
+    "content": "Take a screenshot of my desktop and describe what you see."
+  }'
+```
+</CodeGroup>
+
+The agent processes the message, plans actions, and executes them on the device. Replies stream back through the same session. For real-time updates subscribe to the `/user` Socket.IO namespace.
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Connect integrations" icon="plug" href="/guides/connecting-integrations">
+    Let the agent use Gmail, Slack, and 500+ other tools.
+  </Card>
+  <Card title="Add a Cloud PC" icon="cloud" href="/concepts/cloud-pc">
+    Run tasks without tying up your local machine.
+  </Card>
+  <Card title="Schedule a task" icon="calendar" href="/guides/scheduled-tasks">
+    Fire jobs on a cron schedule.
+  </Card>
+  <Card title="Review errors" icon="circle-exclamation" href="/errors">
+    Understand the status codes you will hit.
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+{/* TODO: replace api.skygen.ai with the real production host once confirmed */}

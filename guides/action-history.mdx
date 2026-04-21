@@ -1,0 +1,104 @@
+---
+title: "Action history"
+description: "Read-only audit trail of every UI action the agent performed in your sessions."
+---
+
+Action history is the ledger of every click, key press, screenshot, scroll, and shell command the agent executed on your behalf. It is derived from `ui_meta_update` system messages stored in the session's transcript, rendered into a clean, queryable feed.
+
+Use it for debugging ("what did the agent actually do?"), transparency ("show me every action"), or as a timeline visualization of complex sessions.
+
+## Data source
+
+There is no separate action_history table. Entries come from `chat_messages` where:
+
+- `role = "system"`
+- `meta_data.type = "ui_meta_update"`
+
+The backend parses the embedded `ui_meta` JSON and returns a clean shape. A partial index `ix_chat_messages_ui_meta` makes this query fast even on large sessions.
+
+## Endpoint
+
+### `GET /action-history`
+
+Query parameters:
+
+| Param | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `session_id` | UUID | — | Filter to one session |
+| `date_from` | ISO datetime | — | Inclusive lower bound |
+| `date_to` | ISO datetime | — | Inclusive upper bound |
+| `mode` | enum | — | `cua`, `deep_research`, `mcp`, `ask_human` |
+| `limit` | int | 50 | Max 200 |
+| `offset` | int | 0 | Standard offset pagination |
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "msg-uuid",
+      "session_id": "sess-uuid",
+      "action_type": "click",
+      "title": "Click 'Submit'",
+      "detail": "x=642, y=389 in Firefox",
+      "tool": "playwright",
+      "status": "success",
+      "timestamp": "2026-04-20T15:30:12Z"
+    }
+  ],
+  "total": 247,
+  "session_id": "sess-uuid"
+}
+```
+
+Fields:
+
+- `action_type` — one of `click`, `type`, `scroll`, `screenshot`, `key`, `wait`, `drag`, `move`, `double_click`, `right_click`, or anything the agent writes to `ui_meta.action_type`
+- `title` — user-friendly label. Falls back to a title derived from `action_type` if null
+- `detail` — extra context (coordinates, command, file path)
+- `tool` — the tool class: `playwright`, `computer_use`, `shell`, etc.
+- `status` — `success`, `failure`, `unknown`
+
+## Working examples
+
+```bash
+# Everything in a session
+curl "https://api.skygen.ai/action-history?session_id=$SID&limit=100" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Last 24 hours across all sessions
+curl "https://api.skygen.ai/action-history?date_from=2026-04-19T00:00:00&date_to=2026-04-20T00:00:00&limit=200" \
+  -H "Authorization: Bearer $TOKEN"
+
+# Only CUA actions
+curl "https://api.skygen.ai/action-history?session_id=$SID&mode=cua" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Ordering
+
+Sorted by `created_at DESC`. Most recent action first. `offset`-based pagination works but slows on large offsets — for deep scrolling use `date_to` with the last seen timestamp.
+
+## Gotchas
+
+<Note>
+**Lost on hard delete.** If you hard-delete a session (`DELETE /sessions/{id}/permanent`), every action is gone. Soft delete (`DELETE /sessions/{id}`) preserves the history.
+</Note>
+
+<Note>
+**Index only helps on the exact filter combo.** The partial index covers `role=system AND type=ui_meta_update`. Filtering on different `role` values won't use it — you'll hit a scan.
+</Note>
+
+<Note>
+**Timestamps are UTC.** `date_from`/`date_to` use server-side UTC, not user-local time. Convert on the client.
+</Note>
+
+<Note>
+**Tool string is free-form.** No validation. Two agents could write `"playwright"` and `"Playwright"` into the same feed. Normalize on the client if you group by tool.
+</Note>
+
+## See also
+
+- [Agents](/concepts/agents) — where the `ui_meta_update` events originate
+- [Chat sessions](/concepts/chat-sessions) — the underlying message store

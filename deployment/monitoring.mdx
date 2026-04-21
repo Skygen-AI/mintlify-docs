@@ -1,0 +1,176 @@
+---
+title: "Monitoring"
+description: "Prometheus, Grafana, Loki — what's shipped, which metrics to watch, how alerts route."
+---
+
+Observability runs in the `monitoring` namespace on both clusters, installed via Helm (`kube-prometheus-stack` + `loki-stack`). Grafana is the front-door UI; Prometheus scrapes metrics; Loki aggregates logs; Alertmanager routes to Email and Telegram.
+
+Dashboards: `grafana-dev.skygen.ai` and `grafana.skygen.ai`.
+
+## Stack
+
+| Component | Helm chart | Retention | Storage |
+|-----------|-----------|-----------|---------|
+| Prometheus | `kube-prometheus-stack` | 15 days | 20Gi PVC |
+| Grafana | (bundled) | n/a | 5Gi PVC |
+| Loki | `loki-stack` | 7 days | 10Gi filesystem |
+| Promtail | (bundled with loki-stack) | n/a | in-memory |
+| Alertmanager | (bundled with prometheus) | n/a | ephemeral |
+
+Install script: `Backend/k8s/monitoring/install-monitoring.sh` (dev) and `Backend/k8s_prod/monitoring/` (prod).
+
+## Dashboards
+
+Dashboards are stored as ConfigMaps with label `grafana_dashboard: "1"` so Grafana's dashboard sidecar auto-imports them. The main dashboard (`k8s/monitoring/grafana-dashboard.json`) has panels for:
+
+- DAU / WAU / MAU gauges
+- Agent request duration histogram
+- Queue sizes and consumer counts
+- HTTP error rate by endpoint
+- Message latency percentiles (p50, p95, p99)
+- Cloud PC state mismatch counter
+- WebSocket message flow
+
+## Metrics sources
+
+Three scrape targets (via pod annotations `prometheus.io/scrape: "true"`):
+
+1. **Backend** port 8000 `/metrics` — `prometheus-fastapi-instrumentator` provides HTTP metrics; custom metrics from `Backend/app/monitoring/metrics.py`
+2. **Worker** port 8001 `/metrics` — Prometheus client library, custom metrics
+3. **Agent** port 8080 `/metrics` — Agent-side metrics
+
+Plus **kube-state-metrics** (cluster state) and **node-exporter** (disabled in Fargate/prod).
+
+## Custom metric catalogue
+
+### User engagement
+
+```
+skygen_users_total
+skygen_users_active
+skygen_users_online
+skygen_users_dau | wau | mau
+skygen_users_new_today
+skygen_devices_connected
+```
+
+### Agent and messages
+
+```
+skygen_agent_requests_total{status}
+skygen_agent_request_duration_seconds (histogram, buckets 0.1–300s)
+skygen_chat_sessions_total
+skygen_chat_messages_total{role}
+skygen_message_to_queue_seconds (backend → RabbitMQ publish latency)
+skygen_message_response_latency_seconds (user wait time, buckets 1–1800s)
+skygen_messages_sent_today{role}
+```
+
+### HTTP
+
+```
+skygen_http_requests_by_type_total{caller_type}   # user | internal | anonymous
+skygen_http_requests_by_category_total{category}  # chat | auth | devices | agent | admin | billing | files | knowledge | mcp | other
+skygen_http_request_latency_by_category_seconds
+skygen_http_errors_total{status_code, method, path}
+```
+
+### Queue health
+
+```
+skygen_queue_messages{queue_name}
+skygen_queue_consumers{queue_name}
+```
+
+### Worker reliability
+
+```
+skygen_worker_errors_total{error_type, message_type}
+skygen_worker_messages_processed_total{message_type, status}
+skygen_cloud_pc_state_mismatch_total
+```
+
+### WebSocket
+
+```
+skygen_websocket_connections{connection_type}      # device | agent
+skygen_websocket_messages_sent_total{message_type}
+skygen_websocket_messages_received_total{message_type}
+skygen_pending_commands_flushed_total{trigger}
+skygen_pending_commands_expired_total
+```
+
+### Billing and attachments
+
+```
+skygen_billing_checks_total{result}              # allowed | insufficient_tokens | error
+skygen_device_lock_total{result}                 # locked | already_locked | unlocked
+attachment_pipeline_total{status}
+attachment_s3_upload_seconds (histogram)
+attachment_file_size_bytes (histogram)
+```
+
+### Agent cost and tokens
+
+```
+skygen_cost_usd{provider, model, agent_type}
+skygen_llm_tokens{provider, model, agent_type, token_type}  # input | output | cache
+sentinel_wakeup_total{status}
+```
+
+## Collection loop
+
+The backend's `MetricsCollector` runs an async task that calls `collect_all_metrics()` every 30 seconds:
+
+1. Query user counts, active/online from DB
+2. Snapshot Socket.IO namespaces for WebSocket counts
+3. Declare RabbitMQ queues passively to read message counts
+4. Aggregate DAU/WAU/MAU from `last_active_at` ranges
+5. Update gauges for next Prometheus scrape
+
+Prometheus scrapes at its configured interval (default 15s), reads the current gauge values, and stores time series.
+
+## Logs (Loki + Promtail)
+
+Promtail is DaemonSet in dev (runs on every node), StatefulSet in prod (Fargate incompatibility). It tails container logs, parses JSON lines from backend/worker/agent (extracts `level`, `timestamp`, `service`, `logger`, `request_id`, `user_id`), and ships to Loki.
+
+Loki endpoint: `http://loki.monitoring.svc.cluster.local:3100`.
+
+In Grafana, use the Explore view and `{app="backend"} |= "ERROR"` to filter logs. For session-scoped queries: `{app="backend"} |= "session_id=xyz"`.
+
+<Warning>
+**Loki datasource quirk.** `loki-stack`'s Helm chart sets `loki.datasource.isDefault` to `true` by default — this conflicts with `kube-prometheus-stack`'s own datasource and crashes Grafana with "duplicate datasource." Our install script passes `--set loki.datasource.isDefault=false` to fix it.
+</Warning>
+
+## Alerts
+
+Alertmanager receivers (configured during install):
+
+- `null` — drop low-severity alerts
+- `telegram-{env}` — default alerts to Telegram `HELPDESK_TELEGRAM_CHAT_ID`
+- `critical-{env}` — critical alerts to Telegram
+
+Alertmanager SMTP credentials (for email receivers) are injected via Helm `--set` from AWS Secrets Manager.
+
+PrometheusRule CRs live under `k8s/monitoring/`. They cover:
+
+- High 5xx error rate
+- Agent timeouts (> 5% failures)
+- Queue backlog (messages > N for Y minutes)
+- DAU/MAU drop
+- Cloud PC state mismatches
+
+## Access URLs
+
+- Dev Grafana: `https://grafana-dev.skygen.ai`
+- Prod Grafana: `https://grafana.skygen.ai`
+- Port-forward locally: `kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80`
+
+Grafana admin credentials live in AWS Secrets Manager (`skygen/{env}/monitoring-grafana-username` + `-password`), synced via ExternalSecret.
+
+ACM wildcard certificate: `arn:aws:acm:us-east-1:118183257315:certificate/6f862367-0c13-42a2-88b5-7cc1286401b0`.
+
+## See also
+
+- [Environment variables](/deployment/environment) — monitoring-related envs
+- [Kubernetes](/deployment/k8s) — cluster quirks (Fargate, DaemonSets)
