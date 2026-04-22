@@ -100,6 +100,13 @@
             "pages": [
               "admin/overview"
             ]
+          },
+          {
+            "group": "Trust & Compliance",
+            "pages": [
+              "security/subprocessors",
+              "security/soc2-readiness"
+            ]
           }
         ]
       },
