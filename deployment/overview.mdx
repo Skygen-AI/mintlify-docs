@@ -22,7 +22,7 @@ Backend runs single-worker Uvicorn (`--workers 1 --timeout-keep-alive 300 --ws-p
 |-------|---------|-------|------|
 | **PostgreSQL** | Users, sessions, messages, devices, billing, KB embeddings | `pgvector/pgvector:pg15` container | RDS with pgvector |
 | **Redis** | Socket.IO distributed state, caching, pub/sub for horizontal scaling | `redis:7-alpine` | ElastiCache |
-| **RabbitMQ** | Task queues (`SEND_MESSAGE_TO_AGENT_QUEUE`, `ANSWER_AGENT_QUEUE`) | `rabbitmq:3-management-alpine` | self-hosted on EKS |
+| **RabbitMQ** | Task queues (`SEND_MESSAGE_TO_AGENT_QUEUE`, `ANSWER_AGENT_QUEUE`) | `rabbitmq:3-management-alpine` | Amazon MQ (`mq.t3.micro`, SINGLE_INSTANCE per env) |
 | **S3 / MinIO** | Screenshots, attachments, Cloud PC backups | MinIO container | AWS S3 |
 
 S3 buckets (prod):
@@ -129,3 +129,5 @@ docker compose -f docker-compose-local.yml up -d
 - [Environment variables](/deployment/environment) — every setting
 - [Monitoring](/deployment/monitoring) — Prometheus / Grafana / Loki
 - [Kubernetes](/deployment/k8s) — cluster specifics
+- [AWS stack inventory](/deployment/aws-inventory) — every AWS service, where it lives
+- [Cost optimization](/deployment/cost-optimization) — what's billed, what's wasted

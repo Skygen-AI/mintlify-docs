@@ -90,7 +90,9 @@
               "deployment/overview",
               "deployment/environment",
               "deployment/monitoring",
-              "deployment/k8s"
+              "deployment/k8s",
+              "deployment/aws-inventory",
+              "deployment/cost-optimization"
             ]
           },
           {

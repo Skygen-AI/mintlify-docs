@@ -70,14 +70,14 @@ Skygen uses Socket.IO's Redis adapter (`python-socketio` with `AsyncRedisManager
 
 `REDIS_URL` is shared across all backend pods.
 
-## Fargate and DaemonSets
+## DaemonSet considerations
 
-Fargate does not support DaemonSets. Two consequences:
+Both clusters run on EC2 nodes provisioned by Karpenter, **not** Fargate — DaemonSets work. Historical note: an earlier plan to run Fargate shaped some choices that are still in the monitoring install script.
 
-1. **node-exporter disabled.** Prod monitoring relies on kube-state-metrics and application-level metrics only.
-2. **Promtail as StatefulSet.** One Promtail pod per cluster region (not per node). Still tails container logs via Kubernetes API.
+- **node-exporter is still disabled.** Historically dropped for Fargate compatibility and never re-enabled. Prod monitoring relies on `kube-state-metrics` and application-level metrics only. Re-enabling would add per-node host metrics (CPU steal, disk I/O, network) with a cheap DaemonSet.
+- **Promtail runs as a DaemonSet** (bundled with the `loki-stack` Helm chart, one pod per node). Both clusters show 6+ `loki-promtail-*` pods, not a single StatefulSet.
 
-`Backend/k8s/monitoring/install-monitoring.sh` handles the disabled settings.
+`Backend/k8s/monitoring/install-monitoring.sh` still carries the old `--set nodeExporter.enabled=false` flag.
 
 ## Karpenter node pools
 

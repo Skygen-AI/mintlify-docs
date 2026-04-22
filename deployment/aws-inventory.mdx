@@ -1,0 +1,356 @@
+---
+title: "AWS stack inventory"
+description: "Every AWS service Skygen uses today, what it's for, and where it lives. Snapshot as of April 2026."
+---
+
+This page catalogues every AWS resource in the Skygen account (`118183257315`). For billing and cost reduction plans, see [Cost optimization](/deployment/cost-optimization). For cluster internals, see [Kubernetes](/deployment/k8s).
+
+<Note>
+Inventory snapshot taken April 2026 directly from AWS CLI + `kubectl`. Running resources and usage patterns may drift. Re-run the audit quarterly.
+</Note>
+
+## Account and regions
+
+| Setting | Value |
+|---------|-------|
+| Account ID | `118183257315` |
+| Primary region | `us-east-1` (N. Virginia) — EKS, RDS, ElastiCache, SES, MQ, almost all compute |
+| Secondary region | `eu-north-1` (Stockholm) — legacy ECS Fargate landing/webapp/adminpanel, Lightsail |
+| Default CLI region | `eu-north-1` (in `~/.aws/config`) — historical |
+
+Two active regions. Nothing in other regions.
+
+## Compute {#compute}
+
+### EKS clusters {#eks}
+
+Two EKS clusters, both in `us-east-1`, both on Kubernetes `1.33` (up to date, no Extended Support surcharge).
+
+| Cluster | Purpose | Namespace | Nodes (observed) |
+|---------|---------|-----------|------------------|
+| `skygen-us-dev` | dev + preview envs | `skygen-agent`, `skygen-monitoring`, `skygen-infra`, `skygen-worker`, `skygen-preview-*`, `monitoring`, `amazon-cloudwatch`, `k6-operator-system`, `load-testing` | 6 Karpenter-managed |
+| `skygen-us-prod` | production | `skygen-prod`, `monitoring`, `karpenter`, `external-secrets` | 6 total (2 managed node group, 4 Karpenter) |
+
+Control plane cost: `$0.10/hr × 2 clusters × 720h ≈ $144/mo` (actual March bill: $166 with minor usage).
+
+Pod inventory — prod `skygen-prod` namespace:
+
+```
+agent × 3, backend × 3, worker × 3, landing × 2, pgbouncer × 2
+```
+
+Pod inventory — dev `skygen-agent` namespace:
+
+```
+agent × 2, backend × 2, worker × 2, pgbouncer × 2, landing × 1, presenton × 1
+```
+
+Both clusters run `kube-prometheus-stack`, `loki-stack`, `external-secrets`, AWS Load Balancer Controller, AWS EBS CSI driver, Karpenter. See [Kubernetes](/deployment/k8s).
+
+### EC2 instances {#ec2}
+
+16 running instances in `us-east-1` (April 2026). Breakdown by role:
+
+| Group | Count | Types | Purpose |
+|-------|-------|-------|---------|
+| Karpenter dev nodes | 6 | `t3a.medium`, `t3a.small`, `t3.small` | auto-scaled EKS dev workloads |
+| Karpenter prod nodes | 4 | `t3.medium`, `t3a.medium` | auto-scaled EKS prod workloads |
+| Prod system nodes | 2 | `t3.medium` | managed node group (`eksctl-skygen-us-prod-nodegroup-sy`) for kube-system, CoreDNS, etc. |
+| OSWorld | 3 | `t3.xlarge` × 2, `t3.large` × 1 | OSWorld benchmark hosts + clients |
+| remote_desktop | 1 | `t3.medium` | standalone desktop (purpose unverified) |
+
+<Warning>
+**Two Karpenter nodes run with a public IPv4 address** (`i-0fd1f9d800614bca2`, `i-0b585fc7cf6b49199`). Karpenter dev subnets are misconfigured — nodes should be in a private subnet with NAT. Tracked in [Cost optimization](/deployment/cost-optimization#karpenter-public-ip).
+</Warning>
+
+<Note>
+**OSWorld and remote_desktop** have been running continuously since February–April 2026. If the OSWorld benchmark is not an always-on workload, these are candidates for scheduled start/stop. Verify usage before deciding.
+</Note>
+
+### ECS Fargate (eu-north-1) {#ecs-fargate}
+
+Cluster `skygen-production` in `eu-north-1`. **9 running Fargate tasks**, capacity-provider strategy `FARGATE:1 / FARGATE_SPOT:4` (base 2 on FARGATE, rest on SPOT).
+
+| Service | Task definition | Purpose |
+|---------|-----------------|---------|
+| `webapp` | `skygen-webapp:51` | webapp prod (legacy — not yet migrated to EKS) |
+| `webapp-dev` | `skygen-webapp:*` | webapp dev |
+| `skygen-landing` | `skygen-landing:41` | marketing landing prod |
+| `skygen-landing-dev` | — | marketing landing dev |
+| `landing-backend` | `landing-backend:17` | landing API prod |
+| `landing-backend-dev` | — | landing API dev |
+| `ui-shared-dev` | — | shared UI preview |
+| `skygen-adminpanel-service` | `skygen-adminpanel:11` | admin panel prod |
+| `skygen-adminpanel-dev-service` | — | admin panel dev |
+
+The Next.js SSR landing deployment in `skygen-us-prod` (EKS, `landing-ssr` image, ingress `ssr.skygen.ai`, 8 days old) is **in the middle of migrating from ECS to EKS**. Webapp and adminpanel have not yet been migrated.
+
+<Warning>
+The empty ECS cluster `Skygen-kuber-dev` in `us-east-1` has 0 tasks, 0 services. Safe to delete after confirming the task definition `skygen-backend-dev` isn't referenced elsewhere.
+</Warning>
+
+### Lightsail (eu-north-1) {#lightsail}
+
+| Name | Bundle | Specs | IP | Since |
+|------|--------|-------|-----|-------|
+| `Ubuntu-1` | `small_3_0` ($10/mo plan) | 2 vCPU, 2 GB RAM, 3 TB transfer | `13.62.245.190` | 2026-01-11 |
+
+<Note>
+**Purpose not documented.** Investigate what Ubuntu-1 hosts before deciding whether to keep or retire. Possible legacy VPN host, jump box, or early-stage landing server.
+</Note>
+
+## Data stores
+
+### RDS (PostgreSQL) {#rds}
+
+5 instances in `us-east-1`, all PostgreSQL 17.x. Overview from March 2026 bill: `$120.09/mo`.
+
+| Instance | Class | Version | Storage | MultiAZ | Purpose |
+|----------|-------|---------|---------|---------|---------|
+| `skygen-prod-db` | `db.t4g.medium` | 17.4 | 20 GB gp3 | No | **production** — main DB |
+| `skygen-dev-db1-use1-eks` | `db.t4g.medium` | 17.6 | 20 GB gp2 | No | dev — used by EKS dev |
+| `skygen-dev-db1-use1` | `db.t4g.micro` | 17.6 | 20 GB gp2 | No | dev — older instance, role unclear |
+| `database-landing-prod` | `db.t4g.small` | 17.6 | 20 GB gp3 | No | landing CMS/API prod (ECS eu-north-1 client) |
+| `database-landing-dev` | `db.t4g.micro` | 17.6 | 20 GB gp2 | No | landing dev |
+
+Backups: automated (default 7-day retention; `backing-up` status observed on prod).
+
+<Warning>
+**No MultiAZ on prod.** A single-AZ `db.t4g.medium` is a SPOF for Skygen users — an AZ outage or DB crash stops all API traffic. Enabling MultiAZ doubles RDS cost but is the standard production posture.
+</Warning>
+
+<Note>
+Two dev instances (`skygen-dev-db1-use1` and `-eks`) plus two landing instances suggests historical drift. Consolidation candidate. See [Cost optimization](/deployment/cost-optimization#rds-consolidation).
+</Note>
+
+### ElastiCache (Valkey) {#elasticache}
+
+Managed Valkey (Redis fork) used for Socket.IO pub/sub and app caching. March bill: `$146.28/mo`.
+
+| Cluster | Node type | Nodes | Engine | Replication | Use |
+|---------|-----------|-------|--------|-------------|-----|
+| `skygen-dev-kuber` | `cache.t4g.small` | 3 | Valkey 8.2.0 | disabled | dev |
+| `skygen-prod-valkey` | `cache.t4g.medium` | 2 | Valkey 7.2.6 | enabled (MultiAZ) | prod |
+
+<Warning>
+**Dev runs 3 nodes** with replication disabled — no redundancy benefit, just 3× the cost of 1 node. See [Cost optimization](/deployment/cost-optimization#elasticache-dev).
+</Warning>
+
+### Amazon MQ (RabbitMQ) {#mq}
+
+| Broker | Engine | Instance | Mode | Env |
+|--------|--------|----------|------|-----|
+| `skygen-prod-rabbitmq` | RabbitMQ | `mq.t3.micro` | SINGLE_INSTANCE | prod |
+| `Broker-kuber-dev-eks2` | RabbitMQ | `mq.t3.micro` | SINGLE_INSTANCE | dev |
+
+March bill: `$46.33/mo`. Both single-instance (no high availability). Used for `SEND_MESSAGE_TO_AGENT_QUEUE` and `ANSWER_AGENT_QUEUE`.
+
+### S3 {#s3}
+
+17 buckets across regions. Total March bill: `$5.52` (object storage is cheap; the pain is operational, not financial).
+
+**Active buckets** (with data, April 2026):
+
+| Bucket | Size | Purpose |
+|--------|------|---------|
+| `skygen-screenshots-us` | 39.7 GB | production screenshots (main artifact bucket) |
+| `skygen-releases-dev-us` | 36.9 GB | dev release artifacts |
+| `skygen-releases-us` | 20.1 GB | prod release artifacts (Agent/AppDemo builds) |
+| `osworld-bucket` | 20.7 GB | OSWorld benchmark data |
+| `skygen-files-prod` | 6.8 GB | user uploads prod |
+| `skygen-screenshots-prod` | 1.0 GB | prod screenshots (duplicate namespace?) |
+| `skygen-cloudpc-profiles` | 212 MB | Cloud PC backup snapshots dev |
+| `skygen-files-us` | 244 MB | user uploads (unclear vs `-prod`) |
+| `skygen-cloudpc-profiles-prod` | 123 MB | Cloud PC backup snapshots prod |
+| `skygen-agent-trajectories-us` | 0.2 MB | agent action traces |
+
+**Empty buckets** (7): `skygen-screenshots`, `skygen-files`, `skygen-releases`, `skygen-releases-dev`, `skygen-assets-us`, `skygen-landing-assets-prod`, `skygen-agent-trajectories`.
+
+<Warning>
+Naming inconsistency: some buckets use `-us` suffix, some `-prod`, some neither. Makes IAM policy drift likely. Consolidation + deletion of empties recommended. See [Cost optimization](/deployment/cost-optimization#s3-cleanup).
+</Warning>
+
+### ECR {#ecr}
+
+7 repositories in `us-east-1` — all `MUTABLE`, no image scanning on push.
+
+| Repo | Image count | Total size | Lifecycle policy |
+|------|-------------|------------|------------------|
+| `skygen/backend` | 1281 | ~450 GB | **none** |
+| `skygen/backend-worker` | 760 | ~500 GB | **none** |
+| `skygen/agent` | 585 | ~450 GB | **none** |
+| `skygen/webapp` | 139 | ~15 GB | **none** |
+| `skygen/adminpanel` | 60 | 1.5 GB | **none** |
+| `skygen/worker` | 2 | 0.8 GB | **none** |
+| `skygen/mock-agent` | 1 | 0.0 GB | **none** |
+
+March bill: `$58.61/mo`, up from `$29.35` in February — cost doubles every ~2 months as images accumulate. See [Cost optimization](/deployment/cost-optimization#ecr-lifecycle).
+
+## Network
+
+### VPCs {#vpcs}
+
+5 VPCs in `us-east-1`.
+
+| VPC ID | CIDR | Name | State |
+|--------|------|------|-------|
+| `vpc-00754490f13984123` | 10.1.0.0/16 | `eksctl-skygen-us-prod-cluster/VPC` | **active** — prod EKS |
+| `vpc-0c92b6f157d6fb9b5` | 10.0.0.0/16 | `eksctl-skygen-us-dev-cluster/VPC` | **active** — dev EKS |
+| `vpc-0190f12b8297ebc7f` | 172.31.0.0/16 | default | AWS default (empty) |
+| `vpc-0d86174a8da367553` | 10.1.0.0/16 | `skygen-prod-vpc` | **orphan** — 0 subnets, 0 ENIs |
+| `vpc-0748d29fba830613d` | 10.0.0.0/16 | `skygen-prod-vpc` | **orphan** — 3 empty subnets, 0 instances |
+
+<Warning>
+Two orphan VPCs with duplicate `skygen-prod-vpc` name. No cost, but CIDR overlap with active EKS VPCs. Delete candidates.
+</Warning>
+
+### NAT Gateways {#nat}
+
+2 NAT Gateways (one per active EKS VPC). `$0.045/hr` each + data processing.
+
+| Gateway | VPC | Public IP |
+|---------|-----|-----------|
+| `nat-05142d5d91be1e832` | prod EKS | 52.45.161.13 |
+| `nat-08acd32a03bb35e01` | dev EKS | 34.206.173.100 |
+
+March cost attribution (under EC2 – Other): `NatGateway-Hours ≈ $19`, `NatGateway-Bytes ≈ $11` partial-month, extrapolates to ~$90/mo for both.
+
+### Load balancers {#load-balancers}
+
+8 active load balancers in `us-east-1`. March bill: `$156.51`.
+
+| Name | Type | Scheme | Used for |
+|------|------|--------|----------|
+| `k8s-skygenpr-backendi-*` | ALB | internet-facing | `api.skygen.ai` (prod backend) |
+| `k8s-skygenpr-backendp-*` | NLB | internal | prod backend private |
+| `k8s-skygenpr-landingi-*` | ALB | internet-facing | `ssr.skygen.ai` (prod landing SSR, 8d) |
+| `a4eabdf86f7e44936977e80c949392d3` | NLB | internet-facing | dev `backend-public` (`skygen-agent/backend-public`) |
+| `k8s-skygendevshared-*` | ALB | internet-facing | dev shared (preview envs) |
+| `k8s-skygenag-presento-*` | ALB | internet-facing | dev presenton tool |
+| `k8s-monitori-grafanai-9b11f53efb` | ALB | internet-facing | Grafana (dev) |
+| `k8s-monitori-grafanai-f440f7ff85` | ALB | internet-facing | Grafana (prod) |
+
+ALB annotations handle Socket.IO stickiness. See [Kubernetes — Ingress](/deployment/k8s#ingress-aws-alb-controller).
+
+### Public IPv4 {#public-ipv4}
+
+AWS charges `$0.005/hr` per public IPv4 address (started February 2024). March bill:
+
+| Region | In-use IPs | Cost |
+|--------|-----------|------|
+| `us-east-1` | — | $94.27 |
+| `eu-north-1` | — | $44.79 |
+| **Total** | | **$139.06/mo** |
+
+8 EC2 instances have public IPs in us-east-1 (OSWorld × 3, remote_desktop, 2 prod system nodes, 2 Karpenter dev nodes). ALBs and NAT Gateways contribute additional public IPs. See [Cost optimization](/deployment/cost-optimization#public-ipv4).
+
+### Route 53 {#route53}
+
+One hosted zone: `skygen.local.` (2 records). Used for internal service discovery. All external DNS (`skygen.ai`, `api.skygen.ai`, etc.) is managed **outside AWS** (likely Cloudflare).
+
+### Client VPN (eu-north-1) {#client-vpn}
+
+A Client VPN endpoint is billed in `eu-north-1` at `$5/mo` for the endpoint association. No active endpoints returned by `describe-client-vpn-endpoints`, suggesting the charge may be a residual association — investigate whether a VPN is still in use.
+
+## Security and identity
+
+### IAM roles {#iam}
+
+Custom roles (not AWS-managed):
+
+| Role | Purpose |
+|------|---------|
+| `skygen-prod-backend` | IRSA for prod backend pods → SES send, S3 read/write |
+| `skygen-dev-backend` | IRSA for dev backend pods |
+| `skygen-eks-external-secrets` | IRSA for ExternalSecrets operator → Secrets Manager read |
+| `skygen-eks-ebs-csi` | IRSA for EBS CSI driver |
+| `KarpenterNodeRole-skygen-us-dev` | Karpenter-provisioned node role |
+| `KarpenterNodeRole-skygen-us-prod` | Karpenter-provisioned node role |
+| `eksctl-skygen-us-{dev,prod}-*` | eksctl-created roles (cluster service, node groups, addons) |
+
+IAM Roles for Service Accounts (IRSA): **keyless authentication** — pods assume roles via OIDC projected tokens. No static AWS credentials in Kubernetes Secrets.
+
+### Secrets Manager {#secrets-manager}
+
+~127 secrets, tiered `skygen/*`, `skygen-prod/*`, `skygen/{env}/*`, `skygen/mcp/*/client_{id,secret}`. March bill: `$50.80/mo` (~$0.40/secret/month).
+
+Categories:
+
+| Prefix | Count | Purpose |
+|--------|-------|---------|
+| `skygen-prod/db-*`, `db-url-*` | ~6 | Postgres credentials |
+| `skygen-prod/stripe-*`, `skygen/stripe-*` | ~4 | Stripe billing |
+| `skygen-{prod,dev}/rabbitmq-url`, `-redis-url`, `-db-url` | ~8 | infra connection strings |
+| `skygen/{prod,dev}/monitoring-*` | ~8 | Grafana, Alertmanager |
+| `skygen/mcp/*` | ~14+ | per-integration OAuth (gmail, calendar, drive, docs, sheets, youtube, contacts, zoom) |
+| Google OAuth | ~6 | web + drive + restricted |
+
+Synced into Kubernetes via `ExternalSecrets` operator.
+
+<Note>
+Some secrets show `LastAccessedDate: None` (never accessed since creation) — audit candidate for deletion.
+</Note>
+
+### ACM {#acm}
+
+4 issued certs in `us-east-1`:
+
+| Domain | Notes |
+|--------|-------|
+| `*.skygen.ai` | wildcard — main prod cert (ALB attach) |
+| `*.dev.skygen.ai` | wildcard dev |
+| `kapi.skygen.ai` | dedicated |
+| `kdev.skygen.ai` | dedicated |
+
+The wildcard ARN pinned in ingress: `arn:aws:acm:us-east-1:118183257315:certificate/6f862367-0c13-42a2-88b5-7cc1286401b0`.
+
+## Observability
+
+### CloudWatch Logs {#cloudwatch-logs}
+
+3 log groups hold >10 MB each. Total >10 MB: **53.7 GB**, all with **no retention policy** (keeps forever):
+
+| Log group | Size | Retention |
+|-----------|------|-----------|
+| `/aws/eks/skygen-us-dev/cluster` | 28.7 GB | never |
+| `/aws/eks/skygen-us-prod/cluster` | 21.6 GB | never |
+| `/aws/eks/skygen-us-dev/containers` | 4.7 GB | never |
+
+March bill total (CloudWatch): `$62.48/mo` — mostly ingestion, not storage.
+
+### In-cluster observability
+
+Prometheus, Grafana, Loki run inside EKS (`monitoring` namespace) — not AWS services. See [Monitoring](/deployment/monitoring).
+
+## Email {#email}
+
+### Amazon SES
+
+| Setting | Value |
+|---------|-------|
+| Region | `us-east-1` |
+| Verified identity | `skygen.ai` (DKIM + DMARC passing) |
+| 24h quota | 50,000 messages |
+| Max send rate | 14/s |
+| Send last 24h (observed) | 1 message |
+| Config sets | `skygen-prod`, `skygen-dev` |
+
+Production access approved. DNS records on `skygen.ai` are Cloudflare-managed and currently route transactional email through SES `send.noreply` and `send.waitlist` subdomains.
+
+## Cost summary {#cost-summary}
+
+| Month | Total (incl. tax) | Main drivers |
+|-------|-------------------|--------------|
+| Feb 2026 | $2,366.03 | EKS $470, Compute $400, VPC $229, ALB $119, ElastiCache $127 |
+| Mar 2026 | $2,219.66 | Compute $558, Tax $306, EC2-Other $301, EKS $166, ALB $157 |
+| Apr 2026 (MTD 22d) | $1,613.52 | on track for ~$2,200 run-rate |
+
+See [Cost optimization](/deployment/cost-optimization) for the full breakdown and savings plan.
+
+## See also
+
+- [Deployment overview](/deployment/overview) — service topology
+- [Kubernetes](/deployment/k8s) — cluster internals
+- [Monitoring](/deployment/monitoring) — Prometheus / Grafana / Loki
+- [Environment variables](/deployment/environment) — every setting
+- [Cost optimization](/deployment/cost-optimization) — where the money goes
