@@ -1,0 +1,170 @@
+---
+title: "Ask-human (ARCH-001)"
+description: "How an agent asks the user a question, hibernates the worker, and resumes when the user replies — end-to-end across agent, backend, and frontend."
+---
+
+Ask-human is how an agent **asks** the user mid-task — a free-text question, a choice between options, a yes/no confirmation, or an MCP connect prompt. The agent does **not** block a worker: it writes a hibernation blob to Redis, exits the ReAct loop, and wakes when the user's reply arrives as a regular chat message. This is the ARCH-001 successor to the old blocking `AgentConfirmationService` path (see [Confirmations](/concepts/confirmations) for the legacy flow kept for back-compat).
+
+## Why hibernate instead of block
+
+The agent worker is a shared resource — one Python process serving many tasks. If a worker blocks on `await user_response_future`, that worker slot is gone until the user answers (often minutes, sometimes never). Under load, waiting on N humans parks N workers. Hibernation decouples "the task is waiting for a human" from "a worker is holding the task in memory":
+
+1. Agent writes hibernation blob to Redis and **returns from the ReAct loop**.
+2. Worker slot is free to pick up the next task.
+3. User reply lands in `message_router.send_message` like any other chat message.
+4. Backend atomically claims the hibernation blob (`HDEL`) and publishes a resume payload.
+5. **Any** worker (not necessarily the original one) picks up the resume, rehydrates state from the blob, and continues the ReAct loop.
+
+Pool utilization stays flat regardless of how long humans take.
+
+## Input types
+
+A single `AskHumanInput` schema covers every ask surface:
+
+| `type` | UX | Answer source |
+|---|---|---|
+| `text` | TaskInput placeholder = "Reply to the agent…" | User types free text and presses Send |
+| `multiline` | Same as `text` | User types multi-line free text |
+| `choice` | Chip buttons above the TaskInput | Click sends the chip `label` as the answer (free text also works) |
+| `confirmation` | Yes / No pills above the TaskInput | Yes sends `"Yes"`; No cancels the task |
+| `mcp_connect_prompt` | Provider cards inline in the chat bubble | User connects an integration |
+
+The schema:
+
+```ts
+interface AskHumanInput {
+  type: "text" | "choice" | "multiline" | "confirmation" | "mcp_connect_prompt";
+  action_id: string;
+  prompt: string;
+  placeholder?: string | null;
+  choices: ChoiceOption[];           // non-empty when type === "choice"
+  required: boolean;
+  validation?: string | null;        // regex for text/multiline
+}
+
+interface ChoiceOption {
+  value: string;
+  label: string;
+}
+```
+
+## End-to-end flow
+
+<Steps>
+  <Step title="Agent emits a terminal ask_human action">
+    `BaseAgent` Gate 1 classifies the action as terminal. Terminal actions are:
+    - `hibernate_and_watch`
+    - `communicate` where `message_type ∈ {result, ask_text, ask_choice}`
+    - `request_confirmation`
+
+    Non-terminal actions in the same step execute normally; exactly one terminal action ends the loop.
+  </Step>
+  <Step title="Hibernation Store writes the blob">
+    `Utilities/Hibernation/Store.py` serializes the agent's resumable state (conversation, pending tool calls, memory) and writes it to Redis under `TASK_DATA_HASH` keyed by `task_id`. Input metadata (type, choices, prompt) goes with it.
+  </Step>
+  <Step title="Agent exits the ReAct loop">
+    The worker returns. No `await`, no blocking. The slot is immediately reusable.
+  </Step>
+  <Step title="Backend transforms to display_message">
+    `ui_meta_update → display_transformer → display_message` produces a payload with `display_type = "ask_human_message"` and `render_data.input_config` carrying the full `AskHumanInput`. The transformer persists the message to the DB and fans out over Socket.IO `/user`.
+  </Step>
+  <Step title="Frontend renders two surfaces">
+    - **In the chat**: `AskHumanMessage` — a read-only bubble with a gradient border and a `Waiting` badge. No interactive controls here (except `mcp_connect_prompt`, which stays inline because provider cards do not fit in the bottom bar).
+    - **Above the TaskInput**: `AskHumanQuickReply` — chips for `choice`, Yes/No pills for `confirmation`, nothing for `text` / `multiline` (the TaskInput itself is the reply surface).
+
+    The TaskInput picks up `askHumanMode` styling (gradient border) and the placeholder `Reply to the agent…`.
+  </Step>
+  <Step title="User replies">
+    On chip click, text submit, or Yes-press, the frontend calls `submitInlineAskHuman(value)` — which sends the answer as a **regular chat message** via `storeSendMessage`. No special API. The agent sees the user's answer as if the user typed it.
+  </Step>
+  <Step title="Backend atomically claims and resumes">
+    `message_router.send_message` detects a pending hibernation blob for the session, calls `HibernationStore.ClaimForWake(task_id)` (backed by Redis `HDEL` — atomic, single-claim), and publishes `ResumeHibernationPayload`. Any worker picks it up, rehydrates the agent state from the blob, and re-enters the ReAct loop with the user's reply as the next observation.
+  </Step>
+  <Step title="Frontend marks the question answered">
+    The next user message after an `ask_human_message` marks the ask-human as answered (derivation in `ChatPage`). The bubble's badge switches from `Waiting` to `Answered`, the `AskHumanQuickReply` bar disappears, and the TaskInput returns to its normal placeholder.
+  </Step>
+</Steps>
+
+## Atomicity — why single-claim matters
+
+The Socket.IO fan-out broadcasts `message_router.send_message` events across all backend pods subscribed to the same user. Without a distributed claim, every pod that receives the fan-out would try to resume the task — the user would get N duplicate "I'm back" replies, one per pod.
+
+`ClaimForWake` uses Redis `HDEL` as the claim primitive:
+
+```python
+async def ClaimForWake(self, task_id: str) -> bool:
+    removed = await self.redis.hdel(self.TASK_DATA_HASH, task_id)
+    return bool(removed)  # exactly one caller sees True
+```
+
+Only the pod whose `HDEL` returns non-zero publishes the resume. The rest see `False` and drop the event silently.
+
+## Frontend state derivation
+
+No extra Zustand state. Two pure derivations over `displayMessages`:
+
+- **`submittedAskHumanIds`** — the set of ask-human message ids that have been superseded. An ask-human is superseded either by a user reply that follows it, or by a **newer** ask-human before the user has answered (the agent moved on). Rendered bubbles get `isSubmitted={true}` → badge flips to `Answered`.
+- **`activeAskHuman`** — the most recent ask-human with no user reply after it, and not of type `mcp_connect_prompt`. Drives `AskHumanQuickReply` and the `askHumanMode` styling on `TaskInput`.
+
+Both survive reload: the DB has the full message history with `display_type` and `render_data`, so on fresh load the same derivation recomputes the same state.
+
+## Which surface to answer in
+
+| `input.type` | Interactive surface | Why |
+|---|---|---|
+| `text`, `multiline` | **TaskInput** (bottom bar) | A free-text field is already there. Placeholder changes to `Reply to the agent…`, border gets the ask-human gradient. |
+| `choice` | **Chips** above TaskInput. User can also type free text in TaskInput. | Parity with legacy `QuickReplyButtons`. Sending label text (not an opaque id) keeps the agent-facing answer semantically meaningful. |
+| `confirmation` | **Yes / No pills** above TaskInput | Yes → `"Yes"`. No → cancel the task (same behavior as the legacy reject path). |
+| `mcp_connect_prompt` | **Inline card in the chat bubble** | Provider cards do not fit in the bottom bar, and the flow is distinct — user is connecting an integration, not replying to a question. |
+
+## Sending the chip label, not the value
+
+Choice chips send `choice.label` (with `choice.value` as a fallback), matching the legacy `QuickReplyButtons` contract. Two reasons:
+
+1. **Semantic parity.** The agent sees the user's answer as a plain chat message. If we send an opaque id (`"opt1"`), the agent would have to reverse-lookup the label to understand the decision. Sending the label that the user saw on the button is what the agent would expect from a user typing their answer.
+2. **Defensive.** If the backend emits an empty `value`, the downstream `trim()` in `submitInlineAskHuman` would silently drop the answer. `label` is the human-visible string and always non-empty in practice.
+
+## Files of interest
+
+**Agent**
+- `Agents/BaseAgent/base.py` — Gate 1 terminal-action classification
+- `Utilities/Hibernation/Store.py` — Redis blob storage and `ClaimForWake`
+
+**Backend**
+- `app/services/display_transformer.py` — `ui_meta_update → display_message`
+- `app/routers/message/message_router.py` — detects the pending blob and publishes `ResumeHibernationPayload`
+- `app/socketio/agent.py` — agent subscription / resume-payload delivery
+
+**Frontend** (`ui-shared-tauri`)
+- `src/types/display.ts` — `AskHumanInput`, `ChoiceOption`, `DisplayMessage`
+- `src/hooks/useChatWebSocket.ts` — `display_message` handler, writes `ask_human_message` into the store
+- `src/hooks/useChatSend.ts` — `submitInlineAskHuman` (sends the answer as a regular chat message, guards against empty values)
+- `src/pages/ChatPage.tsx` — `activeAskHuman` and `submittedAskHumanIds` derivations
+- `src/components/chat/InputPanel.tsx` — wires `AskHumanQuickReply` above the `TaskInput`
+- `src/components/messages/AskHumanMessage.tsx` — read-only bubble (header + badge + text + optional MCP prompt)
+- `src/components/messages/AskHumanQuickReply.tsx` — chips / Yes-No pills above the TaskInput
+
+## Gotchas
+
+<Warning>
+**Store content-dedup can swallow the ask_human upgrade.** `messageSlice.addMessage` deduplicates by `role + content` within a 60s window. If the backend emits a partial `assistant_message` with the same question text **before** the final `ask_human_message`, the second event is dropped as a duplicate and `display_type` never upgrades — chips only appear after a refresh re-reads from the DB. Either the backend must stop emitting the interim `assistant_message`, or the store dedup must allow a `display_type` upgrade. Under investigation.
+</Warning>
+
+<Note>
+**Text replies while on a choice question.** The TaskInput remains usable while chips are showing — the user can type a custom answer if none of the chips fits. The submit path goes through `submitInlineAskHuman` just like a chip click.
+</Note>
+
+<Note>
+**Rejecting a confirmation cancels the task.** This matches the legacy `QuickReplyButtons` behavior — a `No` on a risk confirmation is treated as "stop, do not proceed," not as a negative answer that the agent processes. Use `text` / `choice` if the agent should continue with a negative response.
+</Note>
+
+<Note>
+**The legacy `QuickReplyButtons` / `useConfirmations` path is still wired.** It is driven by the old `ConfirmationRequest` Redis record and handled by `approveConfirmation` / `rejectConfirmation`. On ARCH-001 flows `activeConfirmation` is always `null`, but both paths coexist until the legacy code is removed.
+</Note>
+
+## See also
+
+- [Confirmations](/concepts/confirmations) — the blocking, legacy `AgentConfirmationService` path that ask-human replaces
+- [Agents](/concepts/agents) — the ReAct loop, terminal-action classification
+- [Chat sessions](/concepts/chat-sessions) — where ask-human messages live in the transcript
+- [Safety](/concepts/safety) — what triggers a `confirmation`-type ask

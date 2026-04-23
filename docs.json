@@ -32,6 +32,7 @@
               "concepts/chat-sessions",
               "concepts/agents",
               "concepts/agent-modes",
+              "concepts/ask-human",
               "concepts/confirmations",
               "concepts/cloud-pc",
               "concepts/tasks",
