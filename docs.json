@@ -63,6 +63,7 @@
               "guides/library",
               "guides/helpdesk",
               "guides/pricing",
+              "guides/ask-human-migration",
               "errors"
             ]
           },

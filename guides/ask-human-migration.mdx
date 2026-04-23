@@ -1,0 +1,338 @@
+---
+title: "Migrating a client to ARCH-001 ask_human"
+description: "How to move a native client (Android, iOS, desktop) off the legacy confirmation_request Socket.IO path and onto the new display_message / ask_human_message flow."
+---
+
+This guide walks a client team through the jump from the old blocking `confirmation_request` Socket.IO path to the new hibernate/resume `display_message` flow. It uses the Android codebase under `feature/chat/websocket/` as the running example, but the pattern is identical on any platform — the changes are in events, payloads, and the send path, not in Kotlin-specific APIs.
+
+Read [Ask-human (ARCH-001)](/concepts/ask-human) first for the architecture overview. This guide is the conversion checklist.
+
+## TL;DR — what changes
+
+| Concern | Old path | New path |
+|---|---|---|
+| **Event to subscribe** | `confirmation_request` | `display_message` with `display_type === "ask_human_message"` |
+| **Payload shape** | `{ confirmation: { id, action_type, action_parameters, input } }` | `{ message_id, session_id, display_type, render_data: { content, input_config } }` |
+| **How the user answers** | Emit `confirmation_response` `{ confirmation_id, approved, message }` | **Send a normal chat message** via your existing `send-message` path |
+| **Worker holding the task** | Blocked on `await future` for up to 3600s | Hibernated to Redis; worker slot freed instantly |
+| **What the agent sees as the answer** | `approved: bool` + optional `message` | The exact text of the user's chat message |
+| **Duplicate-safe** | N/A | Yes, via atomic `HDEL` claim on the backend |
+
+The client-side migration is effectively:
+
+1. **Subscribe** to `display_message` instead of `confirmation_request`.
+2. **Render** the question from `render_data.content`; render the interactive surface from `render_data.input_config`.
+3. **Reply** by calling your existing "send chat message" use case with the user's answer as plain text. **Do not** emit `confirmation_response`.
+4. **Derive** "which question is active" and "which question has been answered" from the message list. No new state field required.
+
+## Event subscription
+
+### Before
+
+```kotlin
+// SocketIOClient.kt — old
+on("confirmation_request") { args ->
+    onEvent(args, RawSocketEvent::ConfirmationRequest)
+}
+```
+
+### After
+
+```kotlin
+// SocketIOClient.kt — new
+on("display_message") { args ->
+    onEvent(args, RawSocketEvent::DisplayMessage)
+}
+```
+
+Keep the old listener during the rollover window if your backend still emits both (safety net for in-flight old-style confirmations). Once the server stops emitting `confirmation_request`, delete the listener, the DTOs, the mapper, and the `SendConfirmationResponse` use case.
+
+## DTOs
+
+The new event is one payload with `display_type` as a discriminator. For ask_human:
+
+```kotlin
+internal data class DisplayMessageDto(
+    @SerializedName("message_id") val messageId: String?,
+    @SerializedName("session_id") val sessionId: String,
+    @SerializedName("display_type") val displayType: String,     // discriminator
+    @SerializedName("render_data") val renderData: JsonObject,
+    @SerializedName("timestamp") val timestamp: String,
+    @SerializedName("is_terminal") val isTerminal: Boolean?,
+    @SerializedName("agent_mode") val agentMode: String?,
+)
+
+// For display_type == "ask_human_message", parse render_data as:
+internal data class AskHumanRenderData(
+    @SerializedName("content") val content: String,
+    @SerializedName("input_config") val inputConfig: InputConfigDto?,
+)
+
+internal data class InputConfigDto(
+    @SerializedName("type") val type: String,      // text | multiline | choice | confirmation | mcp_connect_prompt
+    @SerializedName("action_id") val actionId: String,
+    @SerializedName("prompt") val prompt: String,
+    @SerializedName("placeholder") val placeholder: String?,
+    @SerializedName("choices") val choices: List<ChoiceDto>?,
+    @SerializedName("required") val required: Boolean?,
+    @SerializedName("validation") val validation: String?,
+)
+
+internal data class ChoiceDto(
+    @SerializedName("value") val value: String,
+    @SerializedName("label") val label: String,
+    @SerializedName("description") val description: String?,
+)
+```
+
+Your existing `AskHumanMapper` already understands the `InputDto` shape — the schema of `input_config` is **identical** to the `InputDto` you parse today inside `UiMetaPayloadDto`. You can reuse that mapper almost verbatim. The delta is that it now fires from a `display_message` event, not from a `ui_meta_update`.
+
+## Domain entity
+
+Model the ask_human state as an attribute of a chat message, not as a separate entity:
+
+```kotlin
+// Old:
+data class Confirmation(
+    val id: String,
+    val sessionId: String?,
+    val type: String,
+    val title: String,
+    val message: String,
+    val options: List<String>,
+    val inputType: String,
+    val placeholder: String?,
+)
+
+// New — reuse your Message entity with one extra nullable field:
+data class Message(
+    val id: String,
+    val sessionId: String,
+    val role: Role,                                   // assistant / user / system
+    val content: String,
+    val timestamp: Instant,
+    val displayType: DisplayType?,                    // new: "ask_human_message" | "assistant_message" | ...
+    val askHumanInput: AskHumanInput? = null,         // new: populated iff displayType == ASK_HUMAN_MESSAGE
+    // ... existing fields
+)
+
+sealed class AskHumanInput {
+    abstract val actionId: String
+    abstract val prompt: String
+    abstract val required: Boolean
+
+    data class Text(override val actionId: String, override val prompt: String, override val required: Boolean, val placeholder: String?, val validation: String?) : AskHumanInput()
+    data class Multiline(override val actionId: String, override val prompt: String, override val required: Boolean, val placeholder: String?) : AskHumanInput()
+    data class Choice(override val actionId: String, override val prompt: String, override val required: Boolean, val choices: List<ChoiceOption>) : AskHumanInput()
+    data class Confirmation(override val actionId: String, override val prompt: String, override val required: Boolean) : AskHumanInput()
+    data class McpConnectPrompt(override val actionId: String, override val prompt: String, override val required: Boolean, val providers: List<McpProvider>) : AskHumanInput()
+}
+
+data class ChoiceOption(val value: String, val label: String, val description: String?)
+```
+
+Rationale: `ask_human_message` is a real chat message the backend saves to the transcript. Treating it as a separate `Confirmation` entity duplicated state — the message already lives in the message list. The new model makes the transcript the single source of truth.
+
+## How the user replies
+
+### Before
+
+```kotlin
+// Old: dedicated use case that emits a Socket.IO event
+class SendConfirmationResponseImpl @Inject constructor(
+    private val socketIOClient: SocketIOClient,
+) : SendConfirmationResponse {
+    override suspend fun invoke(confirmationId: String, approved: Boolean, message: String?): Result<Unit> =
+        runCatching {
+            socketIOClient.emitConfirmationResponse(confirmationId, approved, message)
+        }
+}
+```
+
+### After
+
+```kotlin
+// New: the existing SendMessage use case does the job. The backend detects
+// the pending hibernation blob for the session and resumes the agent
+// automatically. No new API, no new event.
+
+class ReplyToAskHumanImpl @Inject constructor(
+    private val sendMessage: SendMessage,                     // your existing "send a chat message" use case
+) {
+    suspend operator fun invoke(sessionId: String, answer: String): Result<Unit> =
+        sendMessage(sessionId = sessionId, content = answer)
+}
+```
+
+You do not need `ReplyToAskHumanImpl` as a separate type — you can call `SendMessage` directly from the ViewModel. It is shown here to highlight that **there is no new endpoint**. The migration removes a use case; it does not add one.
+
+### Choice chip → label, not value
+
+When the user taps a choice chip, send the chip's **label**, not its internal `value`:
+
+```kotlin
+// DO:
+fun onChoiceClick(choice: ChoiceOption) {
+    sendMessage(sessionId, choice.label)  // agent sees the human-readable answer
+}
+
+// DO NOT:
+fun onChoiceClick(choice: ChoiceOption) {
+    sendMessage(sessionId, choice.value)  // agent sees an opaque id; also empty-value backends drop the answer silently
+}
+```
+
+Rationale and defense-in-depth: [Ask-human (ARCH-001) → Sending the chip label, not the value](/concepts/ask-human#sending-the-chip-label-not-the-value).
+
+### Rejecting a confirmation = cancel the task
+
+Parity with the old behavior: `No` on a `confirmation`-type ask must cancel the task (call your existing `CancelTask` use case), not send the literal text `"No"`. A rejected safety confirmation is "stop", not "the user said no."
+
+```kotlin
+when (input) {
+    is AskHumanInput.Confirmation -> {
+        YesButton(onClick = { sendMessage(sessionId, "Yes") })
+        NoButton(onClick = { cancelTask(sessionId, reason = "User rejected") })
+    }
+    // other types...
+}
+```
+
+## State derivation — no new fields
+
+The WebApp derives two things from the message list. Do the same on Android — pure functions over `List<Message>`:
+
+```kotlin
+/**
+ * Which ask_human questions have been superseded?
+ * - A newer ask_human before the user replies supersedes all earlier ones.
+ * - A user reply settles every ask_human that came before it.
+ * Superseded questions render as "Answered" (read-only).
+ */
+fun submittedAskHumanIds(messages: List<Message>): Set<String> {
+    val result = mutableSetOf<String>()
+    val pending = mutableListOf<String>()
+    for (msg in messages) {
+        val isAskHuman = msg.displayType == DisplayType.ASK_HUMAN_MESSAGE
+        when {
+            isAskHuman -> {
+                result.addAll(pending); pending.clear()
+                pending.add(msg.id)
+            }
+            msg.role == Role.USER && pending.isNotEmpty() -> {
+                result.addAll(pending); pending.clear()
+            }
+        }
+    }
+    return result
+}
+
+/**
+ * Which ask_human is currently awaiting a reply?
+ * Drives the bottom-bar quick-reply surface.
+ * mcp_connect_prompt is skipped — those render inline in the bubble.
+ */
+fun activeAskHuman(
+    messages: List<Message>,
+    submittedIds: Set<String>,
+): ActiveAskHuman? {
+    for (i in messages.indices.reversed()) {
+        val msg = messages[i]
+        if (msg.displayType != DisplayType.ASK_HUMAN_MESSAGE) continue
+        if (msg.id in submittedIds) return null      // newest-first: last one is already answered
+        val input = msg.askHumanInput ?: return null
+        if (input is AskHumanInput.McpConnectPrompt) return null
+        return ActiveAskHuman(messageId = msg.id, input = input)
+    }
+    return null
+}
+
+data class ActiveAskHuman(val messageId: String, val input: AskHumanInput)
+```
+
+Expose both as derived `StateFlow`s off the message `Flow`:
+
+```kotlin
+val messages: StateFlow<List<Message>> = /* ... */
+
+val submittedAskHumanIds: StateFlow<Set<String>> =
+    messages.map(::submittedAskHumanIds).stateIn(scope, SharingStarted.Eagerly, emptySet())
+
+val activeAskHuman: StateFlow<ActiveAskHuman?> =
+    combine(messages, submittedAskHumanIds) { msgs, ids -> activeAskHuman(msgs, ids) }
+        .stateIn(scope, SharingStarted.Eagerly, null)
+```
+
+Both survive process death automatically — on relaunch, the DB hydrates the message list and the derivation recomputes the same state.
+
+## UI surfaces
+
+Mirror the two-surface pattern from the WebApp:
+
+1. **In the chat bubble** (`AskHumanMessageCard`): read-only header with a `Waiting` / `Answered` badge (driven by `isSubmitted = msg.id in submittedAskHumanIds`), a gradient border, and the question text. **No interactive controls** except the `mcp_connect_prompt` provider cards.
+
+2. **Above the text input** (`AskHumanQuickReplyBar`): chips for `choice`, Yes/No for `confirmation`, nothing for `text` / `multiline` (the regular text input becomes the reply surface — change its placeholder to `Reply to the agent…` and apply an ask_human gradient border).
+
+The text input **must remain enabled** even when `choice` chips are showing — a user who wants to answer freeform should be able to type, and that free-text submit routes through the same `SendMessage` use case.
+
+## Duplicate resume protection (backend-side — you don't handle it)
+
+Socket.IO fan-out means every backend pod subscribed to the user sees the user's reply. Without a distributed claim, every pod would try to resume the task and the user would get duplicate "I'm back" messages.
+
+The backend uses Redis `HDEL` as an atomic single-claim primitive (`HibernationStore.ClaimForWake`). Exactly one pod resumes; the rest see the claim is gone and drop the resume silently. There is nothing for the client to do about this — the client emits one `send-message`, the user sees one reply.
+
+If you ever see **two** agent replies after a single user reply, that is a backend regression in the claim path, not a client bug — report it with the two `message_id`s.
+
+## Gotchas
+
+<Warning>
+**Content dedup races.** If your client deduplicates assistant messages by content (the WebApp store does this for 60s), and the backend emits a partial `assistant_message` with the same text just before the final `ask_human_message`, the second event can be dropped as a duplicate and `display_type` never upgrades — the bubble renders as a plain assistant message and chips never appear. On refresh (DB load) you get one final `ask_human_message` and everything works.
+
+If your client has a similar dedup, either (a) skip dedup when `display_type` differs, or (b) upgrade the existing message's `display_type` and `input_config` instead of rejecting the second event. Pick (a) — it is simpler.
+</Warning>
+
+<Warning>
+**Do not re-use `confirmation_id` anywhere.** The new flow has no `confirmation_id`. The only identifier the client needs is `message_id` (for dedup against Socket.IO retries and for `isSubmitted` lookup). The `action_id` inside `input_config` is opaque to the client — the agent uses it to correlate the reply with its pending question, but the client never sends it back explicitly.
+</Warning>
+
+<Warning>
+**`ask_human_message` is a persisted message.** It goes in the message list, has a `message_id`, gets reloaded from the DB on reopen. Do not route it through a separate "pending confirmations" collection. Render it like any assistant message with a special card component chosen by `displayType`.
+</Warning>
+
+<Note>
+**Coexistence window.** The backend will keep emitting `confirmation_request` for already-pending legacy confirmations for a while. Keep the old listener and mapper through one release, then delete. There is no in-flight state that needs migration on the client — pending legacy confirmations are bounded by their timeout (max 3600s).
+</Note>
+
+## Concrete file changes (Android, `skygen-android`)
+
+**Delete / retire** (after the coexistence window):
+- `feature/chat/websocket/impl/data/dto/confirmation/*.kt` — all of it
+- `feature/chat/websocket/impl/data/usecase/SendConfirmationResponseImpl.kt`
+- `feature/chat/websocket/api/domain/usecase/SendConfirmationResponse.kt`
+- `feature/chat/websocket/api/domain/entity/Confirmation.kt`
+- `feature/chat/websocket/impl/data/SocketIOClient.kt` → `on("confirmation_request")` and `emitConfirmationResponse`
+
+**Add**:
+- `feature/chat/websocket/impl/data/dto/display/DisplayMessageDto.kt` — new DTO (shape above)
+- `feature/chat/websocket/impl/data/mapper/display/DisplayMessageMapper.kt` — discriminator on `display_type`
+- `feature/chat/websocket/impl/data/SocketIOClient.kt` → `on("display_message")`
+- `feature/chat/core/impl/ui/askhuman/AskHumanQuickReplyBar.kt` — bottom-bar surface (chips / Yes-No)
+- ViewModel-level `submittedAskHumanIds` and `activeAskHuman` derivations
+
+**Modify**:
+- `feature/chat/websocket/api/domain/entity/ChatEvent.kt` — add `DisplayMessage` variant
+- `feature/chat/websocket/api/domain/entity/ChatHistory.kt` / message entity — add `displayType` and `askHumanInput`
+- `feature/chat/websocket/impl/data/mapper/uimeta/AskHumanMapper.kt` — reuse for `input_config` parsing (the shape is identical)
+- `feature/chat/core/impl/ui/ChatFragment.kt` — render `AskHumanMessageCard` and `AskHumanQuickReplyBar` based on the derivations
+
+Hold a merge until:
+1. Legacy listener removed and build is clean.
+2. QA covers all five input types on a dev backend: `text`, `multiline`, `choice`, `confirmation`, `mcp_connect_prompt`.
+3. QA verifies: newer question supersedes older (earlier bubble flips to `Answered`), user reply settles question, `No` on a `confirmation` cancels the task, chip click sends `label` and agent echoes it back.
+4. Process-kill + relaunch mid-question re-derives the correct `activeAskHuman` from DB state.
+
+## See also
+
+- [Ask-human (ARCH-001)](/concepts/ask-human) — architectural overview this guide implements
+- [Confirmations](/concepts/confirmations) — the legacy path being replaced
+- [Chat sessions](/concepts/chat-sessions) — how messages are stored and streamed
