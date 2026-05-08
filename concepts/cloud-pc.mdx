@@ -1,201 +1,423 @@
 ---
 title: "Cloud PC"
-description: "Managed persistent desktop environments on E2B Desktop sandboxes with pause, resume, and snapshot."
+description: "Persistent E2B-backed virtual desktop — lifecycle, billing, control handoff, and file management."
 ---
 
-A **Cloud PC** is a persistent, pausable desktop environment powered by E2B Desktop running on Firecracker microVMs. Unlike ephemeral agent sandboxes, a Cloud PC keeps its full OS state across pause/resume cycles through incremental S3 snapshots. You create one, use it from the browser via noVNC, pause it when you are done, come back an hour or a week later, and find every window where you left it.
+A **Cloud PC** is a persistent virtual desktop provisioned on-demand via the E2B sandbox infrastructure. Unlike a per-session sandbox that is torn down when the session ends, a Cloud PC survives between sessions: its filesystem is serialised to S3 on pause and restored on resume. The user and the AI agent share a single screen through a noVNC-style stream, with an exclusive control lock that prevents them from acting simultaneously.
 
-## What it actually is
+## Architecture
 
-- **Runtime**: E2B Desktop SDK on Firecracker microVMs
-- **Resources**: 2 vCPU + 4 GiB RAM on the `desktop` template
-- **Persistence**: custom backup layer that tars `/home/user` to S3 (capped at 500 MB), retained 30 days after termination
-- **Connection**: noVNC stream over WebSocket, rendered in an iframe on the client
-- **Resume latency**: 3–10 seconds from `PAUSED`, much faster than cold boot
+```mermaid
+flowchart TD
+    User["Browser / Desktop App"] -- "POST /cloud-pc/connect" --> API["Backend FastAPI"]
+    API -- "create/resume sandbox" --> E2B["E2B Platform"]
+    E2B -- "stream_url + stream_auth_key" --> API
+    API -- "linked_device_id" --> Device["Device record (E2B_SANDBOX type)"]
+    Device -- "Socket.IO /device namespace" --> Agent["AI Agent"]
+    Agent -- "execute actions" --> E2B
+    API -- "pause: backup → S3" --> S3["AWS S3"]
+    S3 -- "restore" --> E2B
 
-## Relation to other concepts
-
-|              | Cloud PC | E2B sandbox | Real device |
-|--------------|----------|-------------|-------------|
-| Lifecycle    | User-controlled pause and resume | Ephemeral, auto-killed | Long-lived, bound to hardware |
-| Use case     | Daily automation without using your laptop | Throwaway compute for one task | Automate your actual machine |
-| API surface  | `/cloud-pc/*` | `/e2b/*` | `/devices` |
-
-A Cloud PC surfaces as a `Device` with `device_type=E2B_SANDBOX` when you call `POST /cloud-pc/link-device`, so agents can target it like any other device.
-
-## State machine
-
-```
-CREATING ───► ACTIVE ◄──── RESUMING
-    │            │              ▲
-    │      disconnect           │
-    │            ▼              │
-    │         PAUSING ─────► PAUSED
-    │            │              │
-    │            │              │ delete
-    │            │              ▼
-    └────────► ERROR ───► TERMINATED
+    subgraph "Billing loop"
+        Heartbeat["POST /cloud-pc/{id}/heartbeat\n(every 60 s)"] -- "1 token/min via Redis dedup" --> Tokens["TokenBalance"]
+    end
 ```
 
-The full enum from `app/models/cloud_pc.py:CloudPCStatus`: `CREATING`, `RESTORING`, `ACTIVE`, `PAUSING`, `PAUSED`, `RESUMING`, `ERROR`, `TERMINATED`. Stale transitional states (stuck > 5 minutes) are auto-recovered by a background job and marked `TERMINATED`.
+**Key tables:**
 
-## Lifecycle endpoints
+| Table | Purpose |
+|-------|---------|
+| `cloud_pcs` | One row per persistent desktop; tracks status, stream URL, backup location |
+| `devices` | One linked `E2B_SANDBOX` device row; bridges Cloud PC to Socket.IO agent path |
+| `token_transactions` | Every `cloud_pc_usage` debit |
 
-<ParamField path="POST /cloud-pc/connect" type="lifecycle">
-Create a new Cloud PC or reconnect to an existing one. Request body: `{ cloud_pc_id?, name?, session_id? }`. If `cloud_pc_id` is omitted, a new one is created (subject to the `max_cloud_pcs` limit). Response includes `stream_url`, an encrypted `stream_auth_key`, resolution, and status.
+## Lifecycle states
+
+`CloudPCStatus` (source: `Backend/app/models/cloud_pc.py`):
+
+| Status | Meaning |
+|--------|---------|
+| `creating` | E2B sandbox is being provisioned for the first time |
+| `restoring` | Filesystem backup is being loaded from S3 |
+| `active` | Sandbox is live; stream URL is valid |
+| `pausing` | Backup is being written to S3, sandbox will be paused |
+| `paused` | Sandbox is suspended; filesystem is in S3 |
+| `resuming` | Backup is being restored; sandbox is starting up |
+| `error` | A lifecycle operation failed; check `status` field and retry |
+| `terminated` | Sandbox permanently destroyed; cannot resume |
+
+```mermaid
+stateDiagram-v2
+    [*] --> creating : POST /connect (new)
+    creating --> active : sandbox ready
+    creating --> error : E2B failure
+
+    active --> pausing : POST /disconnect or auto-pause
+    pausing --> paused : S3 backup complete
+    pausing --> error : backup failure
+
+    paused --> restoring : POST /connect (existing)
+    restoring --> active : restore complete
+    restoring --> error : restore failure
+
+    active --> terminated : DELETE /{id}
+    error --> terminated : DELETE /{id}
+    paused --> terminated : DELETE /{id}
+```
+
+## API reference
+
+### Connect / resume
+
+<ParamField path="POST /cloud-pc/connect" type="endpoint">
+Provision a new Cloud PC or attach an existing one to a chat session.
+
+Rate-limited to **10 requests per 60 seconds** per user. Requires billing access and a minimum of **5 tokens** in the account. Enforces a 1:1 session binding — a Cloud PC can only be attached to one session at a time.
+
+**Request body:**
+
+<ParamField body="cloud_pc_id" type="string | null">
+  UUID of an existing Cloud PC to resume. Omit to create a new one.
 </ParamField>
 
-<ParamField path="POST /cloud-pc/disconnect" type="lifecycle">
-Gracefully pause. Backs `/home/user` up to S3, then pauses the E2B sandbox. Falls back to `TERMINATED` if pause is unavailable. Reconciles outstanding billing.
+<ParamField body="name" type="string | null">
+  Display name for a new Cloud PC (max 100 characters).
 </ParamField>
 
-<ParamField path="POST /cloud-pc/heartbeat" type="lifecycle">
-Keep the Cloud PC alive and deduct per-minute tokens. Send every 60 seconds while the user is viewing the stream. Returns `204 No Content`. Returns `402` if tokens are insufficient, `409` if the Cloud PC is not `ACTIVE`, `410` if the underlying sandbox is gone.
+<ParamField body="session_id" type="string | null">
+  Chat session to bind this Cloud PC to.
 </ParamField>
 
-<ParamField path="GET /cloud-pc/status" type="lifecycle">
-Current state snapshot. Returns `stream_url` only when `ACTIVE`.
+<ParamField body="force_reattach" type="boolean" default="false">
+  Pass `true` to steal the Cloud PC from another session after the user confirms the Force Release dialog.
 </ParamField>
 
-<ParamField path="GET /cloud-pc/list" type="lifecycle">
-List all Cloud PCs for the current user. `?include_deleted=true` includes soft-deleted entries.
-</ParamField>
-
-<ParamField path="PATCH /{cloud_pc_id}" type="lifecycle">
-Rename. Body: `{ "name": "..." }` (max 100 chars).
-</ParamField>
-
-<ParamField path="DELETE /{cloud_pc_id}" type="lifecycle">
-Soft-delete. Kills the E2B sandbox, keeps the S3 backup for 30 days. Returns `409` if an agent session is active.
-</ParamField>
-
-<ParamField path="POST /{cloud_pc_id}/restore" type="lifecycle">
-Restore from soft-delete if the 30-day retention has not elapsed.
-</ParamField>
-
-## File management
-
-The VNC stream does not proxy file transfers. Use presigned S3 URLs instead.
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/cloud-pc/files` | List entries under `/home/user` |
-| `POST` | `/cloud-pc/files/download` | Get presigned URL for a file in the sandbox |
-| `POST` | `/cloud-pc/files/upload` | Get a presigned POST form to upload |
-| `POST` | `/cloud-pc/files/upload-callback` | After upload, move the file from S3 into the sandbox |
-| `POST` | `/cloud-pc/files/copy-attachment` | Copy a chat attachment into the Cloud PC |
-| `POST` | `/cloud-pc/files/mkdir` | Create a directory |
-| `DELETE` | `/cloud-pc/files` | Delete a file or directory |
-
-All file paths are restricted to `/home/user/`. Rate-limited to 30 operations per minute per user.
-
-## Agent control transfer
-
-While a Cloud PC is `ACTIVE`, either the user (via noVNC) or an agent (via device actions) holds control. Transfer explicitly:
-
-<Steps>
-  <Step title="Link the Cloud PC as a device">
-    `POST /cloud-pc/link-device` creates a `Device` record with `device_type=E2B_SANDBOX` named "Cloud PC". Only one linked device per user at a time.
-  </Step>
-  <Step title="Take control from the agent">
-    `POST /cloud-pc/take-control` with `{ session_id }` pauses the agent, acquires an exclusive control lock in Redis, and logs a message to the chat.
-  </Step>
-  <Step title="Hand control back">
-    `POST /cloud-pc/resume-ai` drains queued messages and publishes a wake-up task. `POST /cloud-pc/renew-control` extends the user's control TTL (default 120s, renewed every 50s by the frontend).
-  </Step>
-</Steps>
-
-## Connect flow (client side)
-
-<Steps>
-  <Step title="Call connect">
-    `POST /cloud-pc/connect` and wait for `status: "active"`. Typical time is 3–5 seconds for a new instance, 3–10 seconds to resume from pause.
-  </Step>
-  <Step title="Open the VNC stream">
-    Render `stream_url` in an iframe. Pass the decrypted `stream_auth_key` as the query string or header expected by E2B's noVNC proxy.
-  </Step>
-  <Step title="Start heartbeat">
-    Every 60 seconds, `POST /cloud-pc/heartbeat` with `{ is_active: true }` while the user is interacting. The backend deducts one token per minute and prevents auto-pause.
-  </Step>
-  <Step title="Disconnect cleanly">
-    On close, `POST /cloud-pc/disconnect`. This backs up state and pauses, so resume is fast.
-  </Step>
-</Steps>
-
-## Pause and resume semantics
-
-**Preserved**: the entire `/home/user` directory (files, dotfiles, permissions), OS processes (paused, not killed), environment variables, open file descriptors, local git state.
-
-**Lost**: clipboard, active network connections (TCP sockets time out after a few minutes of pause), X11 pixmaps (noVNC re-renders on reconnect), some daemons that exit on suspend.
-
-**Limits**:
-- Max pause duration: 30 days (S3 backup retention)
-- Heartbeat interval: 60 seconds recommended
-- Auto-pause on missed heartbeat: 5 minutes
-- Auto-pause on max idle: 30 minutes
-- Backup size cap: 500 MB
-
-## Tier gating and billing
-
-Cloud PC is a **paid feature**. The check lives in `plan_access_service.require_feature(db, user_id, "cloud_pc")` and runs on every `connect`. The plan's `features_config` also controls `max_cloud_pcs`:
-
+**Response `200`:**
 ```json
-{ "cloud_pc": true, "max_cloud_pcs": 3 }
+{
+  "status": "active",
+  "cloud_pc_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "sandbox_id": "snd_01J...",
+  "stream_url": "wss://stream.e2b.dev/...",
+  "stream_auth_key": "eak_...",
+  "resolution": [1920, 1080],
+  "message": "Cloud PC is ready"
+}
 ```
 
-**Billing**: E2B costs approximately $0.1656/hour for the 2 vCPU + 4 GiB template. Skygen marks it up by 2.5×, so usage burns about **0.41 tokens/hour** while `ACTIVE`. Heartbeats deduct one token per minute, deduplicated in Redis so double-heartbeats do not double-bill. Pause is free for compute; S3 storage is charged separately.
+**Error responses:**
 
-## End to end
+| Code | `error` field | Meaning |
+|------|--------------|---------|
+| `402` | `billing_required` | No payment method on file |
+| `402` | `tokens_exhausted` | Monthly tokens used up; enable pay-as-you-go |
+| `409` | `cloud_pc_busy` | This Cloud PC is already bound to another session; use `force_reattach` |
+| `503` | — | E2B service unavailable or feature disabled |
+</ParamField>
 
-```bash
-# 1. Connect (new instance)
-curl -X POST https://api.skygen.ai/cloud-pc/connect \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "My dev PC"}'
-# → { "status": "active", "cloud_pc_id": "cpc_...", "stream_url": "...", "stream_auth_key": "..." }
+### Disconnect / pause
 
-# 2. Heartbeat loop (every 60s)
-curl -X POST https://api.skygen.ai/cloud-pc/heartbeat \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"cloud_pc_id": "cpc_...", "is_active": true}'
+<ParamField path="POST /cloud-pc/disconnect" type="endpoint">
+Back up the sandbox filesystem to S3 and suspend it. Status transitions to `pausing → paused`.
 
-# 3. Disconnect (pauses + backs up)
-curl -X POST https://api.skygen.ai/cloud-pc/disconnect \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"cloud_pc_id": "cpc_..."}'
+**Request body:**
 
-# 4. Resume (fast, ~5s)
-curl -X POST https://api.skygen.ai/cloud-pc/connect \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"cloud_pc_id": "cpc_..."}'
+<ParamField body="cloud_pc_id" type="string | null">
+  UUID of the Cloud PC to pause. Resolves from the session's `device_id` when omitted.
+</ParamField>
 
-# 5. Link for agent control
-curl -X POST https://api.skygen.ai/cloud-pc/link-device \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"cloud_pc_id": "cpc_..."}'
+<ParamField body="session_id" type="string | null">
+  When provided, clears `chat_sessions.device_id` so the session no longer owns the Cloud PC.
+</ParamField>
 
-# 6. Terminate
-curl -X DELETE https://api.skygen.ai/cloud-pc/cpc_... \
-  -H "Authorization: Bearer $TOKEN"
+**Response `200`:**
+```json
+{
+  "status": "paused",
+  "message": "Cloud PC paused and backed up",
+  "backed_up": true
+}
+```
+</ParamField>
+
+### List
+
+<ParamField path="GET /cloud-pc/list" type="endpoint">
+Returns all Cloud PCs owned by the current user plus plan limits.
+
+**Response `200`:**
+```json
+{
+  "cloud_pcs": [
+    {
+      "cloud_pc_id": "3fa85f64-...",
+      "name": "My Desktop",
+      "status": "active",
+      "sandbox_id": "snd_01J...",
+      "stream_url": "wss://...",
+      "created_at": "2026-01-15T12:00:00",
+      "last_activity_at": "2026-05-08T09:30:00",
+      "linked_device_id": "device-uuid",
+      "is_agent_active": true,
+      "backup_size_bytes": 4831838208,
+      "last_backup_at": "2026-05-07T22:00:00",
+      "deleted_at": null
+    }
+  ],
+  "max_cloud_pcs": 1,
+  "max_concurrent_active_cpcs": 1
+}
 ```
 
-## Known rough edges
+`max_concurrent_active_cpcs` — maximum number of simultaneously running (non-paused) Cloud PCs allowed by the plan. Independent of `max_cloud_pcs`, which counts paused ones too.
+</ParamField>
+
+### Status
+
+<ParamField path="GET /cloud-pc/status" type="endpoint">
+Current status and connection details for the user's primary Cloud PC.
+
+**Response `200`:**
+```json
+{
+  "status": "active",
+  "cloud_pc_id": "3fa85f64-...",
+  "name": "My Desktop",
+  "sandbox_id": "snd_01J...",
+  "stream_url": "wss://...",
+  "last_backup_at": "2026-05-07T22:00:00",
+  "backup_size_bytes": 4831838208,
+  "paused_at": null,
+  "last_activity_at": "2026-05-08T09:30:00",
+  "total_active_seconds": 7200,
+  "linked_device_id": "device-uuid",
+  "controller": "ai"
+}
+```
+
+`controller` — `"ai"` when the agent holds the control lock, `"user"` when the user does, `null` when nobody does.
+</ParamField>
+
+### Heartbeat
+
+<ParamField path="POST /cloud-pc/{id}/heartbeat" type="endpoint">
+Proof-of-life ping sent by the frontend every **60 seconds** while the Cloud PC stream is open. Deduped via Redis — only the first call in any 60-second window deducts tokens.
+
+**Request body:**
+
+<ParamField body="is_active" type="boolean" default="false">
+  `true` if the user had at least one real interaction (mouse/keyboard) since the last heartbeat. Updates `last_interaction_at` in addition to `last_activity_at`.
+</ParamField>
+
+**Billing:** Each accepted heartbeat deducts **1 token** via a `cloud_pc_usage` transaction.
+</ParamField>
+
+### Take control / Resume AI
+
+<ParamField path="POST /cloud-pc/take-control" type="endpoint">
+User claims the control lock, interrupting any active AI action.
+
+**Request body:** `{ "session_id": "uuid" }`
+
+**Response `200`:**
+```json
+{ "status": "ok", "controller": "user" }
+```
+</ParamField>
+
+<ParamField path="POST /cloud-pc/resume-ai" type="endpoint">
+User releases the control lock back to the AI.
+
+**Request body:** `{ "session_id": "uuid" }`
+
+**Response `200`:**
+```json
+{ "status": "ok", "controller": "ai", "queued_messages_count": 2 }
+```
+
+`queued_messages_count` — messages that arrived while the user held control and are now unblocked for processing.
+</ParamField>
+
+### File management
+
+All file operations are scoped to `/home/user/` on the sandbox. Paths containing null bytes or traversal sequences are rejected at the schema layer.
+
+<ParamField path="GET /cloud-pc/{id}/files" type="endpoint">
+List directory contents. Query param: `path` (default `/home/user`).
+
+**Response entry shape:**
+```json
+{
+  "name": "report.pdf",
+  "type": "file",
+  "size": 204800,
+  "modified_at": 1746704400,
+  "permissions": "-rw-r--r--"
+}
+```
+</ParamField>
+
+<ParamField path="POST /cloud-pc/{id}/files/download" type="endpoint">
+Generate a presigned S3 download URL for a file.
+
+**Request:** `{ "file_path": "/home/user/report.pdf" }`
+
+**Response:**
+```json
+{
+  "download_url": "https://s3.amazonaws.com/...",
+  "filename": "report.pdf",
+  "size": 204800,
+  "expires_at": "2026-05-08T10:00:00Z"
+}
+```
+</ParamField>
+
+<ParamField path="POST /cloud-pc/{id}/files/upload" type="endpoint">
+Get a presigned S3 upload URL (multipart POST). Upload directly from the browser — the backend is not in the data path.
+
+**Request:** `{ "dest_path": "/home/user/", "filename": "data.csv" }`
+
+**Response:**
+```json
+{
+  "upload_url": "https://s3.amazonaws.com/bucket",
+  "fields": { "key": "uploads/...", "Content-Type": "text/csv", "..." : "..." },
+  "s3_key": "uploads/user-id/data.csv"
+}
+```
+
+After the browser completes the upload, call `POST /cloud-pc/{id}/files/upload/callback` with `{ "s3_key": "...", "dest_path": "..." }` to copy the file into the sandbox.
+</ParamField>
+
+<ParamField path="POST /cloud-pc/{id}/files/mkdir" type="endpoint">
+Create a directory inside the sandbox.
+
+**Request:** `{ "path": "/home/user/projects/new-folder" }`
+</ParamField>
+
+### Device linking
+
+<ParamField path="POST /cloud-pc/link-device" type="endpoint">
+Create or retrieve the `E2B_SANDBOX` device record that bridges the Cloud PC to the Socket.IO agent path.
+
+**Request:** `{ "cloud_pc_id": "uuid" }`
+
+**Response:**
+```json
+{
+  "device_id": "device-uuid",
+  "device_name": "Cloud PC · My Desktop"
+}
+```
+
+This device ID is what agents use to route actions to the Cloud PC via the `/device` Socket.IO namespace.
+</ParamField>
+
+### Update and delete
+
+<ParamField path="PATCH /cloud-pc/{id}" type="endpoint">
+Rename a Cloud PC. Body: `{ "name": "New Name" }` (max 100 characters).
+</ParamField>
+
+<ParamField path="DELETE /cloud-pc/{id}" type="endpoint">
+Soft-delete and permanently destroy the E2B sandbox. The record's `deleted_at` is set; S3 backup is not automatically deleted. Status transitions to `terminated`. This operation is irreversible.
+</ParamField>
+
+<ParamField path="POST /cloud-pc/{id}/restore" type="endpoint">
+Restore a soft-deleted Cloud PC from its S3 backup. Creates a new sandbox and transitions through `restoring → active`.
+</ParamField>
+
+## Billing
+
+Cloud PC time is billed in **1-token-per-minute** increments charged through the heartbeat endpoint. The dedup key uses a **per-calendar-minute bucket** in Redis: `cloud_pc:billing:{cloud_pc_id}:{unix_minute}` where `unix_minute = int(time.time()) // 60`. The key is written with `SET ... NX EX 120` — if the key already exists for this minute, billing is skipped. The 120-second TTL (2 × the bucket width) ensures keys expire cleanly even if a heartbeat arrives slightly after the minute boundary.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend
+    participant API as Backend
+    participant Redis
+    participant DB as Postgres
+
+    loop every 60 s
+        FE->>API: POST /cloud-pc/{id}/heartbeat
+        API->>Redis: SET cloud_pc:billing:{id}:{unix_minute} "1" NX EX 120
+        alt key did not exist (first heartbeat this minute)
+            Redis-->>API: OK
+            API->>DB: INSERT token_transactions (cloud_pc_usage, amount=-1)
+            API->>DB: UPDATE token_balances SET balance = balance - 1
+        else key existed (duplicate heartbeat same minute)
+            Redis-->>API: nil (skipped)
+            API-->>FE: 204 (no charge)
+        end
+    end
+```
+
+Requirements to start a Cloud PC:
+- Active subscription with Cloud PC enabled (`features_config.cloud_pc = true`)
+- At least **5 tokens** in balance (gate at connect time)
+- `max_cloud_pcs` not exceeded for the plan
+
+## Control lock
+
+Only one controller — `"ai"` or `"user"` — may act on the Cloud PC screen at a time.
+
+| Endpoint | Result |
+|----------|--------|
+| `POST /cloud-pc/take-control` | Sets controller to `"user"`. Agent actions return error until released. |
+| `POST /cloud-pc/resume-ai` | Returns controller to `"ai"`. Queued messages are unblocked. |
+
+The agent renews the lock on every action call. If the lock expires (no action within the TTL) and the user takes control, the agent's next action will fail with `"currently controlled by user"`.
+
+## Socket.IO events
+
+When the Cloud PC status or controller changes, the backend pushes an event to the connected frontend via the `/user` Socket.IO namespace.
+
+| Event name | Trigger | Key payload fields |
+|------------|---------|-------------------|
+| `cloud_pc_status_changed` | Any `CloudPCStatus` transition | `cloud_pc_id`, `status`, `stream_url` |
+| `cloud_pc_control_changed` | Take-control or resume-AI | `cloud_pc_id`, `controller` (`"ai"` \| `"user"`) |
+
+## Persistence and backup
+
+On `POST /disconnect` the backend:
+
+1. Calls the E2B SDK to snapshot the sandbox filesystem.
+2. Uploads the snapshot to S3 at key `backups/{user_id}/{cloud_pc_id}/{timestamp}.tar.gz`.
+3. Writes `backup_s3_key`, `backup_size_bytes`, and `last_backup_at` on the `cloud_pcs` row.
+4. Transitions status to `paused`.
+
+On `POST /connect` for an existing Cloud PC in `paused` state:
+
+1. Status transitions to `restoring`.
+2. E2B restores from the S3 key stored in `backup_s3_key`.
+3. Status transitions to `active` and a new `stream_url` is issued.
+
+## Auto-pause memo
+
+When the agent auto-pauses a Cloud PC session, the backend moves `chat_sessions.device_id` to `chat_sessions.paused_device_id` rather than clearing it. This one-shot memo lets the session be resumed later by restoring `device_id` from `paused_device_id`. Only the `reason='paused'` path writes this field; `reason='terminate'` and `reason='sandbox_missing'` remain destructive.
+
+## Gotchas
 
 <Warning>
-**No incremental backup.** Every pause tars all of `/home/user`, even if only one file changed. Large workspaces pause slowly. Consider keeping your working set trim.
+**Stream URL expires.** The `stream_url` is valid only for the current active session. After a pause/resume cycle a new URL is issued. Always re-fetch via `GET /cloud-pc/status` before connecting a noVNC client.
+</Warning>
+
+<Warning>
+**File paths must be under `/home/user/`.** The schema validator normalises the path with `os.path.normpath` and rejects anything outside `/home/user` — including traversal sequences (`../`). Absolute paths that do not start with `/home/user` are rejected with `422`.
 </Warning>
 
 <Note>
-**500 MB backup cap.** Data beyond the cap is not backed up. Large media or datasets should stay in S3 or an external store, not in `/home/user`.
+**`is_agent_active` in list response.** This field is `true` when an agent task is currently running against this Cloud PC. Use it to warn the user before taking control.
 </Note>
 
 <Note>
-**Pause fallback to terminate.** If the E2B pause API fails, Skygen forcefully terminates the sandbox. Unsaved in-memory state is lost. Rare, but possible during infrastructure incidents.
+**Soft-delete vs. terminate.** `DELETE /{id}` sets `deleted_at` (soft delete) and kills the E2B sandbox, but the S3 backup survives. `POST /{id}/restore` can recover from the backup. Hard-purging the S3 key is a separate admin operation.
 </Note>
 
 ## See also
 
-- [Devices](/concepts/devices) — unified device model
-- [Agents](/concepts/agents) — action routing
-- [Billing](/concepts/billing) — tier gating and per-minute cost
+- [Devices](/concepts/devices) — how the `E2B_SANDBOX` device type bridges Cloud PC to the agent action layer
+- [Billing](/concepts/billing) — token system, subscription tiers, and Cloud PC quotas
+- [Agents](/concepts/agents) — how agents route actions to Cloud PC via the device layer
+- [Confirmations](/concepts/confirmations) — the `start_cloud_pc_prompt` confirmation type that gates the first connect

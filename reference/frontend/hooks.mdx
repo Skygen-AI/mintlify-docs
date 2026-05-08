@@ -1,0 +1,869 @@
+---
+title: "Frontend Hooks Reference"
+description: "Every custom React hook in the Skygen shared UI library — parameters, return values, side effects, and store dependencies."
+---
+
+# Frontend Hooks Reference
+
+All hooks live in `ui-shared-tauri/src/hooks/`. The index re-exports every hook at `hooks/index.ts`.
+
+---
+
+## Auth
+
+### useAuth
+
+**File:** `hooks/useAuth.ts`  
+**Purpose:** Convenience wrapper around `authSlice` in the Zustand store. Exposes all auth state and actions as a single flat object.
+
+### Returns
+<ResponseField name="user" type="User | null">Authenticated user object, or `null` if not logged in.</ResponseField>
+<ResponseField name="isLoading" type="boolean">True during session restore or login.</ResponseField>
+<ResponseField name="isAuthenticated" type="boolean">Whether a valid session exists. Optimistically true if `auth_token` is in localStorage.</ResponseField>
+<ResponseField name="needsOTPSetup" type="boolean">True when 2FA setup is required after login.</ResponseField>
+<ResponseField name="login" type="(email: string, password: string) => Promise<void>">Log in with email and password.</ResponseField>
+<ResponseField name="signup" type="(email: string, password: string, displayName?: string, meta?: Record<string, unknown>) => Promise<void>">Register a new account. Optional `displayName` and `meta` for platform-specific metadata.</ResponseField>
+<ResponseField name="logout" type="() => Promise<void>">Disconnect wsClient, POST /auth/logout, reset all user state across all slices.</ResponseField>
+<ResponseField name="refreshUser" type="() => Promise<void>">Re-fetch user profile from `/users/me`.</ResponseField>
+<ResponseField name="restoreSession" type="() => Promise<boolean>">Check stored tokens, upgrade legacy token to cookie, reconnect wsClient. Returns `true` if session was restored.</ResponseField>
+<ResponseField name="setNeedsOTPSetup" type="(v: boolean) => void">Manually set the 2FA setup flag.</ResponseField>
+
+### Example
+```tsx
+const { user, isAuthenticated, logout } = useAuth();
+if (!isAuthenticated) return <Navigate to="/login" />;
+```
+
+**Used by:** `LoginPage`, `RegisterPage`, `AuthProvider`, `ProtectedRoute`
+
+---
+
+## Chat
+
+### useChat
+
+**File:** `hooks/useChat.ts`  
+**Purpose:** Composition hook for a chat session. Loads messages on session change, mounts `useChatWebSocket`, and exposes send/cancel wrappers. Contains a 2-minute freshness guard to avoid resurrecting stale "Thinking…" spinners after reload.
+
+### Parameters
+<ParamField path="sessionId" type="string | null" required>Active session ID. Pass `null` when no session is selected.</ParamField>
+
+### Returns
+<ResponseField name="messages" type="Message[]">Ordered message list for the session.</ResponseField>
+<ResponseField name="isTyping" type="boolean">True while the agent is generating a response.</ResponseField>
+<ResponseField name="taskStatus" type="TaskStatus | null">Current task state (`isActive`, `status`, `subAgentCount`).</ResponseField>
+<ResponseField name="uiMeta" type="UiMetaUpdatePayload | null">Live UI meta from the agent (used for progress overlays).</ResponseField>
+<ResponseField name="agentSteps" type="AgentStep[]">Live step list for the current task.</ResponseField>
+<ResponseField name="agentStepsByPlanStep" type="Record<string, AgentStep[]>">Steps grouped by plan step ID.</ResponseField>
+<ResponseField name="plan" type="PlanPayload | null">Live execution plan from the agent.</ResponseField>
+<ResponseField name="frozenPlanByMessageId" type="Record<string, FrozenPlanSnapshot>">Completed plans indexed by terminal message ID.</ResponseField>
+<ResponseField name="isLoading" type="boolean">True while messages are being fetched from REST.</ResponseField>
+<ResponseField name="sendMessage" type="(content: string, otpCode?: string, deviceId?: string, isSandbox?: boolean, agentMode?: string) => Promise<SendResult>">Send a new message. Starts the watchdog clock.</ResponseField>
+<ResponseField name="cancelTask" type="(deviceId?: string, reason?: string) => Promise<void>">Cancel the running task.</ResponseField>
+<ResponseField name="updateMessage" type="(messageId: string, updates: Partial<Message>) => void">Optimistically update a message in the store.</ResponseField>
+
+### Example
+```tsx
+const { messages, isTyping, sendMessage, cancelTask } = useChat(sessionId);
+```
+
+**Used by:** `ChatPage`
+
+---
+
+### useChatWebSocket
+
+**File:** `hooks/useChatWebSocket.ts`  
+**Purpose:** Manages all Socket.IO event subscriptions for a chat session.
+
+**Subscribed events:**
+- `display_message` — unified event protocol: handles `assistant_message`, `user_message`, `cancelled_message`, `paused_message`, `error_message`, `ask_human_message`, `status_update`, `step_progress`, `plan_update`, `mode_progress`, `attachment_ready`, `billing_notice`
+- `new_message` — legacy event (deduped against `display_message` via `displayHandledIdsRef`)
+- `task_progress` — drives `updateTaskProgress` in liveStateSlice
+- `agent_typing` — drives `setTyping`; sealed sessions reject `is_typing: true`
+- `device_status` — drives `updateDeviceStatus`
+- `reconnected` — reloads messages for the current session (debounced to 5s)
+- `ui_meta_update` — drives agent steps and plan updates; contains legacy MCP connect prompt fallback (disabled)
+- `agent_error` — finalizes session with `error` status, inserts system error message
+- `attachments_ready` — updates message attachments with S3 keys
+- `message_deleted` — removes message from store (cross-device delete sync)
+
+**Safety watchdog:** A `setInterval` at 15-second ticks. If a task is active for more than 120 seconds without any agent event (`lastAgentEventRef`), finalizes the session with `error`. Also REST-polls `GET /agent/task/{id}/status` every tick to catch stale `isActive=true` from page reloads before any events arrive.
+
+### Parameters
+<ParamField path="sessionId" type="string | null" required>The session to subscribe to.</ParamField>
+
+### Returns
+<ResponseField name="markAgentEvent" type="() => void">Resets the watchdog timer to now. Call when a user action proves the agent is alive (e.g., after `sendMessage`).</ResponseField>
+
+**Used by:** `useChat`
+
+---
+
+### useChatSend
+
+**File:** `hooks/useChatSend.ts`  
+**Purpose:** Encapsulates all message submission logic: new session creation, agent mode selection (CUA/SWE/Deep Research/auto), file upload attachment to Cloud PC, paywall checks, device-busy/unreachable error handling, confirmation reply routing, and landing stats tracking.
+
+### Parameters
+<ParamField path="options" type="UseChatSendOptions" required>
+```typescript
+interface UseChatSendOptions {
+  sessionId: string | null;
+  selectedDeviceId: string | null | undefined;
+  selectedDevice: { id: string; connection_status?: 'online' | 'offline' | 'deleted' } | null;
+  isComputerUseActive: boolean;
+  isDeepResearchActive: boolean;
+  isSWEActive: boolean;
+  activeConfirmation: { id: string } | null;
+  approveConfirmation: (id: string, message: string) => void;
+  rejectConfirmation: (id: string) => void;
+  isProcessingConfirmation: boolean;
+  cancelTask: (deviceId?: string, reason?: string) => Promise<void>;
+  isTyping: boolean;
+  taskStatus: { isActive?: boolean; status?: string } | null;
+}
+```
+</ParamField>
+
+### Returns
+<ResponseField name="inputValue" type="string">Controlled input field value. Initialized from `sessionStorage.pendingPrompt` if present.</ResponseField>
+<ResponseField name="setInputValue" type="(v: string) => void">Set the input value.</ResponseField>
+<ResponseField name="attachedFiles" type="AttachedFile[]">Currently attached files.</ResponseField>
+<ResponseField name="setAttachedFiles" type="React.Dispatch<React.SetStateAction<AttachedFile[]>>">State setter for attached files.</ResponseField>
+<ResponseField name="isSending" type="boolean">True during the async send call.</ResponseField>
+<ResponseField name="errorMessage" type="string | null">Error text to display below the input. Reset on session change.</ResponseField>
+<ResponseField name="setErrorMessage" type="(msg: string | null) => void">Manually set or clear the error message.</ResponseField>
+<ResponseField name="forceReleaseDeviceId" type="string | null">Set when a `device_busy` or `cloud_pc_conflict` error requires a force-release UI. Reset on session change.</ResponseField>
+<ResponseField name="setForceReleaseDeviceId" type="(id: string | null) => void">Manually set or clear the force-release device ID.</ResponseField>
+<ResponseField name="isThinking" type="boolean">`true` when the agent is processing. Combines `isTyping`, `isSending`, `isProcessingConfirmation`, and active `taskStatus`. Suppressed when `activeConfirmation` is set (so the ask_human input is visible).</ResponseField>
+<ResponseField name="handleSubmit" type="() => Promise<void>">Submit the current input. Handles session creation, agent mode, file copy to Cloud PC, and all error routing (device_busy, device_unreachable, cloud_pc_conflict, payment_required).</ResponseField>
+<ResponseField name="handleStop" type="() => Promise<void>">Cancel the running task. Rejects active confirmation before cancelling.</ResponseField>
+<ResponseField name="submitInlineAskHuman" type="(value: string) => Promise<void>">Send an answer to an inline ask_human form (ARCH-001 hibernate/wake pattern). Does not go through the legacy confirmation service.</ResponseField>
+
+**Used by:** `InputPanel` (ChatPage)
+
+---
+
+### useChatScroll
+
+**File:** `hooks/useChatScroll.ts`  
+**Purpose:** Auto-scrolls the message list to the bottom when new messages arrive, unless the user has manually scrolled up.
+
+### Parameters
+<ParamField path="messages" type="Message[]">The message list to track.</ParamField>
+<ParamField path="isTyping" type="boolean">True while the agent is streaming — keeps scroll pinned to bottom.</ParamField>
+
+**Used by:** `ChatPage`
+
+---
+
+### useChatConnectors
+
+**File:** `hooks/useChatConnectors.ts`  
+**Purpose:** Provides connector state and handlers scoped to the chat context. Bridges `ConnectorsContext` with the chat's modal state for the quick-connect flow.
+
+### Returns
+<ResponseField name="connectors" type="IntegrationWithActive[]">Active connectors.</ResponseField>
+<ResponseField name="isConnectorsOpen" type="boolean">Whether the ConnectorsModal is open.</ResponseField>
+<ResponseField name="setIsConnectorsOpen" type="(v: boolean) => void">Open/close the ConnectorsModal.</ResponseField>
+<ResponseField name="handleConnectApps" type="() => void">Open the modal on the Apps tab.</ResponseField>
+<ResponseField name="handleConnectorSelect" type="(provider: string) => void">Open modal with a specific connector pre-selected.</ResponseField>
+<ResponseField name="handleQuickConnect" type="() => void">Initiate OAuth connect for `quickConnectProvider`.</ResponseField>
+
+**Used by:** `ChatPage`, `ChatModals`
+
+---
+
+### useChatDeviceState
+
+**File:** `hooks/useChatDeviceState.ts`  
+**Purpose:** Provides device and Cloud PC state scoped to a chat session, including the current ask-human confirmation.
+
+### Parameters
+<ParamField path="urlSessionId" type="string | undefined">Session ID from the URL.</ParamField>
+
+**Used by:** `ChatPage`
+
+---
+
+### useChatReplay
+
+**File:** `hooks/useChatReplay.ts`  
+**Purpose:** Utility functions for deduplicating replayed WebSocket events after reconnect. Exports `isReplayedMessage`, `hasNewerTask`, and `isStaleReplayEvent`. No return value (module of pure functions).
+
+**Used by:** `useChatWebSocket`
+
+---
+
+## Billing
+
+### useBilling
+
+**File:** `hooks/useBilling.ts`  
+**Purpose:** Convenience wrapper around `billingSlice` in the Zustand store. The primary billing hook — `BillingContext` is a no-op stub; use this hook instead.
+
+### Returns
+<ResponseField name="status" type="BillingStatus | null">Current billing status including plan, token balance, feature flags (`cloud_pc_enabled`, `scheduled_tasks_enabled`, `can_access`, `access_reason`, `access_message`, `allowed_model_profiles`, `active_model_profile`).</ResponseField>
+<ResponseField name="pricing" type="PricingInfo | null">Pricing configuration.</ResponseField>
+<ResponseField name="plans" type="Plan[]">Available subscription plans, sorted by `sort_order` then `price_usd`.</ResponseField>
+<ResponseField name="isStatusLoading" type="boolean">True while loading billing status.</ResponseField>
+<ResponseField name="isPricingLoading" type="boolean">True while loading pricing.</ResponseField>
+<ResponseField name="isPlansLoading" type="boolean">True while loading plans.</ResponseField>
+<ResponseField name="onboardingDone" type="boolean">Whether the user has completed onboarding. Persisted in `platform.storage`.</ResponseField>
+<ResponseField name="loadStatus" type="(silent?: boolean) => Promise<void>">Fetch billing status from the API. Pass `silent: true` to skip loading spinner.</ResponseField>
+<ResponseField name="loadPricing" type="() => Promise<void>">Fetch pricing from the API.</ResponseField>
+<ResponseField name="loadPlans" type="() => Promise<void>">Fetch plan list from the API.</ResponseField>
+<ResponseField name="markOnboardingComplete" type="() => Promise<void>">Mark onboarding as complete and persist to `platform.storage`.</ResponseField>
+<ResponseField name="checkOnboardingStatus" type="() => Promise<void>">Load onboarding status from `platform.storage` into the store.</ResponseField>
+<ResponseField name="setupCard" type="() => Promise<SetupIntentResponse>">Create a Stripe SetupIntent for adding a payment method.</ResponseField>
+<ResponseField name="confirmCard" type="(setupIntentId: string) => Promise<void>">Confirm a SetupIntent after Stripe.js collects card details.</ResponseField>
+<ResponseField name="createCheckoutSession" type="(planId: string) => Promise<string>">Create a Stripe Checkout session; returns the checkout URL.</ResponseField>
+<ResponseField name="subscribe" type="(planId: string) => Promise<void>">Subscribe to a plan with an existing payment method.</ResponseField>
+<ResponseField name="changePlan" type="(planId: string) => Promise<void>">Switch to a different plan.</ResponseField>
+<ResponseField name="cancel" type="() => Promise<void>">Cancel the current subscription.</ResponseField>
+<ResponseField name="enableOverage" type="() => Promise<void>">Enable usage-based overage billing.</ResponseField>
+<ResponseField name="disableOverage" type="() => Promise<void>">Disable overage billing.</ResponseField>
+<ResponseField name="canAccess" type="() => boolean">Derived getter: `status?.can_access ?? false`. Used to gate message sending.</ResponseField>
+
+**Used by:** `ChatPage`, `HomeUpdated`, `PricingPage`, `InputPanel`, `MainLayout`, and most authenticated pages.
+
+---
+
+### usePlanAccess
+
+**File:** `hooks/usePlanAccess.ts`  
+**Purpose:** Centralized feature access checker. Checks `cloud_pc` and `scheduled_tasks` via `status.cloud_pc_enabled` / `status.scheduled_tasks_enabled` flags and finds the cheapest upgrade plan when access is denied.
+
+```typescript
+export type FeatureKey = "cloud_pc" | "scheduled_tasks";
+
+export interface PlanAccessResult {
+  allowed: boolean;
+  upgradePlanId?: string;
+  planName?: string;
+}
+```
+
+### Returns
+<ResponseField name="checkFeatureAccess" type="(feature: FeatureKey) => PlanAccessResult">Check access and return `{ allowed, upgradePlanId?, planName? }`. When denied, finds the cheapest plan above the current `sort_order` that has the feature enabled in `features_config`.</ResponseField>
+<ResponseField name="status" type="BillingStatus | null">Current billing status (direct store reference).</ResponseField>
+<ResponseField name="modelDisplayName" type="string | null">Current plan's model display name from `status.model_display_name`.</ResponseField>
+<ResponseField name="allowedModelProfiles" type="string[] | null">Model profiles available to this plan from `status.allowed_model_profiles`.</ResponseField>
+<ResponseField name="activeModelProfile" type="string | null">Currently selected model profile from `status.active_model_profile`.</ResponseField>
+<ResponseField name="modelProfilesMeta" type="ModelProfileMeta[] | null">Display metadata for model profiles from `status.model_profiles_meta`.</ResponseField>
+<ResponseField name="setModelProfile" type="(profile: string) => Promise<void>">Switch the active model profile via `billingSlice.setModelProfile`.</ResponseField>
+
+### Example
+```tsx
+const { checkFeatureAccess } = usePlanAccess();
+const result = checkFeatureAccess("cloud_pc");
+if (!result.allowed) {
+  navigate(`/subscriptions?plan_id=${result.upgradePlanId}`);
+}
+```
+
+**Used by:** `HomeUpdated`, `MainLayout`, `ChooseDeviceModal`
+
+---
+
+### useStripeCheckoutReturn
+
+**File:** `hooks/useStripeCheckoutReturn.ts`  
+**Purpose:** Runs once on mount to detect a Stripe Checkout redirect return. Reads `?session_id=` from the URL, polls for subscription activation, and redirects to `/subscriptions` if a `?plan_id=` deep-link is stored.
+
+**Used by:** `PricingPage`, `HomeUpdated`
+
+---
+
+## Devices
+
+### useDevices
+
+**File:** `hooks/useDevices.ts`  
+**Purpose:** Convenience wrapper around `deviceSlice` in the Zustand store.
+
+### Returns
+<ResponseField name="devices" type="Device[]">All registered devices.</ResponseField>
+<ResponseField name="selectedDeviceId" type="string | null">Currently selected device ID.</ResponseField>
+<ResponseField name="isLoading" type="boolean">True while loading the device list (`isDevicesLoading` in slice).</ResponseField>
+<ResponseField name="loadDevices" type="() => Promise<void>">Fetch device list from the API. Skips if `devicesLoaded || isDevicesLoading`.</ResponseField>
+<ResponseField name="selectDevice" type="(deviceId: string | null) => void">Select or deselect a device.</ResponseField>
+<ResponseField name="registerDevice" type="(request: CreateDeviceRequest) => Promise<Device>">Register a new device.</ResponseField>
+<ResponseField name="deleteDevice" type="(deviceId: string) => Promise<void>">Remove a device.</ResponseField>
+<ResponseField name="getSelectedDevice" type="() => Device | null">Get the currently selected `Device` object.</ResponseField>
+<ResponseField name="getOnlineDevices" type="() => Device[]">Filter to devices with `connection_status === 'online'`.</ResponseField>
+
+**Used by:** `useComputerUse`, `DevicesContext`, `ChooseDeviceModal`
+
+---
+
+### useComputerUse
+
+**File:** `hooks/useComputerUse.ts`  
+**Purpose:** All-in-one hook for Computer Use and Cloud PC state. Manages device picker modal state, Cloud PC connect/disconnect, per-session Cloud PC state (reads `cloudPcBySession[urlSessionId]` with fallback to global fields), device-select handler, and the StartCloudPcPrompt cross-component bridge (`chooseDeviceRequested` store flag).
+
+### Returns
+<ResponseField name="devices" type="Device[]">All registered devices.</ResponseField>
+<ResponseField name="selectedDevice" type="Device | null">Currently selected Device object.</ResponseField>
+<ResponseField name="selectedDeviceId" type="string | null">Currently selected device ID.</ResponseField>
+<ResponseField name="isComputerUseActive" type="boolean">`true` when a device is selected or a Cloud PC is active/connecting for this session.</ResponseField>
+<ResponseField name="isCloudDesktopSelected" type="boolean">`true` when Cloud PC is active, connecting, or viewMode is not `hidden`.</ResponseField>
+<ResponseField name="chooseDeviceList" type="Array<{id, name, description, platform, status}>">Formatted device list for `ChooseDeviceModal` (excludes e2b_sandbox type devices).</ResponseField>
+<ResponseField name="isCloudConnecting" type="boolean">True while Cloud PC connect is in progress.</ResponseField>
+<ResponseField name="cloudStreamUrl" type="string | null">VNC stream URL. Prefers per-session value over global.</ResponseField>
+<ResponseField name="cloudConnectError" type="string | null">Last connect error message.</ResponseField>
+<ResponseField name="cloudConnectErrorStatus" type="number | null">HTTP status of the last connect error.</ResponseField>
+<ResponseField name="cloudLinkedDeviceId" type="string | null">Device ID linked to the active Cloud PC. Prefers per-session value.</ResponseField>
+<ResponseField name="cloudPCStatus" type="CloudPCStatus">Per-session Cloud PC status. Prefers `cloudPcBySession[urlSessionId].status` over global.</ResponseField>
+<ResponseField name="viewMode" type="'hidden' | 'pip' | 'split'">How the Cloud Desktop panel is displayed. Prefers per-session value.</ResponseField>
+<ResponseField name="cloudPCList" type="CloudPCListItem[]">All available Cloud PCs for the account.</ResponseField>
+<ResponseField name="maxCloudPCs" type="number">Max Cloud PCs allowed by the current plan.</ResponseField>
+<ResponseField name="fetchCloudPCList" type="() => Promise<void>">Fetch the Cloud PC catalog.</ResponseField>
+<ResponseField name="isAddDeviceOpen" type="boolean">Whether the add-device modal is open (local state).</ResponseField>
+<ResponseField name="isChooseDeviceOpen" type="boolean">Whether the device picker modal is open (local state).</ResponseField>
+<ResponseField name="handleDeviceSelect" type="(deviceId: string, cloudPcId?: string, sessionId?: string | null) => void">Select a device or connect a Cloud PC. Clears action cooldown on Cloud PC path. Honors `chooseDeviceExpandOnSelect` flag to set `viewMode` to `split`.</ResponseField>
+<ResponseField name="handleAddDevice" type="(data: {name, deviceId, platform}) => Promise<void>">Register a new device and select it.</ResponseField>
+<ResponseField name="handleComputerUseToggle" type="(active: boolean) => void">Toggle Computer Use. Deactivating opens the turn-off dialog if Cloud PC is active; activating reconnects if in error state.</ResponseField>
+<ResponseField name="openAddDeviceModal" type="() => void">Open the add-device modal.</ResponseField>
+<ResponseField name="closeAddDeviceModal" type="() => void">Close the add-device modal.</ResponseField>
+<ResponseField name="openChooseDeviceModal" type="() => void">Open the device picker modal.</ResponseField>
+<ResponseField name="closeChooseDeviceModal" type="() => void">Close the device picker modal. Also clears `chooseDeviceExpandOnSelect` flag.</ResponseField>
+<ResponseField name="createCloudPC" type="() => Promise<void>">Create and link a new Cloud PC, then refresh the list.</ResponseField>
+<ResponseField name="deleteCloudPC" type="(cloudPcId: string) => Promise<void>">Delete a Cloud PC. Resets store state if it was the active one.</ResponseField>
+
+**Used by:** `HomeUpdated`, `ChatPage` (via `useChatDeviceState`)
+
+---
+
+### useCloudPCActions
+
+**File:** `hooks/useCloudPCActions.ts`  
+**Purpose:** Stable hooks API for Cloud PC lifecycle operations: connect, disconnect, file management (load, download, upload, delete, createFolder), take control, resume AI, fetch status/list, reset, restore.
+
+### Returns
+<ResponseField name="connect" type="(sessionId?: string | null, cloudPcId?: string, name?: string) => Promise<void>">Connect or resume a Cloud PC for a session.</ResponseField>
+<ResponseField name="disconnect" type="(reason?: string, errorStatus?: number) => Promise<void>">Disconnect the Cloud PC.</ResponseField>
+<ResponseField name="fetchStatus" type="() => Promise<void>">Refresh Cloud PC status from REST.</ResponseField>
+<ResponseField name="fetchList" type="() => Promise<void>">Fetch the Cloud PC catalog.</ResponseField>
+<ResponseField name="reset" type="() => void">Reset Cloud PC store state to idle.</ResponseField>
+<ResponseField name="setViewMode" type="(mode: 'hidden' | 'pip' | 'split') => void">Change the Cloud Desktop panel display mode.</ResponseField>
+<ResponseField name="takeControl" type="() => Promise<void>">Transfer control from AI to the user.</ResponseField>
+<ResponseField name="resumeAI" type="() => Promise<void>">Return control to the AI.</ResponseField>
+<ResponseField name="restore" type="() => Promise<void>">Restore Cloud PC bindings from REST (reconcile).</ResponseField>
+<ResponseField name="loadFiles" type="(path?: string) => Promise<void>">Load file listing for Cloud PC file manager.</ResponseField>
+<ResponseField name="downloadFile" type="(filePath: string) => Promise<void>">Download a file from the Cloud PC.</ResponseField>
+<ResponseField name="uploadFile" type="(file: File, path?: string) => Promise<void>">Upload a file to the Cloud PC.</ResponseField>
+<ResponseField name="deleteFile" type="(filePath: string) => Promise<void>">Delete a file on the Cloud PC.</ResponseField>
+<ResponseField name="createFolder" type="(path: string) => Promise<void>">Create a folder on the Cloud PC.</ResponseField>
+
+**Used by:** `CloudDesktopPanel`, `CloudDesktopFileManager`
+
+---
+
+### useCloudPCEvents
+
+**File:** `hooks/useCloudPCEvents.ts`  
+**Purpose:** Subscribes to Cloud PC Socket.IO events at the layout level. Routes events by `cloud_pc_id` to the correct per-session entry in `cloudPcBySession`. Also triggers a REST reconcile on tab visibility change (throttled to 30 seconds).
+
+**Subscribed events:**
+- `cloud_pc_status_changed` — calls `updateCloudPCStatus` + `fetchCloudPCList`
+- `cloud_pc_control_changed` — calls `setCloudPCController`
+- `cloud_pc_session_released` — calls `handleCloudPcSessionReleased` (clears binding when force-released)
+- `cloud_pc_session_rebound` — calls `handleCloudPcSessionRebound` + patches `sessions[].device_id` locally
+- `reconnected` — calls `restoreCloudPC()` (REST reconcile)
+- `visibilitychange` — calls `restoreCloudPC()` when tab returns to foreground (throttled 30s)
+
+**Returns:** `void` (no return value)
+
+**Used by:** `MainLayout`
+
+---
+
+### useCloudPCPolling
+
+**File:** `hooks/useCloudPCPolling.ts`  
+**Purpose:** Ensures Cloud PC heartbeat cleanup on unmount. Heartbeats are started by the slice (`connectCloudPC`, `restoreCloudPC`); this hook stops them if the component tree unmounts without a clean disconnect (logout, navigation away). Not a polling interval — the name is misleading; actual REST polling is done by the slice actions.
+
+### Returns
+<ResponseField name="isPolling" type="boolean">`true` when `connectedSessionId` is set AND `cloudPCStatus === 'active'`.</ResponseField>
+
+**Side effects:** On unmount, calls `stopAllHeartbeats()`, `stopControlRenewal()`, `removeVisibilityHandler()` from `store/cloudPcHeartbeat.ts` — but only if there was an active session or status was `active` at mount time.
+
+**Used by:** `MainLayout` (top-level layout)
+
+---
+
+## Layout / Init
+
+### useMainLayoutInit
+
+**File:** `hooks/useMainLayoutInit.ts`  
+**Purpose:** Encapsulates all initialization effects that run when `MainLayout` mounts.
+
+**Effects performed:**
+1. Load sessions → reconcile per-session task status (REST poll up to 8 most-recently-updated sessions, concurrency 4, 30-minute window) to restore sidebar spinner after hard refresh
+2. Zombie-spinner watchdog: every 60s, REST-polls all sessions where `taskStatusBySession[id].isActive === true`; clears stale entries
+3. Load devices
+4. Restore Cloud PC state (REST reconcile)
+5. Fetch Cloud PC list and bind active Cloud PC to `activeSessionId`
+6. Load billing status, pricing, plans
+7. Auto-refresh billing status every 30s (clears interval if 401, triggers logout via `logoutRef`)
+8. Check onboarding status
+9. Subscribe to `scheduled_session_created` WebSocket event
+
+### Parameters
+<ParamField path="isAuthenticated" type="boolean" required>Whether the user is logged in. Guards all effects.</ParamField>
+<ParamField path="activeSessionId" type="string | null" required>The currently open session ID for Cloud PC binding reconcile.</ParamField>
+
+### Returns
+<ResponseField name="status" type="BillingStatus | null">Current billing status (from `useBilling`).</ResponseField>
+<ResponseField name="logoutRef" type="MutableRefObject<(() => void) | null>">The layout must populate this ref with its logout callback so the billing auto-refresh can call logout on 401.</ResponseField>
+
+**Used by:** `MainLayout`
+
+---
+
+## Notifications
+
+### useNotifications
+
+**File:** `hooks/useNotifications.ts`  
+**Purpose:** Wrapper around `notificationsSlice`. Subscribes to `admin_notification` WebSocket events, loads initial unread count and notifications, and provides debounced batch mark-as-read.
+
+**Subscribed events:** `admin_notification` — inserts notification immediately into store, then background-reloads unread list to get server-assigned IDs.
+
+### Returns
+<ResponseField name="unreadNotifications" type="NotificationItem[]">Unread notifications loaded by `loadUnread`.</ResponseField>
+<ResponseField name="unreadCount" type="number">Count of unread notifications.</ResponseField>
+<ResponseField name="notifications" type="NotificationItem[]">All loaded notifications (from `loadAll`).</ResponseField>
+<ResponseField name="isLoading" type="boolean">`isNotificationsLoading` from the slice.</ResponseField>
+<ResponseField name="loadUnread" type="() => Promise<void>">Fetch unread notifications (up to backend default limit).</ResponseField>
+<ResponseField name="loadCount" type="() => Promise<void>">Fetch and update the unread count integer only.</ResponseField>
+<ResponseField name="markAsRead" type="(id: string) => void">Debounced batch mark-as-read. IDs are collected in a `Set` and dispatched as individual API calls after a 500ms debounce. NOT async — the count update happens after the API call resolves.</ResponseField>
+<ResponseField name="markAllAsRead" type="() => Promise<void>">Mark all notifications as read.</ResponseField>
+<ResponseField name="refresh" type="() => Promise<void>">Alias for `loadUnread`.</ResponseField>
+
+<Warning>
+`markAsRead` returns `void`, not `Promise<void>`. It batches IDs via a 500ms debounce and dispatches after the timeout. Do not `await` it.
+</Warning>
+
+**Used by:** `NotificationsPage`, `NotificationsOverlay`, `MainLayout`
+
+---
+
+## Files
+
+### useSessionFiles
+
+**File:** `hooks/useSessionFiles.ts`  
+**Purpose:** Incrementally collects all files emitted during a session from three sources: `message.attachments`, `message.meta_data.published_files`, and `message.render_data.files` (agent-generated files). Provides file preview and download callbacks.
+
+### Parameters
+<ParamField path="sessionId" type="string | null">Active session ID. Resets seen-files state on change.</ParamField>
+<ParamField path="messages" type="Message[]">Current message list. Scanned incrementally — only new messages processed per render.</ParamField>
+
+### Returns
+<ResponseField name="allSessionFiles" type="PreviewFile[]">All files collected from the session so far. Grows monotonically until session change.</ResponseField>
+<ResponseField name="showSessionFiles" type="boolean">Whether the "all files" panel is open.</ResponseField>
+<ResponseField name="setShowSessionFiles" type="(v: boolean) => void">Open/close the all-files panel.</ResponseField>
+<ResponseField name="sessionFilesData" type="PreviewFile[]">Snapshot of `allSessionFiles` at the time "show all" was clicked (avoids jitter while panel is open).</ResponseField>
+<ResponseField name="handleOpenPreview" type="(file: PreviewFile) => Promise<void>">Open file preview. If file has `s3Key`, `filePath`, or `downloadUrl`, opens immediately via `useStore.getState().openFilePreview`. Otherwise resolves S3 key via `filesApi.listAttachments` first (shows `resolving: true` state in panel during resolution).</ResponseField>
+<ResponseField name="resolveFileSource" type="(file: PreviewFile) => Promise<void>">Resolve S3 key for a file that has only a filename. Calls `filesApi.listAttachments(sessionId)` and updates preview with the found key.</ResponseField>
+<ResponseField name="handleSessionFileDownload" type="(file: PreviewFile) => Promise<void>">Download a file. Resolves S3 key via `filesApi.listAttachments` if missing. Uses `cloudPcApi.downloadPublishedFile(s3Key)` if S3 key present, otherwise `cloudPcApi.downloadFile(filePath)`.</ResponseField>
+<ResponseField name="handleShowAllFiles" type="() => void">Snapshot current files to `sessionFilesData` and set `showSessionFiles: true`.</ResponseField>
+
+**Used by:** `ChatPage`
+
+---
+
+### useFileProcessing
+
+**File:** `hooks/useFileProcessing.ts`  
+**Purpose:** Handles file attachment upload flow. Accepts `File[]`, validates each file via `filesApi.validateFile`, uploads via `filesApi.parseFile`, and manages the `AttachedFile` list with per-file upload progress and status.
+
+### Parameters
+<ParamField path="sessionId" type="string | null | undefined">Used as context for `filesApi.parseFile`. Pass the active session ID if available.</ParamField>
+<ParamField path="setAttachedFiles" type="(files: AttachedFile[] | ((prev: AttachedFile[]) => AttachedFile[])) => void">State setter from the parent `useState<AttachedFile[]>`. Receives updater functions for incremental per-file updates.</ParamField>
+
+### Returns
+<ResponseField name="processFiles" type="(files: File[]) => Promise<void>">Validate all files → add as `status: 'uploading'` entries in one batch → upload sequentially → update each to `status: 'uploaded'` with `parseResponse`, or `status: 'error'` with error message.</ResponseField>
+
+**Used by:** `InputPanel`, `HomeUpdated`
+
+---
+
+## Drag / Paste
+
+### useFullPageDrop
+
+**File:** `hooks/useFullPageDrop.ts`  
+**Purpose:** Listens for `dragover`/`drop` events on the document and calls `onDrop` with the dropped files.
+
+### Parameters
+<ParamField path="onDrop" type="(files: File[]) => void" required>Called with the dropped file array.</ParamField>
+<ParamField path="showOverlay" type="boolean">Whether to maintain `isDragOver` state for rendering a drop overlay.</ParamField>
+<ParamField path="disabled" type="boolean">Disables the listener when true.</ParamField>
+
+**Used by:** `HomeUpdated`, `ChatPage`
+
+---
+
+### useFullPagePaste
+
+**File:** `hooks/useFullPagePaste.ts`  
+**Purpose:** Listens for `paste` events on the document and calls `onPaste` with any files from the clipboard.
+
+### Parameters
+<ParamField path="onPaste" type="(files: File[]) => void" required>Called with pasted files.</ParamField>
+<ParamField path="disabled" type="boolean">Disables the listener when true.</ParamField>
+
+**Used by:** `HomeUpdated`, `ChatPage`
+
+---
+
+## OAuth / MCP
+
+### useOAuthReturn
+
+**File:** `hooks/useOAuthReturn.ts`  
+**Purpose:** Detects a same-tab OAuth return from the backend's `/mcp/oauth/callback` redirect when `return_to` was set. Strips `?status=`, `?appName=`, `?connectedAccountId=`, and `?error=` query params from the URL and invalidates REST connector caches. The `McpConnectPrompt` component handles the actual UI update via `mcp_connection_completed` Socket.IO event.
+
+**Returns:** `void` (no return value).
+
+**Used by:** `ChatPage`, `HomeUpdated`
+
+---
+
+### useOAuthPolling
+
+**File:** `hooks/useOAuthPolling.ts`  
+**Purpose:** Polls `connectorsApi.getConnected()` with exponential backoff until the given provider shows `is_connected` or `status === 'ACTIVE'/'CONNECTED'`, or the max polling time elapses. Active only when `provider` is non-null; cleans up on unmount or provider change.
+
+```typescript
+export type OAuthPollStatus = 'polling' | 'connected' | 'timeout' | 'idle';
+
+export interface UseOAuthPollingOptions {
+  onSuccess: (provider: string) => void;
+  onTimeout?: (provider: string) => void;
+  intervals?: number[];   // Default: [2000, 4000, 8000, 16000, 30000]
+  maxTime?: number;       // Default: 300000 (5 minutes)
+}
+```
+
+### Parameters
+<ParamField path="provider" type="string | null">The provider being connected. Pass `null` to deactivate polling.</ParamField>
+<ParamField path="options" type="UseOAuthPollingOptions" required>Callbacks and timing configuration.</ParamField>
+<ParamField path="options.onSuccess" type="(provider: string) => void" required>Called when the connector reaches connected status.</ParamField>
+<ParamField path="options.onTimeout" type="(provider: string) => void">Called if polling times out without connection.</ParamField>
+<ParamField path="options.intervals" type="number[]">Custom backoff intervals in ms. Default: `[2000, 4000, 8000, 16000, 30000]`. Cycles through and caps at the last value.</ParamField>
+<ParamField path="options.maxTime" type="number">Maximum total polling time in ms. Default: `300000` (5 minutes).</ParamField>
+
+**Returns:** `void` (no return value).
+
+**Used by:** `ConnectorsContext`
+
+---
+
+## Scheduled Tasks
+
+### useScheduledTasks
+
+**File:** `hooks/useScheduledTasks.ts`  
+**Purpose:** Manages scheduled task list: load, toggle enable/disable, delete (with confirmation state), run now, and run history. Exposes a toast state for action feedback.
+
+### Returns
+<ResponseField name="scheduledTasks" type="ScheduledTask[]">All scheduled tasks from the store.</ResponseField>
+<ResponseField name="completedRuns" type="ScheduledTaskRun[]">Completed run history from the store.</ResponseField>
+<ResponseField name="isScheduledTasksLoading" type="boolean">True while loading the task list.</ResponseField>
+<ResponseField name="isCompletedRunsLoading" type="boolean">True while loading run history.</ResponseField>
+<ResponseField name="loadScheduledTasks" type="() => Promise<void>">Fetch the scheduled task list.</ResponseField>
+<ResponseField name="loadCompletedRuns" type="(taskId?: string) => Promise<void>">Fetch completed run history. Optionally scoped to a task ID.</ResponseField>
+<ResponseField name="deleteTarget" type="ScheduledTask | null">Task selected for deletion (local state). Used to drive the confirmation dialog.</ResponseField>
+<ResponseField name="setDeleteTarget" type="(task: ScheduledTask | null) => void">Set or clear the delete confirmation target.</ResponseField>
+<ResponseField name="isDeleting" type="boolean">True during the delete API call.</ResponseField>
+<ResponseField name="handleDeleteConfirm" type="() => Promise<void>">Execute the delete for `deleteTarget`, then clear it.</ResponseField>
+<ResponseField name="handleToggle" type="(task: ScheduledTask) => Promise<void>">Toggle `is_enabled` for the task (passes `!task.is_enabled` to `toggleScheduledTask`).</ResponseField>
+<ResponseField name="runningTaskId" type="string | null">ID of the task currently being run via Run Now (local state).</ResponseField>
+<ResponseField name="handleRunNow" type="(task: ScheduledTask) => Promise<void>">Trigger a one-off run. Guards double-submit via `runningTaskId`. Sets toast on success or error.</ResponseField>
+<ResponseField name="toastMsg" type="{ text: string; type: 'info' | 'error' } | null">Current toast message.</ResponseField>
+<ResponseField name="dismissToast" type="() => void">Clear the toast message.</ResponseField>
+
+**Used by:** `ScheduledTasksModal`
+
+---
+
+### useScheduledTaskForm
+
+**File:** `hooks/useScheduledTaskForm.ts`  
+**Purpose:** Form state management for creating or editing a scheduled task. Validates fields, builds the API payload, and handles Cloud PC selection and connector multi-select.
+
+### Parameters
+<ParamField path="editTask" type="ScheduledTask | null">Existing task to edit, or `null` for a new task.</ParamField>
+
+### Returns (selected)
+<ResponseField name="name" type="string">Task name field value.</ResponseField>
+<ResponseField name="prompt" type="string">Task prompt field value.</ResponseField>
+<ResponseField name="frequency" type="ScheduleFrequency">Schedule frequency (`daily` / `weekly` / `monthly` / `once`).</ResponseField>
+<ResponseField name="isSaving" type="boolean">True during the save API call.</ResponseField>
+<ResponseField name="handleSave" type="() => Promise<void>">Validate and submit the form.</ResponseField>
+
+**Used by:** `AddScheduledTaskModal`
+
+---
+
+## Toolkits / Connectors
+
+### useToolkits
+
+**File:** `hooks/useToolkits.ts`  
+**Purpose:** Composio toolkit discovery and management. Handles search, connect (with Composio trust gate), add-another-account, disconnect, account rename, toggle active, silent refresh, and logout reset.
+
+```typescript
+export type ToolkitConnectStatus = 'idle' | 'connecting' | 'connected' | 'error';
+```
+
+### Parameters
+<ParamField path="deps.refreshConnectors" type="() => Promise<void>" required>Called after connect/disconnect to sync the connectors context.</ParamField>
+<ParamField path="deps.onRequireManualAuth" type="(provider: string) => void">Called when the backend indicates manual credentials are needed instead of OAuth (e.g., Telegram).</ParamField>
+
+### Returns
+<ResponseField name="toolkits" type="Toolkit[]">Current toolkit list (result of last `searchToolkits` call).</ResponseField>
+<ResponseField name="toolkitsLoading" type="boolean">True while loading toolkits.</ResponseField>
+<ResponseField name="toolkitsError" type="string | null">Last error message from a toolkit operation. Auto-clears after 8 seconds.</ResponseField>
+<ResponseField name="setToolkitsError" type="(msg: string | null) => void">Manually set or clear the error message.</ResponseField>
+<ResponseField name="searchToolkits" type="(query?: string, category?: string) => Promise<void>">Search toolkits by query and/or category. Also fetches automation app trigger counts and enriches the list.</ResponseField>
+<ResponseField name="connectToolkit" type="(slug: string, connectionData?: Record<string, string>) => Promise<void>">Initiate OAuth or API-key connection. If Composio trust has not been shown, stores as `pendingComposioConnect` instead.</ResponseField>
+<ResponseField name="addAnotherAccount" type="(slug: string) => Promise<void>">Initiate OAuth for an additional account on an already-connected toolkit. Subject to same trust gate.</ResponseField>
+<ResponseField name="disconnectToolkit" type="(slug: string, accountId: string) => Promise<void>">Disconnect a specific account from a toolkit.</ResponseField>
+<ResponseField name="toggleAccountActive" type="(slug: string, accountId: string, isActive: boolean) => Promise<void>">Enable/disable a specific account (optimistic update, reverts on failure).</ResponseField>
+<ResponseField name="syncToolkitActive" type="(slug: string, isActive: boolean) => void">Sync `is_active` from an external dropdown toggle (no API call — pure local state update).</ResponseField>
+<ResponseField name="renameAccount" type="(slug: string, accountId: string, newLabel: string) => Promise<void>">Rename a connected account label (optimistic update, reverts on failure).</ResponseField>
+<ResponseField name="refreshToolkits" type="() => Promise<void>">Re-run the last search (re-fetches with same query/category).</ResponseField>
+<ResponseField name="silentRefreshToolkits" type="() => Promise<void>">Background refresh without a loading spinner. Ignores errors.</ResponseField>
+<ResponseField name="resetToolkits" type="() => void">Clear toolkits, error, and pending state (used on logout).</ResponseField>
+<ResponseField name="composioTrustShown" type="boolean">Whether the Composio trust explanation has been shown. Persisted in `localStorage` under `composio_trust_shown`.</ResponseField>
+<ResponseField name="markTrustShown" type="() => void">Record that the trust explanation was shown (sets state + localStorage).</ResponseField>
+<ResponseField name="pendingComposioConnect" type="{ slug: string; connectionData?: Record<string, string> } | null">Connect call waiting for trust confirmation.</ResponseField>
+<ResponseField name="clearPendingComposioConnect" type="() => void">Clear the pending connect without proceeding.</ResponseField>
+<ResponseField name="confirmComposioConnect" type="() => Promise<void>">Confirm the pending connect: marks trust shown, clears pending, then performs the connect.</ResponseField>
+<ResponseField name="connecting" type="Set<string>">Slugs currently in the connect flow.</ResponseField>
+<ResponseField name="disconnecting" type="Set<string>">Slugs currently in the disconnect flow.</ResponseField>
+<ResponseField name="pendingOAuthProvider" type="string | null">Provider for which an OAuth window was just opened (set before `platform.openOAuthWindow`). Used by `useOAuthPolling` to start polling.</ResponseField>
+<ResponseField name="clearPendingOAuthProvider" type="() => void">Clear the pending OAuth provider.</ResponseField>
+
+**Used by:** `ConnectorsContext`
+
+---
+
+### useTriggers
+
+**File:** `hooks/useTriggers.ts`  
+**Purpose:** Automation trigger management. Load, create, update, delete, and reset triggers.
+
+### Returns
+<ResponseField name="triggers" type="Trigger[]">All configured triggers.</ResponseField>
+<ResponseField name="triggersLoading" type="boolean">True while loading.</ResponseField>
+<ResponseField name="refreshTriggers" type="() => Promise<void>">Re-fetch triggers from the API.</ResponseField>
+<ResponseField name="createTrigger" type="(toolkit: string, triggerType: string, actionPrompt: string, config?: Record<string, unknown>) => Promise<void>">Create a new trigger and refresh the list.</ResponseField>
+<ResponseField name="updateTrigger" type="(triggerId: string, updates: { action_prompt?: string; is_active?: boolean }) => Promise<void>">Update a trigger and refresh the list.</ResponseField>
+<ResponseField name="deleteTrigger" type="(triggerId: string) => Promise<void>">Remove a trigger and refresh the list.</ResponseField>
+<ResponseField name="resetTriggers" type="() => void">Clear triggers list (used on logout).</ResponseField>
+
+**Used by:** `ConnectorsContext`
+
+---
+
+## Helpdesk
+
+### useHelpdesk
+
+**File:** `hooks/useHelpdesk.ts`  
+**Purpose:** Wrapper around `helpdeskSlice`. Manages support tickets and KB articles. Subscribes to three WebSocket events for live ticket updates.
+
+**Subscribed events:**
+- `ticket_reply` — calls `addTicketReply` with the new `HelpdeskMessage`
+- `ticket_updated` — calls `updateTicketInList` with partial ticket fields
+- `ticket_created` — calls `loadTickets()` to reload the full list
+
+### Returns
+<ResponseField name="tickets" type="Ticket[]">All support tickets.</ResponseField>
+<ResponseField name="currentTicket" type="HelpdeskTicketDetail | null">Currently loaded ticket detail (includes messages).</ResponseField>
+<ResponseField name="ticketLoadError" type="string | null">Error message if the last `loadTicket` call failed.</ResponseField>
+<ResponseField name="kbArticles" type="KBArticle[]">Knowledge base articles.</ResponseField>
+<ResponseField name="isLoading" type="boolean">`isHelpdeskLoading` from the slice (loading counter-based).</ResponseField>
+<ResponseField name="loadTickets" type="() => Promise<void>">Fetch the ticket list.</ResponseField>
+<ResponseField name="loadTicket" type="(ticketId: string) => Promise<void>">Fetch a single ticket with full message history into `currentTicket`.</ResponseField>
+<ResponseField name="createTicket" type="(data: CreateTicketRequest) => Promise<void>">Create a new support ticket.</ResponseField>
+<ResponseField name="replyToTicket" type="(ticketId: string, content: string, attachments?: AttachmentInput[]) => Promise<void>">Add a reply to a ticket.</ResponseField>
+<ResponseField name="rateTicket" type="(ticketId: string, rating: number) => Promise<void>">Submit a satisfaction rating.</ResponseField>
+<ResponseField name="loadKBArticles" type="(query?: string) => Promise<void>">Fetch knowledge base articles, optionally filtered by query.</ResponseField>
+
+**Used by:** `HelpdeskPage`
+
+---
+
+## Audio / Voice
+
+### useAudioRecorder
+
+**File:** `hooks/useAudioRecorder.ts`  
+**Purpose:** Manages browser MediaRecorder lifecycle for voice input.
+
+### Returns
+<ResponseField name="isRecording" type="boolean">True while recording.</ResponseField>
+<ResponseField name="startRecording" type="() => Promise<void>">Start recording from the microphone.</ResponseField>
+<ResponseField name="stopRecording" type="() => Promise<Blob>">Stop recording and return the audio Blob.</ResponseField>
+<ResponseField name="cancelRecording" type="() => void">Abort recording without returning data.</ResponseField>
+<ResponseField name="error" type="string | null">Error message if mic access failed.</ResponseField>
+<ResponseField name="stream" type="MediaStream | null">Active media stream.</ResponseField>
+
+**Used by:** `TaskInput` (via `VoiceInput`)
+
+---
+
+### useAudioAnalyser
+
+**File:** `hooks/useAudioAnalyser.ts`  
+**Purpose:** Analyses microphone audio in real time and returns amplitude (0–1) for the waveform visualizer. Also exports `generateMockAmplitude()` for testing.
+
+### Parameters
+<ParamField path="stream" type="MediaStream | null">Audio stream to analyse.</ParamField>
+<ParamField path="isRecording" type="boolean">Whether recording is active.</ParamField>
+
+### Returns
+<ResponseField name="amplitude" type="number">Current amplitude value (0–1).</ResponseField>
+<ResponseField name="error" type="string | null">Error if mic access failed.</ResponseField>
+
+**Used by:** `VoiceInput`
+
+---
+
+### useMicPermission
+
+**File:** `hooks/useMicPermission.ts`  
+**Purpose:** Checks browser microphone permission state.
+
+### Returns
+<ResponseField name="status" type="'granted' | 'denied' | 'prompt' | 'unsupported'">Current permission state.</ResponseField>
+<ResponseField name="request" type="() => Promise<void>">Prompt the user for microphone access.</ResponseField>
+
+**Used by:** `VoiceInput`
+
+---
+
+## Responsive / Viewport
+
+### useMediaQuery
+
+**File:** `hooks/useMediaQuery.ts`  
+**Purpose:** Evaluates a CSS media query and returns a boolean that updates on viewport change. Also exports `useIsMobile()` (`≤768px`), `useIsTablet()` (`769–1024px`), and `useIsDesktop()` (`≥1025px`).
+
+### Parameters
+<ParamField path="query" type="string" required>CSS media query string.</ParamField>
+
+### Returns
+<ResponseField name="matches" type="boolean">Whether the query currently matches.</ResponseField>
+
+### Example
+```tsx
+const isMobile = useIsMobile(); // shorthand
+const isWide = useMediaQuery('(min-width: 1400px)');
+```
+
+**Used by:** `AppSidebar`, `CloudDesktopPanel`, `SettingsModal`
+
+---
+
+### useVisualViewport
+
+**File:** `hooks/useVisualViewport.ts`  
+**Purpose:** Returns the visual viewport height in pixels. Used to adjust input position on mobile when the software keyboard is visible.
+
+### Returns
+<ResponseField name="height" type="number">Visual viewport height in pixels.</ResponseField>
+
+**Used by:** `MainLayout`, `InputPanel`
+
+---
+
+### useIntersectionObserver
+
+**File:** `hooks/useIntersectionObserver.ts`  
+**Purpose:** React wrapper around `IntersectionObserver`. Returns a ref to attach to an element and a boolean indicating whether it is visible.
+
+### Parameters
+<ParamField path="options.threshold" type="number">Intersection threshold (0–1). Default: `0`.</ParamField>
+<ParamField path="options.rootMargin" type="string">Root margin string. Default: `"0px"`.</ParamField>
+<ParamField path="options.root" type="Element | null">Scroll container. Default: viewport.</ParamField>
+
+**Used by:** `NotificationsPage` (infinite scroll), `TaskList`
+
+---
+
+## Admin
+
+### useAdminPanel
+
+**File:** `hooks/useAdminPanel.ts`  
+**Purpose:** Manages the hidden admin panel. Listens for 3× backtick/Backquote key presses within 2 seconds (layout-independent via `event.code`), shows a password dialog, authenticates against `VITE_ADMIN_PASSWORD`, and persists auth state in `sessionStorage` (cleared on tab close). Also closes on Escape key.
+
+### Returns
+<ResponseField name="isOpen" type="boolean">Whether the admin panel is visible.</ResponseField>
+<ResponseField name="isAuthenticated" type="boolean">Whether admin access has been granted this session.</ResponseField>
+<ResponseField name="showPasswordDialog" type="boolean">Whether the password dialog is open.</ResponseField>
+<ResponseField name="openPasswordDialog" type="() => void">Programmatically open the password dialog.</ResponseField>
+<ResponseField name="closePasswordDialog" type="() => void">Close the password dialog.</ResponseField>
+<ResponseField name="authenticate" type="(password: string) => boolean">Validate the password, set auth state in `sessionStorage`, open the panel. Returns `true` if password is correct.</ResponseField>
+<ResponseField name="open" type="() => void">Open the admin panel if authenticated, otherwise open the password dialog.</ResponseField>
+<ResponseField name="close" type="() => void">Close the admin panel.</ResponseField>
+
+**Used by:** `App.tsx` (GlobalAdminPanel component)
+
+---
+
+## Misc
+
+### useWebSocket
+
+**File:** `hooks/useWebSocket.ts`  
+**Purpose:** Low-level hook to subscribe to WebSocket events by name. Returns the `wsClient` singleton's connection state and provides `on`/`off` helpers and `sendSafetyConfirmationResponse`.
+
+### Returns
+<ResponseField name="isConnected" type="boolean">Whether the Socket.IO connection is currently established. Updates reactively via internal `connect`/`disconnect` events.</ResponseField>
+<ResponseField name="on" type="<T>(event: string, handler: (data: T) => void) => void">Subscribe to a WebSocket event by name.</ResponseField>
+<ResponseField name="off" type="(event: string, handler?: (data: unknown) => void) => void">Unsubscribe from a WebSocket event.</ResponseField>
+<ResponseField name="sendSafetyConfirmationResponse" type="(confirmationId: string, approved: boolean, message?: string) => void">Send a safety confirmation response (approve/reject). Wraps `wsClient.sendSafetyConfirmationResponse`.</ResponseField>
+
+**Used by:** `PricingPage` (subscription_updated events), safety confirmation flow
+
+---
+
+### useUpdater
+
+**File:** `hooks/useUpdater.ts`  
+**Purpose:** Desktop auto-updater integration via `platform.updater`. Checks for updates, manages download progress, and provides `dismiss()` to snooze the update prompt.
+
+### Returns
+<ResponseField name="updateInfo" type="UpdateInfo | null">Available update metadata, or null if up to date.</ResponseField>
+<ResponseField name="isChecking" type="boolean">True while checking for updates.</ResponseField>
+<ResponseField name="isDownloading" type="boolean">True while downloading.</ResponseField>
+<ResponseField name="error" type="string | null">Error message if update check/download failed.</ResponseField>
+<ResponseField name="appVersion" type="string | null">Current installed version.</ResponseField>
+<ResponseField name="checkForUpdates" type="() => Promise<void>">Manually trigger an update check.</ResponseField>
+<ResponseField name="downloadAndInstall" type="() => Promise<void>">Download and install the available update.</ResponseField>
+<ResponseField name="dismiss" type="() => void">Dismiss the update notification.</ResponseField>
+
+**Used by:** `UpdateNotification`
+
+---
+
+### useInlineEdit
+
+**File:** `hooks/useInlineEdit.ts`  
+**Purpose:** Manages inline editing state (edit mode, current value, save/cancel).
+
+### Parameters
+<ParamField path="onSave" type="(id: string, value: string) => void" required>Called when the user confirms the edit.</ParamField>
+
+**Used by:** `TaskList` (session title renaming)

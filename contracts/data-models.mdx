@@ -1,0 +1,396 @@
+---
+title: "Data Models Contract"
+description: "Every SQLAlchemy model in the Skygen backend — tables, columns, relationships, soft-delete patterns. Generated from source."
+---
+
+> Generated: 2026-05-08 · Source: `Backend/app/models/` · Regenerate with `/doc-gen`
+
+---
+
+## User
+
+**Table:** `users`
+**Soft-delete:** `is_active=False` (logical delete, no `deleted_at`)
+**Services:** `user_repo`, `billing_service`, `email_segments_service`, `analytics_tracker`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| email | VARCHAR | UNIQUE, NOT NULL, index | |
+| password_hash | VARCHAR | nullable | null for Google OAuth users |
+| auth_provider | VARCHAR | NOT NULL, default="local" | "local" or "google" |
+| google_id | VARCHAR | UNIQUE, nullable, index | |
+| is_active | BOOLEAN | NOT NULL, default=True | logical soft-delete flag |
+| is_admin | BOOLEAN | NOT NULL, default=False | |
+| admin_role_id | VARCHAR(36) | FK→admin_roles(id) ON DELETE SET NULL, nullable | |
+| is_email_verified | BOOLEAN | NOT NULL, default=False | |
+| display_name | VARCHAR | nullable | |
+| preferences | JSON | default={} | stores `pending_plan_id`, `pending_stripe_price_id` etc. |
+| otp_secret | VARCHAR | nullable | 2FA (disabled) |
+| is_2fa_verified | BOOLEAN | NOT NULL, default=False | 2FA (disabled) |
+| last_2fa | DATETIME | nullable | 2FA (disabled) |
+| kb_enabled | BOOLEAN | NOT NULL, default=True | Knowledge Base access |
+| safety_level | VARCHAR | NOT NULL, default="standard" | "strict"\|"standard"\|"relaxed" |
+| password_changed_at | DATETIME | nullable | JWT revocation timestamp |
+| first_task_completed_at | DATETIME | nullable, index | analytics |
+| last_active_at | DATETIME | nullable, index | DAU/MAU tracking |
+| preferred_model_profile | VARCHAR(50) | nullable | overrides plan default |
+| registration_meta | JSON | nullable | UTM/GA params at signup |
+| created_at | DATETIME | NOT NULL | |
+| updated_at | DATETIME | NOT NULL, auto-update | |
+
+**Relationships:**
+- `devices` → Device (cascade delete-orphan)
+- `chat_sessions` → ChatSession (cascade delete-orphan)
+- `mcp_integrations` → MCPUserIntegration (cascade delete-orphan)
+- `custom_connectors` → CustomConnector (cascade delete-orphan)
+- `scheduled_tasks` → ScheduledTask (cascade delete-orphan)
+- `stripe_customer` → StripeCustomer (backref)
+- `subscriptions` → Subscription (backref)
+- `token_balance` → TokenBalance (backref)
+
+---
+
+## Device
+
+**Table:** `devices`
+**Soft-delete:** `connection_status="deleted"` + `deleted_at` timestamp (dual guard)
+**Services:** `devices_repo`, `device_cache`, `device_lock_manager`, `e2b_sandbox_service`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, NOT NULL, index | |
+| device_name | VARCHAR | NOT NULL | |
+| platform | VARCHAR | NOT NULL | "macos"\|"windows"\|"linux"\|"mobile" |
+| capabilities | JSON | NOT NULL, default={} | |
+| device_token_kid | VARCHAR | UNIQUE, NOT NULL, index | auth KID |
+| last_seen | DATETIME | nullable | |
+| connection_status | VARCHAR | NOT NULL, default="offline" | "online"\|"offline"\|"deleted" |
+| machine_id | VARCHAR | nullable, index | hardware UUID for dedup |
+| deleted_at | DATETIME | nullable | soft-delete timestamp |
+| last_kid_rotation | DATETIME | nullable | rate-limit tracking |
+| device_type | ENUM(DeviceType) | NOT NULL, default=REAL_DEVICE, index | "real_device"\|"e2b_sandbox"\|"session_sandbox" |
+| sandbox_config | JSON | nullable | E2B: `{template_id, sandbox_id, stream_url}` |
+| created_at | DATETIME | NOT NULL | |
+
+**Note:** `session_sandbox` device_type is in the model but not in the Pydantic schema — see [Schema Inconsistencies](/reference/backend/schema-inconsistencies).
+
+**Relationships:**
+- `owner` → User
+- `chat_sessions` → ChatSession (foreign_keys=ChatSession.device_id)
+
+---
+
+## ChatSession
+
+**Table:** `chat_sessions`
+**Soft-delete:** `deleted_at` timestamp
+**Services:** `chat_session_repo`, `message_router`, `session_router`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, NOT NULL, index | |
+| device_id | VARCHAR(36) | FK→devices(id) ON DELETE SET NULL, nullable, index | null = chat-only session |
+| task_sandbox_device_id | VARCHAR(36) | FK→devices(id) ON DELETE SET NULL, nullable, index | Compute V2: SESSION_SANDBOX slot |
+| paused_device_id | VARCHAR(36) | FK→devices(id) ON DELETE SET NULL, nullable, index | memo for Cloud PC resume |
+| emplogent_id | VARCHAR(36) | FK→emplogents(id) ON DELETE SET NULL, nullable, index | linked AI persona |
+| title | VARCHAR | NOT NULL | |
+| is_active | BOOLEAN | NOT NULL, default=True | |
+| meta_data | JSON | default={} | |
+| deleted_at | DATETIME | nullable | soft-delete |
+| created_at | DATETIME | NOT NULL | |
+| updated_at | DATETIME | NOT NULL, auto-update | |
+
+**Indices:** `ix_chat_sessions_user_device_active` on `(user_id, device_id, is_active, deleted_at)`
+
+---
+
+## ChatMessage
+
+**Table:** `chat_messages`
+**Soft-delete:** No (hard delete supported)
+**Services:** `chat_message_repo`, `message_router`, `display_transformer`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| session_id | VARCHAR(36) | FK→chat_sessions(id) ON DELETE CASCADE, NOT NULL, index | |
+| task_id | VARCHAR | FK→tasks(id), nullable, index | |
+| role | VARCHAR | NOT NULL | "user"\|"assistant"\|"system" |
+| content | TEXT | NOT NULL | |
+| meta_data | JSON | default={} | `type`, `status`, `ui_meta`, `step_number`, `attachment_id`, etc. |
+| created_at | DATETIME | NOT NULL | |
+
+**meta_data types:**
+- `type="ui_meta_update"` + `ui_meta.type="plan"` → agent plan steps
+- `type="agent_step"` → filtered from GET /messages response
+- `type="version_update_required"` → client update notice
+- `status="completed"|"error"` → final assistant message
+
+**Note:** `attachments` relationship is `lazy="selectin"` — always eager-loaded (performance concern).
+
+---
+
+## Task
+
+**Table:** `tasks`
+**Soft-delete:** No (hard delete)
+**Services:** `task_repo`, `task_router`, `message_router`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, NOT NULL, index | |
+| device_id | VARCHAR(36) | FK→devices(id) ON DELETE CASCADE, NOT NULL, index | |
+| status | VARCHAR | NOT NULL, default="CREATED" | "CREATED"\|"QUEUED"\|"RUNNING"\|"COMPLETED"\|"TASK_COMPLETED"\|"ERROR" |
+| title | VARCHAR | NOT NULL | |
+| description | TEXT | nullable | |
+| payload | JSON | default={} | |
+| idempotency_key | VARCHAR | UNIQUE, NOT NULL, index | |
+| created_at | DATETIME | NOT NULL | |
+| updated_at | DATETIME | NOT NULL, auto-update | |
+
+---
+
+## Attachment
+
+**Table:** `attachments`
+**Services:** `attachment_storage_service`, `attachment_pipeline`, `file_parser_service`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK, index | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, NOT NULL, index | |
+| session_id | VARCHAR(36) | FK→chat_sessions(id) ON DELETE SET NULL, nullable | |
+| message_id | VARCHAR(36) | FK→chat_messages(id) ON DELETE SET NULL, nullable | |
+| filename | VARCHAR | NOT NULL | |
+| content_type | VARCHAR | NOT NULL | MIME type |
+| size_bytes | INTEGER | NOT NULL | |
+| bucket | VARCHAR | NOT NULL | S3/MinIO bucket name |
+| object_key | VARCHAR | NOT NULL | S3 object path |
+| revision | INTEGER | NOT NULL, default=1 | |
+| image_object_keys | JSON | default=[] | extracted page images |
+| parse_status | VARCHAR | NOT NULL, default="parsed" | |
+| text_length | INTEGER | nullable | |
+| pages | INTEGER | nullable | |
+| created_at | DATETIME | NOT NULL | |
+
+---
+
+## StripeCustomer
+
+**Table:** `stripe_customers`
+**Services:** `stripe_service`, `billing_repo`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, UNIQUE, NOT NULL | |
+| stripe_customer_id | VARCHAR(255) | UNIQUE, NOT NULL, index | |
+| default_payment_method_id | VARCHAR(255) | nullable | |
+| has_valid_payment_method | BOOLEAN | NOT NULL, default=False | |
+| created_at | DATETIME | NOT NULL | |
+| updated_at | DATETIME | NOT NULL, auto-update | |
+
+---
+
+## Subscription
+
+**Table:** `subscriptions`
+**Services:** `billing_service`, `billing_repo`, `stripe_service`
+
+| Column | Type | Constraints | Notes |
+|--------|------|------------|-------|
+| id | VARCHAR(36) | PK | UUID string |
+| user_id | VARCHAR(36) | FK→users(id) ON DELETE CASCADE, NOT NULL, index | |
+| stripe_customer_id_fk | VARCHAR(36) | FK→stripe_customers(id), nullable | |
+| subscription_plan_id | VARCHAR(36) | FK→subscription_plans(id), nullable, index | |
+| stripe_subscription_id | VARCHAR(255) | UNIQUE, nullable, index | |
+| tier | ENUM(SubscriptionTier) | NOT NULL, default=NONE | "none"\|"free"\|"standard"\|"trial" |
+| status | ENUM(SubscriptionStatus) | NOT NULL, default=INCOMPLETE | "active"\|"canceled"\|"past_due"\|"incomplete"\|"expired"\|"trialing" |
+| price_usd | FLOAT | NOT NULL, default=0.0 | |
+| monthly_tokens_included | INTEGER | NOT NULL, default=0 | |
+| allow_overage | BOOLEAN | NOT NULL, default=False | |
+| current_period_start | DATETIME | nullable | |
+| current_period_end | DATETIME | nullable | |
+| cancel_at_period_end | BOOLEAN | NOT NULL, default=False | |
+| created_at | DATETIME | NOT NULL | |
+| updated_at | DATETIME | NOT NULL, auto-update | |
+
+---
+
+## TokenBalance
+
+**Table:** `token_balances`
+**Note:** Single row per user (UNIQUE on user_id)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | VARCHAR(36) | PK |
+| user_id | VARCHAR(36) | UNIQUE — one balance per user |
+| balance | INTEGER | current token balance |
+| fractional_tokens | FLOAT | accumulated sub-token fraction |
+| total_earned | INTEGER | lifetime credits |
+| total_spent | INTEGER | lifetime debits |
+
+---
+
+## TokenTransaction
+
+**Table:** `token_transactions`
+**Note:** `id` is native UUID (unlike all other models which use VARCHAR(36))
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | UUID | PK (native UUID) |
+| user_id | VARCHAR(36) | FK→users |
+| transaction_type | ENUM | "trial_grant"\|"subscription_topup"\|"admin_grant"\|"free_grant"\|"api_usage"\|"cloud_pc_usage"\|"manual_deduction"\|"refund"\|"promo_code" |
+| amount | INTEGER | always positive |
+| balance_after | INTEGER | |
+| api_cost_usd | FLOAT | nullable |
+| reference_id | VARCHAR(255) | nullable, index |
+| created_at | DATETIME | NOT NULL, index |
+
+---
+
+## SubscriptionPlan
+
+**Table:** `subscription_plans`
+**Soft-delete:** `is_active=False`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | VARCHAR(36) | PK |
+| stripe_price_id | VARCHAR(255) | null for free plans |
+| plan_type | VARCHAR(20) | "free"\|"paid" |
+| name | VARCHAR(100) | "Lite"\|"Optima"\|"Pro" |
+| price_usd | FLOAT | |
+| monthly_tokens | INTEGER | |
+| allowed_agent_modes | TEXT | JSON array |
+| model_profile | VARCHAR(50) | "fast"\|"default"\|"pro" |
+| features_config | TEXT | JSON: `{cloud_pc: bool, max_cloud_pcs: int}` |
+| is_active | BOOLEAN | |
+| is_featured | BOOLEAN | |
+| is_hidden | BOOLEAN | |
+
+---
+
+## CloudPC
+
+**Table:** `cloud_pcs`
+**Soft-delete:** `deleted_at` + `status=TERMINATED` (dual guard)
+**Services:** `cloud_pc_service`, `device_lock_manager`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | VARCHAR(36) | PK |
+| user_id | VARCHAR(36) | FK→users |
+| sandbox_id | VARCHAR(255) | E2B sandbox ID |
+| status | ENUM(CloudPCStatus) | "creating"\|"restoring"\|"active"\|"pausing"\|"paused"\|"resuming"\|"error"\|"terminated" |
+| template_id | VARCHAR(100) | default="desktop" |
+| stream_url | VARCHAR(1024) | noVNC stream |
+| stream_auth_key | VARCHAR(512) | |
+| linked_device_id | VARCHAR(36) | FK→devices — device representing this CPC |
+| paused_at | DATETIME | |
+| last_activity_at | DATETIME | heartbeat |
+| deleted_at | DATETIME | |
+
+---
+
+## MCP Models
+
+### ComposioConnection (`composio_connections`)
+
+| Column | Notes |
+|--------|-------|
+| toolkit | e.g. "gmail", "slack" |
+| composio_account_id | Composio-side ID |
+| status | "pending"\|"connected"\|"revoked" |
+| is_active | user soft-toggle |
+
+### TriggerConfiguration (`trigger_configurations`)
+
+| Column | Notes |
+|--------|-------|
+| composio_trigger_id | Composio trigger subscription ID |
+| toolkit | |
+| trigger_name | |
+| action_prompt | agent instruction for this trigger |
+| is_active | |
+
+### CustomConnector (`custom_connectors`)
+
+| Column | Notes |
+|--------|-------|
+| type | "app"\|"custom_api"\|"custom_mcp" |
+| config | JSON — encrypted at rest via `connectors_crypto` |
+| tools | JSON — tool definitions |
+| status | "draft"\|"connected"\|"error" |
+
+---
+
+## Knowledge Base Models
+
+### GeneralInsight (`general_insights`)
+
+Copy-on-Write (CoW) pattern: updates create new rows with `is_tombstone=True` on the old.
+
+| Column | Notes |
+|--------|-------|
+| insight_type | category of insight |
+| global_insight_type | "SOCIAL"\|"TECHNICAL" |
+| user_id | "global" for system-wide insights (no FK) |
+| embedding | Vector(768) — pgvector |
+| overrides_global_id | CoW parent reference |
+| is_tombstone | CoW deletion flag |
+
+### TrajectoryPlan (`trajectory_plans`)
+
+Stores agent execution plans with embeddings for retrieval.
+
+| Column | Notes |
+|--------|-------|
+| agent_type | which agent type created this plan |
+| plan_steps | JSON array of steps |
+| embedding | Vector(768) — pgvector |
+
+---
+
+## ScheduledTask
+
+**Table:** `scheduled_tasks`
+**Soft-delete:** `is_active=False`
+
+| Column | Notes |
+|--------|-------|
+| frequency | "once"\|"hourly"\|"daily"\|"weekly"\|"monthly" |
+| time_of_day | TIME — HH:MM |
+| day_of_week | INTEGER — 0=Mon |
+| day_of_month | INTEGER — 1-31 |
+| next_run_at | DATETIME, index |
+| automation_playbook | JSON — structured plan |
+| action_prompt | TEXT — agent instruction |
+
+---
+
+## Minor Models Summary
+
+| Model | Table | Purpose | Soft-delete |
+|-------|-------|---------|------------|
+| `ApiCost` | `api_costs` | Agent LLM call cost tracking | No |
+| `Transcription` | `transcriptions` | Audio transcription records | No |
+| `AdminNotification` | `admin_notifications` | Push notification definitions | No |
+| `UserNotification` | `user_notifications` | Per-user notification delivery | No |
+| `LibraryCategory` | `library_categories` | Use-case library categories | Yes (is_active) |
+| `LibraryCard` | `library_cards` | Use-case library cards | Yes (is_active) |
+| `InviteCode` | `invite_codes` | Registration invite codes | No (used_by_user_id) |
+| `AdminRole` | `admin_roles` | Admin permission roles | No |
+| `HelpDeskTicket` | `helpdesk_tickets` | User support tickets | Yes |
+| `MessageRating` | `message_ratings` | Per-message star ratings (1-5) | No |
+| `Emplogent` | `emplogents` | User AI personas | No |
+| `EmplogentTemplate` | `emplogent_templates` | Templates for AI personas | No |
+| `SafetyViolation` | `safety_violations` | Safety guardrail log | No |
+| `ConversationSummary` | `conversation_summaries` | KB conversation summaries | No |
+| `TaskEvaluation` | `task_evaluations` | Agent trajectory evaluations | No |

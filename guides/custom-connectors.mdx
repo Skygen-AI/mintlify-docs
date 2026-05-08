@@ -1,174 +1,227 @@
 ---
-title: "Custom connectors"
-description: "Turn any HTTP API or MCP server into a first-class agent tool with encrypted secrets."
+title: "Custom Connectors"
+description: "How to register a custom API as a Skygen connector so agents can call it as a tool."
 ---
 
-Custom connectors let you plug your internal services into Skygen without waiting for a Composio integration. Point at an HTTP endpoint or an MCP server, define a few tools, and the agent picks them up alongside the 500+ Composio toolkits.
+## Overview
 
-## Types
+Custom connectors allow you to expose any HTTP API as a set of tools the Skygen agent can invoke. A connector has a type (OpenAPI, REST, or GraphQL), a name, a slug, authentication config, and a list of tool definitions. The agent discovers tools via the connector registry and calls them during task execution.
 
-Three connector types, picked at creation:
+---
 
-| Type | What it is | Tool definition |
-|------|------------|-----------------|
-| `custom_api` | Generic HTTP tool. Agent specifies method/url/headers/body at call time. Secrets substituted via `{{NAME}}` templates. | Auto-generated from the config |
-| `custom_mcp` | MCP server (HTTP or stdio). Tools discovered at runtime by probing the server on create. | Discovered, not declared |
-| `app` | Legacy structured tools with fixed schema | Hand-written per tool |
+## Connector types
 
-## Schema
+| Type | Description |
+|------|-------------|
+| `openapi` | Connector introspects an OpenAPI 3.x spec URL and auto-generates tool definitions |
+| `rest` | Manual tool definitions for REST endpoints |
+| `graphql` | Manual tool definitions wrapping GraphQL operations |
 
-```python
-class ConnectorBase(BaseModel):
-    name: str
-    slug: str                          # Normalized to lowercase-dash
-    type: ConnectorTypeEnum            # "app" | "custom_api" | "custom_mcp"
-    description: Optional[str]
-    icon_url: Optional[str]            # S3 URL from presigned upload
-    note: Optional[str]                # User instructions for the agent
-    config: Dict[str, Any]             # Type-specific, encrypted at rest
-    tools: List[ConnectorTool]
-    status: ConnectorStatusEnum        # "draft" | "connected" | "error"
+---
+
+## Creating a connector
+
+```http
+POST /connectors
+Authorization: Bearer {token}
+Content-Type: application/json
 ```
 
-Each tool:
-
-```python
-class ConnectorTool(BaseModel):
-    name: str
-    description: Optional[str]
-    input_schema: Dict                 # JSON Schema for parameters
-    action: Dict                       # Execution config (HTTP endpoint, etc.)
+```json
+{
+  "type": "openapi",
+  "name": "My CRM API",
+  "description": "Customer relationship management API",
+  "config": {
+    "base_url": "https://api.mycrm.com/v1",
+    "spec_url": "https://api.mycrm.com/v1/openapi.json",
+    "auth_type": "bearer",
+    "auth_token": "sk-..."
+  }
+}
 ```
 
-## Encrypted secrets
+<ParamField body="type" type="string" required>
+  Connector type: `openapi`, `rest`, or `graphql`.
+</ParamField>
 
-Anything under `config.secrets` is encrypted with `MCP_CRYPTO_KEY` (Fernet, 32-byte base64) before persistence. On read the backend decrypts and redacts secrets to `***` before returning responses. Plaintext secrets never leave backend memory.
+<ParamField body="name" type="string" required>
+  Human-readable name. Max 100 characters.
+</ParamField>
 
-At tool execution, `{{SECRET_NAME}}` placeholders in headers, URLs, and bodies are replaced with the decrypted values.
+<ParamField body="description" type="string">
+  Description shown to the agent in tool discovery.
+</ParamField>
 
-## Create a `custom_api` connector
+<ParamField body="config" type="object" required>
+  Authentication and endpoint configuration. Encrypted at rest using AES (key: `MCP_CRYPTO_KEY`).
+</ParamField>
 
-```bash
-curl -X POST https://api.skygen.ai/connectors/custom \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Internal Orders",
-    "slug": "internal-orders",
-    "type": "custom_api",
-    "description": "Orders microservice",
-    "config": {
-      "server_url": "https://orders.internal",
-      "timeout": 30,
-      "secrets": {
-        "API_KEY": "sk-abc123"
+<ParamField body="note" type="string">
+  Private note visible only to the owner. Not shown to the agent.
+</ParamField>
+
+**Response — 201 Created:**
+
+```json
+{
+  "id": "connector-uuid",
+  "user_id": "user-uuid",
+  "type": "openapi",
+  "name": "My CRM API",
+  "slug": "my-crm-api",
+  "description": "Customer relationship management API",
+  "icon_url": null,
+  "config": {"base_url": "...", "spec_url": "...", "auth_type": "bearer", "auth_token": "[REDACTED]"},
+  "tools": null,
+  "status": "active",
+  "created_at": "2026-05-08T10:00:00",
+  "updated_at": "2026-05-08T10:00:00"
+}
+```
+
+<Note>
+  The `config` field in responses always has secrets replaced with `[REDACTED]`. The plaintext is only used when the agent invokes a tool.
+</Note>
+
+---
+
+## Config authentication options
+
+| `auth_type` | Required fields | Notes |
+|-------------|----------------|-------|
+| `bearer` | `auth_token` | `Authorization: Bearer {auth_token}` |
+| `api_key` | `api_key`, `api_key_header` | Custom header name |
+| `basic` | `username`, `password` | Base64-encoded |
+| `none` | — | Public API |
+
+---
+
+## Listing connectors
+
+```http
+GET /connectors
+Authorization: Bearer {token}
+```
+
+Returns all connectors owned by the authenticated user. Sensitive config values are redacted.
+
+---
+
+## Updating a connector
+
+```http
+PUT /connectors/{connector_id}
+Authorization: Bearer {token}
+Content-Type: application/json
+```
+
+All fields are optional. Only provided fields are updated.
+
+---
+
+## Deleting a connector
+
+```http
+DELETE /connectors/{connector_id}
+Authorization: Bearer {token}
+```
+
+Removes the connector. Running tasks that reference this connector may fail.
+
+---
+
+## Uploading a connector icon
+
+Connector icons are stored in S3. Use the two-step presigned upload flow:
+
+**Step 1: Get presigned URL**
+
+```http
+POST /connectors/icon/presigned
+Authorization: Bearer {token}
+
+{"content_type": "image/png", "file_extension": "png"}
+```
+
+Returns `upload_url`, `fields`, and `icon_key`.
+
+**Step 2: Upload to S3**
+
+```python
+import requests
+
+resp = requests.post(
+    presigned["upload_url"],
+    data=presigned["fields"],
+    files={"file": open("icon.png", "rb")},
+)
+```
+
+**Step 3: Set icon on connector**
+
+```http
+PATCH /connectors/{connector_id}/icon
+Authorization: Bearer {token}
+
+{"icon_key": "connector-icons/{user_id}/{uuid}.png"}
+```
+
+Supported icon types: PNG, JPEG, SVG, WebP. Maximum size: 2 MB.
+
+---
+
+## Manual tool definitions
+
+For `rest` type connectors, define tools explicitly:
+
+```json
+{
+  "type": "rest",
+  "name": "Internal API",
+  "config": {
+    "base_url": "https://internal.example.com/api",
+    "auth_type": "bearer",
+    "auth_token": "internal-token"
+  },
+  "tools": [
+    {
+      "name": "get_customer",
+      "description": "Retrieve a customer by ID",
+      "method": "GET",
+      "path": "/customers/{customer_id}",
+      "parameters": {
+        "customer_id": {"type": "string", "description": "Customer UUID", "required": true}
       }
     },
-    "tools": []
-  }'
-```
-
-The agent now sees one tool, `custom_api__<connector_id>`, with this schema:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "method": { "type": "string", "enum": ["GET","POST","PUT","DELETE","PATCH"] },
-    "url":    { "type": "string", "description": "Full URL to call" },
-    "headers":{ "type": "object", "description": "Use {{SECRET_NAME}} for secrets" },
-    "body":   { "type": "object", "description": "For POST/PUT/PATCH" }
-  },
-  "required": ["method", "url"]
+    {
+      "name": "create_ticket",
+      "description": "Create a support ticket",
+      "method": "POST",
+      "path": "/tickets",
+      "body_schema": {
+        "title": {"type": "string", "required": true},
+        "priority": {"type": "string", "enum": ["low", "normal", "high"]}
+      }
+    }
+  ]
 }
 ```
 
-At call time the agent supplies something like:
+---
 
-```json
-{
-  "method": "GET",
-  "url": "https://orders.internal/orders/order_001",
-  "headers": {"Authorization": "Bearer {{API_KEY}}"}
-}
-```
+## Security
 
-Skygen decrypts `API_KEY`, substitutes into the header, and makes the request.
+All connector configs are encrypted at rest. The encryption key is `MCP_CRYPTO_KEY` (AES). The `connectors_crypto.py` service handles encrypt/decrypt/redact operations transparently — application code never sees plaintext secrets outside of active tool invocation.
 
-## Create a `custom_mcp` connector
+SSRF protection: the `validate_url_not_ssrf()` service validates all base URLs and spec URLs against a blocklist before saving. Requests to localhost, link-local addresses (169.254.0.0/16), and internal RFC 1918 ranges are rejected.
 
-```bash
-curl -X POST https://api.skygen.ai/connectors/custom \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "name": "My MCP server",
-    "slug": "my-mcp",
-    "type": "custom_mcp",
-    "config": {
-      "server_url": "http://localhost:3000/mcp",
-      "transport_type": "http",
-      "headers": {"Authorization": "Bearer TOKEN"}
-    },
-    "tools": []
-  }'
-```
+---
 
-On create, Skygen probes the server (10-second synchronous timeout). If reachable, it discovers tools and sets `status=connected`. If the probe fails, `status=error` and `config.probe_error` holds the message.
+## Connector status values
 
-## Icon upload
-
-<Steps>
-  <Step title="Request presigned POST">
-    ```bash
-    curl -X POST https://api.skygen.ai/connectors/icon/presigned \
-      -H "Authorization: Bearer $TOKEN" \
-      -d '{"content_type": "image/png", "file_extension": "png"}'
-    # → { "upload_url": "...", "fields": {...}, "icon_key": "connector-icons/user_123/abc.png" }
-    ```
-    Max size 2 MB. Allowed: png, jpeg, svg+xml, webp. URL valid 300s.
-  </Step>
-  <Step title="POST multipart to S3">
-    Client-side upload.
-  </Step>
-  <Step title="Attach to connector">
-    ```bash
-    curl -X PATCH https://api.skygen.ai/connectors/custom/$CONNECTOR_ID \
-      -H "Authorization: Bearer $TOKEN" \
-      -d '{"icon_url": "https://.../connector-icons/user_123/abc.png"}'
-    ```
-  </Step>
-</Steps>
-
-## Sensitive tools
-
-Mark a tool with `requires_confirmation: true` in its `action` to force a [Confirmation](/concepts/confirmations) before the agent can call it. Useful for destructive endpoints like `cancel_order` or anything that writes to production.
-
-## CRUD endpoints
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/connectors/custom` | Create. Probes MCP servers synchronously. |
-| `GET` | `/connectors/custom` | List user's connectors. Config decrypted and redacted. |
-| `PATCH` | `/connectors/custom/{id}` | Partial update. Config re-encrypted if modified. |
-| `DELETE` | `/connectors/custom/{id}` | Delete. |
-| `POST` | `/connectors/icon/presigned` | Presigned S3 URL for icon upload. |
-
-## Gotchas
-
-<Warning>
-**MCP probe is synchronous.** Servers that take longer than 10 seconds to respond to the initial capability exchange fail to create. Either make your server faster to warm up, or retry the create after the server is ready.
-</Warning>
-
-<Note>
-**Slug normalization.** Non-alphanumeric characters become `-`. `"My API"` becomes `"my-api"`. Provide your own slug if you care about the value.
-</Note>
-
-<Note>
-**Never log secrets.** The redaction step applies to responses. If you log `config` from your own code, ensure you call `redact_config()` first.
-</Note>
-
-## See also
-
-- [MCP integrations](/concepts/mcp-integrations) — Composio side of the catalog
-- [Confirmations](/concepts/confirmations) — gating destructive tools
-- [Connecting integrations](/guides/connecting-integrations) — OAuth-based alternative
+| Status | Meaning |
+|--------|---------|
+| `active` | Connector is live and available to agents |
+| `inactive` | Connector is disabled; not offered to agents |
+| `error` | Last introspection or tool call failed |

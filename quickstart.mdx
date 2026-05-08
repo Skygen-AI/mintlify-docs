@@ -1,121 +1,285 @@
 ---
 title: "Quickstart"
-description: "Register, authenticate, connect a device, and run your first agent session."
+description: "From zero to running your first agent task in five minutes."
 ---
 
-This guide walks you from a fresh account to a running agent in under five minutes. You will create a user, obtain an access token, register a device, start a chat session, and send a message.
+This guide walks you through authenticating, creating a session, sending a message to the agent, and watching it execute. All examples use `curl` and Python.
 
-## Prerequisites
+**Base URL:** `https://api.skygen.ai`
 
-- An email address for account verification
-- One of: the Skygen desktop app installed on your machine **or** access to create a Cloud PC
+---
 
-## 1. Create an account
+<Steps>
 
-Sign up through the web dashboard or via the API.
+<Step title="Register or log in">
+
+If you don't have an account yet, register with email and password:
 
 <CodeGroup>
-```bash cURL
-curl -X POST https://api.skygen.ai/security/signup \
+```bash curl
+curl -s -X POST https://api.skygen.ai/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "you@example.com",
-    "password": "your-strong-password"
+    "password": "your-password",
+    "display_name": "Your Name"
   }'
 ```
 
 ```python Python
 import httpx
 
-response = httpx.post(
-    "https://api.skygen.ai/security/signup",
-    json={"email": "you@example.com", "password": "your-strong-password"},
-)
-response.raise_for_status()
+BASE_URL = "https://api.skygen.ai"
+
+resp = httpx.post(f"{BASE_URL}/auth/register", json={
+    "email": "you@example.com",
+    "password": "your-password",
+    "display_name": "Your Name"
+})
+resp.raise_for_status()
+data = resp.json()
+token = data["access_token"]
+print("Registered, token:", token[:20], "...")
 ```
 </CodeGroup>
 
-Check your inbox for a verification email and confirm the address before continuing.
-
-## 2. Log in and get an access token
+The response contains an `access_token` (JWT) and the created `user` object. If you already have an account, log in instead:
 
 <CodeGroup>
-```bash cURL
-curl -X POST https://api.skygen.ai/security/login \
+```bash curl
+curl -s -X POST https://api.skygen.ai/auth/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=you@example.com&password=your-strong-password"
+  -d "username=you@example.com&password=your-password"
+```
+
+```python Python
+resp = httpx.post(f"{BASE_URL}/auth/token", data={
+    "username": "you@example.com",
+    "password": "your-password",
+})
+resp.raise_for_status()
+token = resp.json()["access_token"]
 ```
 </CodeGroup>
 
-The response contains an `access_token` (JWT). Use it as `Authorization: Bearer <token>` in every authenticated request. See [Authentication](/guides/authentication) for the refresh flow.
+<Note>
+  Store the `access_token`. Tokens are valid for 30 days. Pass it in every subsequent request as `Authorization: Bearer <token>`.
+</Note>
 
-## 3. Register a device
+</Step>
 
-Devices are the machines your agent will run on. They can be real (your laptop via the desktop app) or virtual (a Cloud PC or E2B sandbox).
+<Step title="Create a chat session">
+
+A **session** is the container for a conversation with an agent. Create a software-only session (no device needed):
 
 <CodeGroup>
-```bash cURL
-curl -X POST https://api.skygen.ai/devices \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+```bash curl
+curl -s -X POST https://api.skygen.ai/sessions \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "My MacBook",
-    "platform": "macos",
-    "device_type": "real_device"
+    "title": "My first session"
   }'
 ```
-</CodeGroup>
 
-The response includes a `device_token_kid` which the desktop app uses to authenticate its websocket connection. See [Devices](/concepts/devices) for the full lifecycle.
+```python Python
+headers = {"Authorization": f"Bearer {token}"}
 
-## 4. Start a chat session
-
-<CodeGroup>
-```bash cURL
-curl -X POST https://api.skygen.ai/sessions \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "device_id": "DEVICE_UUID_FROM_STEP_3",
-    "title": "First run"
-  }'
+resp = httpx.post(f"{BASE_URL}/sessions", headers=headers, json={
+    "title": "My first session"
+})
+resp.raise_for_status()
+session = resp.json()
+session_id = session["id"]
+print("Session ID:", session_id)
 ```
 </CodeGroup>
 
-Sessions scope agent memory and tool access. Learn more in [Chat sessions](/concepts/chat-sessions).
+<Accordion title="Sample response">
+```json
+{
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "user_id": "b2e9f7c1-...",
+  "title": "My first session",
+  "device_id": null,
+  "created_at": "2026-05-08T10:00:00Z",
+  "updated_at": "2026-05-08T10:00:00Z"
+}
+```
+</Accordion>
 
-## 5. Send a message
+</Step>
+
+<Step title="Send a message to the agent">
+
+Post a user message to the session. The agent picks it up asynchronously via RabbitMQ and begins executing:
 
 <CodeGroup>
-```bash cURL
-curl -X POST https://api.skygen.ai/messages \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+```bash curl
+curl -s -X POST "https://api.skygen.ai/sessions/$SESSION_ID/messages" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "session_id": "SESSION_UUID_FROM_STEP_4",
+    "content": "Search the web for the latest Claude model pricing and summarize it.",
     "role": "user",
-    "content": "Take a screenshot of my desktop and describe what you see."
+    "agent_mode": "auto",
+    "client_version": "1.0.0"
   }'
+```
+
+```python Python
+resp = httpx.post(
+    f"{BASE_URL}/sessions/{session_id}/messages",
+    headers=headers,
+    json={
+        "content": "Search the web for the latest Claude model pricing and summarize it.",
+        "role": "user",
+        "agent_mode": "auto",
+        "client_version": "1.0.0",
+    }
+)
+resp.raise_for_status()
+msg = resp.json()
+print("Message ID:", msg["id"])
+print("Status:", msg.get("meta_data", {}).get("status"))
 ```
 </CodeGroup>
 
-The agent processes the message, plans actions, and executes them on the device. Replies stream back through the same session. For real-time updates subscribe to the `/user` Socket.IO namespace.
+<Warning>
+  The `client_version` field is required. Pass `"1.0.0"` or your actual client version. Omitting it returns an error asking you to update.
+</Warning>
 
-## Next steps
+The message is queued and the agent begins processing. You'll receive intermediate steps and the final result either by polling or over Socket.IO.
+
+</Step>
+
+<Step title="Poll for the agent's reply">
+
+List messages in the session to see the agent's responses:
+
+<CodeGroup>
+```bash curl
+curl -s "https://api.skygen.ai/sessions/$SESSION_ID/messages" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```python Python
+import time
+
+for _ in range(30):  # poll up to 60 seconds
+    resp = httpx.get(
+        f"{BASE_URL}/sessions/{session_id}/messages",
+        headers=headers
+    )
+    messages = resp.json()
+    # Look for a completed assistant message
+    for m in reversed(messages):
+        if m["role"] == "assistant":
+            meta = m.get("meta_data") or {}
+            if meta.get("status") in ("completed", "error"):
+                print("Agent reply:", m["content"][:500])
+                break
+    else:
+        time.sleep(2)
+        continue
+    break
+```
+</CodeGroup>
+
+For real-time streaming, connect to the Socket.IO `/user` namespace and subscribe to `message_created` events on your user ID. See the [WebApp architecture](/webapp/api-client) for details.
+
+</Step>
+
+<Step title="(Optional) Provision a Cloud PC and attach it to a session">
+
+To run a task on a full GUI desktop, connect to a Cloud PC (E2B-backed persistent sandbox).
+A new sandbox is created automatically on the first call; subsequent calls reconnect to the same instance.
+
+<CodeGroup>
+```bash curl
+# 1. Create a session (without a device — Cloud PC will be linked next)
+SESSION_ID=$(curl -s -X POST https://api.skygen.ai/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Cloud PC session"}' | jq -r '.id')
+
+# 2. Connect (or create) a Cloud PC and bind it to that session
+curl -s -X POST https://api.skygen.ai/cloud-pc/connect \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"session_id\": \"$SESSION_ID\",
+    \"name\": \"My Cloud PC\"
+  }"
+```
+
+```python Python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+# 1. Create a session
+session_resp = httpx.post(f"{BASE_URL}/sessions", headers=headers,
+                          json={"title": "Cloud PC session"})
+session_resp.raise_for_status()
+session_id = session_resp.json()["id"]
+
+# 2. Connect (or create) a Cloud PC and bind it to the session
+cpc_resp = httpx.post(f"{BASE_URL}/cloud-pc/connect", headers=headers, json={
+    "session_id": session_id,
+    "name": "My Cloud PC",          # optional display name
+    # "cloud_pc_id": "<uuid>",      # omit to create a new sandbox
+})
+cpc_resp.raise_for_status()
+cpc = cpc_resp.json()
+# cpc["stream_url"] — noVNC stream for the live desktop
+print("Cloud PC status:", cpc["status"], "| stream:", cpc.get("stream_url"))
+```
+</CodeGroup>
+
+The response includes `stream_url` for a live noVNC view of the desktop. Now send a message to the session — the agent will control the GUI to complete your task.
+
+**Reconnecting to an existing Cloud PC:**
+
+```bash
+curl -s -X POST https://api.skygen.ai/cloud-pc/connect \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"cloud_pc_id\": \"$CLOUD_PC_ID\", \"session_id\": \"$SESSION_ID\"}"
+```
+
+<Note>
+  Cloud PC requires `CLOUD_PC_ENABLED=true` on the backend and an active subscription with the `cloud_pc` feature. If the sandbox is busy in another session, the API returns HTTP 409 `cloud_pc_busy` — pass `"force_reattach": true` to take it over.
+</Note>
+
+</Step>
+
+</Steps>
+
+---
+
+## What Happens Next
+
+Once you've confirmed the basics work, explore:
 
 <CardGroup cols={2}>
-  <Card title="Connect integrations" icon="plug" href="/guides/connecting-integrations">
-    Let the agent use Gmail, Slack, and 500+ other tools.
+  <Card title="Authentication deep-dive" icon="lock" href="/guides/authentication">
+    Google OAuth, token lifecycle, cookie-based auth for web clients.
   </Card>
-  <Card title="Add a Cloud PC" icon="cloud" href="/concepts/cloud-pc">
-    Run tasks without tying up your local machine.
+  <Card title="LLM Routing" icon="brain" href="/guides/llm-routing">
+    Choose between Claude, Gemini, Cerebras, and Groq per session.
   </Card>
-  <Card title="Schedule a task" icon="calendar" href="/guides/scheduled-tasks">
-    Fire jobs on a cron schedule.
+  <Card title="Scheduled Tasks" icon="clock" href="/guides/scheduled-tasks">
+    Automate recurring agent runs on a flexible schedule.
   </Card>
-  <Card title="Review errors" icon="circle-exclamation" href="/errors">
-    Understand the status codes you will hit.
+  <Card title="MCP Integrations" icon="plug" href="/guides/connecting-integrations">
+    Connect Slack, Gmail, GitHub, and more to your agent.
+  </Card>
+  <Card title="Knowledge Base" icon="book" href="/guides/knowledge-base">
+    Give your agent persistent memory with a vector knowledge base.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api-reference/introduction">
+    Full REST API reference with request/response schemas.
   </Card>
 </CardGroup>
-
-{/* TODO: replace api.skygen.ai with the real production host once confirmed */}

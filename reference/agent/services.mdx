@@ -1,0 +1,606 @@
+---
+title: "Agent Services Reference"
+description: "Complete reference for AgentSocketIOClient, CostTracker, RedisEventBus, TaskCancellationManager, SandboxHeartbeat, and cost_tracking_middleware."
+---
+
+# Agent Services
+
+The services layer (`Agent/Services/`) provides six infrastructure modules shared by all agents: Socket.IO connectivity, billing accounting, distributed event bus, distributed task cancellation, Compute V2 sandbox keepalive, and a shared cost-tracking middleware.
+
+---
+
+## AgentSocketIOClient
+
+**File:** `Agent/Services/socketio_client.py`
+
+Maintains the persistent Socket.IO connection between the Agent pod and the Backend `/agent` namespace. Implements custom single-task reconnection with exponential backoff, heartbeats, optional Redis event bus creation, and presigned S3 screenshot upload.
+
+### Constructor
+
+```python
+AgentSocketIOClient(
+    backend_url: str,
+    agent_token: str,
+    agent_id: str = "default_agent",
+    auto_reconnect: bool = True,
+    heartbeat_interval: int = 30,
+    redis_url: Optional[str] = None,
+)
+```
+
+<ParamField path="backend_url" type="str">
+  WebSocket or HTTP URL of the Backend, e.g. `wss://dev.skygen.ai` or `http://localhost:8000`. The client automatically converts `ws(s)://` to `http(s)://` for Socket.IO.
+</ParamField>
+
+<ParamField path="agent_token" type="str">
+  Bearer token sent in the `/agent` namespace handshake `auth` dict. Maps to `AGENT_API_TOKEN` env var.
+</ParamField>
+
+<ParamField path="agent_id" type="str">
+  Unique agent identifier. Used as the Socket.IO `agent_id` auth field and as the `consumer_name` for the Redis Event Bus.
+</ParamField>
+
+<ParamField path="auto_reconnect" type="bool">
+  Whether to start the custom reconnect loop on disconnect. Defaults to `True`.
+</ParamField>
+
+<ParamField path="heartbeat_interval" type="int">
+  Seconds between `heartbeat` Socket.IO calls. Defaults to 30.
+</ParamField>
+
+<ParamField path="redis_url" type="str | None">
+  If provided, creates a `RedisEventBus` instance keyed on `agent_id`. Enables result delivery via Redis Streams as a fallback alongside Socket.IO events.
+</ParamField>
+
+### Connection Lifecycle
+
+The built-in python-socketio reconnection is **disabled**. `AgentSocketIOClient` implements its own single-task reconnect loop:
+
+1. On `disconnect`, saves active subscriptions and starts the reconnect task (if `auto_reconnect` is set).
+2. Uses exponential backoff with jitter (base `RECONNECT_DELAY_INITIAL=2s`, max `RECONNECT_DELAY_MAX=60s`, jitter fraction `RECONNECT_JITTER=0.5`).
+3. On reconnect, the `on_connect` handler fires: restarts the heartbeat task, then restores all saved subscriptions.
+
+All environment variables controlling timeouts (`WS_SUBSCRIBE_TIMEOUT`, `REDIS_EVENT_TIMEOUT`, `CONNECT_EVENT_TIMEOUT`, `RECONNECT_DELAY_INITIAL`, `RECONNECT_DELAY_MAX`, `RECONNECT_JITTER`) can be overridden at runtime.
+
+### Methods
+
+```python
+async def connect() -> bool
+```
+
+Initiates the Socket.IO handshake to `/agent`. Returns `True` on success. Waits up to `CONNECT_EVENT_TIMEOUT` (default 35s) for the `on_connect` event to fire, creates an `aiohttp.ClientSession` for HTTP use, and starts the Redis Event Bus background task if configured.
+
+```python
+async def disconnect() -> None
+```
+
+Cancels the reconnect task, heartbeat task, and Redis Event Bus task; disconnects Socket.IO; closes the owned `aiohttp.ClientSession`.
+
+```python
+async def subscribe(resource_id: str) -> bool
+```
+
+Subscribes to device/session events. Emits `subscribe` to the Backend with `resource_type="device"`. Results are cached; re-subscribing a cached ID is a no-op. On reconnect, all saved subscriptions are automatically restored.
+
+```python
+async def execute_action(
+    device_id: str,
+    action_type: str,
+    parameters: Dict[str, Any] = None,
+    timeout: int = 30,
+    action_id: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+Executes an action on a device. Registers a per-action result handler before sending to avoid the race where the device responds before the ack returns. Races `asyncio.Future` (via Socket.IO event) against `RedisEventBus.wait_for_event()` if available; accepts whichever resolves first. Transparently retries on transient Cloud PC sandbox errors (`retry_after` in response) up to `_MAX_SANDBOX_RETRIES=3` or `_MAX_SANDBOX_RETRY_TOTAL_SECONDS=60`. Auto-resubscribes if Backend reports subscription lost.
+
+```python
+async def upload_screenshot_direct(
+    screenshot_path: str,
+    session_id: str,
+    task_id: Optional[str] = None,
+    step_number: int = 0,
+) -> Dict[str, Any]
+```
+
+Two-step upload: calls `get_presigned_upload_url()` then POSTs the PNG directly to S3 via the presigned URL. Returns `{screenshot_id, screenshot_url, status: "uploaded"}`.
+
+```python
+async def send_ui_meta_update(
+    user_id: str, session_id: str, payload: Dict[str, Any]
+) -> Dict[str, Any]
+```
+
+Emits `ui_meta_update` to the Backend with acknowledgement. Routes the payload to the user's frontend via the `/user` namespace.
+
+```python
+async def send_new_message(
+    user_id: str, session_id: str, message: Dict[str, Any]
+) -> Dict[str, Any]
+```
+
+Emits `new_message` to create a chat message visible in the frontend.
+
+```python
+async def get_device_status(device_id: str) -> Dict[str, Any]
+```
+
+Emits `get_device_status` and returns the Backend's connection status for the device.
+
+```python
+async def send_event(method: str, params: Dict[str, Any] = None) -> bool
+```
+
+Fire-and-forget emit. For `"ui_meta_update"` extracts `user_id`/`session_id`/`payload` and calls the dedicated Socket.IO call; all other methods use plain `sio.emit`. Returns `False` if not connected. Provided for backward compatibility with the old `AgentWebSocketClient`.
+
+```python
+async def send_request(
+    method: str, params: Dict[str, Any] = None, timeout: float = 30.0
+) -> Any
+```
+
+Wraps `sio.call()` — sends an event and waits for acknowledgement. Raises `ConnectionError` if not connected. Provided for backward compatibility.
+
+```python
+def on_event(event_type: str, handler: Callable) -> None
+```
+
+Registers an event handler for Backend events routed through `_handle_event`. Supports both sync and async handlers. For `action_result`, handlers can be keyed as `"action_result:{action_id}"` for per-action dispatch.
+
+```python
+def off_event(event_type: str, handler: Callable) -> None
+```
+
+Removes a previously registered handler. Cleans up the handler list entry if it becomes empty.
+
+### Heartbeat
+
+Calls the `heartbeat` Socket.IO event every `heartbeat_interval` seconds using `sio.call()` with a 10-second timeout. The Backend uses heartbeat absence to detect stale agent pods.
+
+### Redis Event Bus Integration
+
+When `redis_url` is set, the client creates a `RedisEventBus(redis_url, consumer_name=agent_id)` and connects it in a background task after initial Socket.IO connect. It subscribes to streams `"action_result"`, `"task_completed"`, and `"task_failed"`. For `execute_action`, the result races between the Socket.IO event and the Redis stream; whichever resolves first wins.
+
+---
+
+## CostTracker
+
+**File:** `Agent/Services/cost_tracker.py`
+
+Records per-call billing data, calculates costs against a `model_pricing.yaml` table, enforces per-session billing limits, and persists records locally (JSONL) and to the Backend.
+
+### `APICallCost`
+
+```python
+@dataclass
+class APICallCost:
+    timestamp: str
+    session_id: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    input_cost: float
+    output_cost: float
+    cache_read_cost: float
+    cache_write_cost: float
+    total_cost: float
+    latency_seconds: float
+    agent_type: str = "unknown"
+    task_id: str = ""
+    user_id: Optional[str] = None
+```
+
+Note: field names use no `_usd` suffix; cache fields are `cache_read_tokens` / `cache_write_tokens`; latency is `latency_seconds` (not `latency_ms`).
+
+### `BillingLimitReached`
+
+```python
+class BillingLimitReached(Exception): ...
+```
+
+Raised by `record_api_call_async()` when the Backend returns HTTP `402` or when the session's billing flag was set by a prior call. Caught by `BaseAgent.chat()` and causes the loop to exit with status `"billing_limit_reached"`.
+
+### Constructor
+
+```python
+CostTracker(
+    storage_path: Optional[str] = None,
+    backend_session=None,
+    backend_url: Optional[str] = None,
+    http_session=None,
+)
+```
+
+<ParamField path="storage_path" type="str | None">
+  Path for local JSONL fallback files. Defaults to `COST_TRACKER_PATH` env var or `../agent_costs`.
+</ParamField>
+
+<ParamField path="backend_session" type="Any | None">
+  Legacy WebSocket client reference (not used for HTTP POST; kept for compat).
+</ParamField>
+
+<ParamField path="backend_url" type="str | None">
+  Backend URL for `POST /admin/costs/record`. Defaults to `BACKEND_URL` env var or `http://localhost:8000`. `ws://` / `wss://` schemes are converted to `http://` / `https://` automatically.
+</ParamField>
+
+<ParamField path="http_session" type="aiohttp.ClientSession | None">
+  Preferred HTTP session for REST API calls.
+</ParamField>
+
+Behavior is controlled by:
+- `ENABLE_COST_TRACKING` — set to `"false"` to disable entirely (default `"true"`).
+- `COST_TRACKING_BACKEND` — set to `"false"` to write locally only (default `"true"`).
+- `COST_TRACKING_VERBOSE` — set to `"true"` for INFO-level per-call logs.
+
+### `record_api_call_async()`
+
+```python
+async def record_api_call_async(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_seconds: float,
+    session_id: str = "unknown",
+    agent_type: str = "unknown",
+    task_id: str = "",
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    user_id: Optional[str] = None,
+    server_total_cost_usd: Optional[float] = None,
+    server_prompt_cost_usd: Optional[float] = None,
+    server_completion_cost_usd: Optional[float] = None,
+) -> APICallCost
+```
+
+1. Pre-flight billing limit check — raises `BillingLimitReached` immediately if already flagged.
+2. Calculates cost via `_resolve_call_costs()`: prefers server-reported USD totals (from OpenRouter `usage.cost`) over local pricing table.
+3. Appends the record to an in-memory `session_costs` list (thread-safe via `asyncio.Lock`; capped at `MAX_SESSION_COSTS=10000`).
+4. Emits Prometheus metrics if available.
+5. POSTs to `{backend_url}/admin/costs/record`; on HTTP `402` raises `BillingLimitReached`; on failure saves to `agent_costs/costs_{date}.jsonl` (file-locked).
+
+### `calculate_cost()`
+
+```python
+def calculate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> Dict[str, float]
+```
+
+Returns `{input_cost, output_cost, cache_read_cost, cache_write_cost, total_cost}`. Supports tiered pricing via `context_threshold` key in `model_pricing.yaml`.
+
+### `get_session_summary()`
+
+```python
+def get_session_summary(session_id: Optional[str] = None) -> Dict
+```
+
+Returns aggregated metrics: `total_cost`, `total_calls`, `total_tokens`, per-model and per-agent breakdowns, and a `cache_savings` block.
+
+### `cleanup_session()`
+
+```python
+def cleanup_session(session_id: str) -> None
+```
+
+Removes in-memory billing limit flags for a completed session to prevent memory leaks.
+
+### Pricing YAML Format
+
+```yaml
+# model_pricing.yaml (USD per 1M tokens)
+anthropic/claude-sonnet-4.6:
+  context_threshold: 10000   # switches to _large tiers above this total-context
+  input_small: 3.00
+  output_small: 15.00
+  cache_read_small: 0.30
+  cache_write_small: 3.75
+  input_large: 3.00
+  output_large: 15.00
+  cache_read_large: 0.30
+  cache_write_large: 3.75
+google/gemini-2.5-flash:
+  input: 0.075
+  output: 0.30
+  cache_read: 0.01875
+  cache_write: 0.075
+default:
+  input: 5.0
+  output: 15.0
+```
+
+---
+
+## RedisEventBus
+
+**File:** `Agent/Services/redis_event_bus.py`
+
+Durable pub/sub using Redis Streams with consumer groups. Supports both standalone Redis and Redis Cluster (auto-detected from URL). Provides at-least-once delivery with ACK/NACK, retry counting, dead-letter archiving, and a one-shot `wait_for_event()` helper.
+
+### Architecture
+
+```
+Publisher                     Consumer (_consume_stream task)
+    │                               │
+    ▼                               ▼
+XADD events:{event_type}       XREADGROUP GROUP agents {consumer_name}
+    │                               │
+    │                          ACK on success
+    │                          retry_count:stream:id INCR on failure
+    │                          Dead-letter after MAX_HANDLER_RETRIES
+    ▼
+"dead_letter:events:{event_type}"   ← failed messages archived here
+```
+
+Streams are named `events:{event_type}` (e.g. `events:action_result`).
+
+### Constants
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `consumer_group` | `"agents"` | All agent pods share one consumer group; each message is processed by exactly one pod |
+| `MAX_HANDLER_RETRIES` | `3` | Retries before routing to dead-letter stream |
+| `DEAD_LETTER_STREAM_PREFIX` | `"dead_letter:"` | Prepended to stream key for dead-letter storage |
+
+### Constructor
+
+```python
+RedisEventBus(redis_url: str, consumer_name: str)
+```
+
+`consumer_name` should be unique per pod (e.g. `agent_id`). Cluster mode is auto-detected by checking for `"clustercfg"` or `"cluster"` in the URL.
+
+### Methods
+
+```python
+async def connect() -> None
+```
+
+Creates the Redis connection (standalone or Cluster). Verifies with `PING`. Raises `ConnectionError` on failure with full cleanup.
+
+```python
+async def disconnect() -> None
+```
+
+Cancels all consumer tasks and closes the Redis connection.
+
+```python
+async def publish(event_type: str, data: Dict[str, Any]) -> None
+```
+
+Calls `XADD events:{event_type} * data {json}` with approximate `MAXLEN 10000`.
+
+```python
+async def subscribe(event_type: str) -> None
+```
+
+Creates consumer group `agents` for `events:{event_type}` (with `MKSTREAM`), then starts a `_consume_stream` background task. `BUSYGROUP` errors (group already exists) are silently ignored.
+
+```python
+def on_event(event_type: str, handler: Callable) -> None
+```
+
+Registers a handler to be called when a message of `event_type` is consumed.
+
+```python
+def off_event(event_type: str, handler: Callable) -> None
+```
+
+Removes a registered handler.
+
+```python
+async def wait_for_event(
+    event_type: str,
+    timeout: float = 60.0,
+    filter_fn: Optional[Callable[[Dict], bool]] = None,
+) -> Optional[Dict[str, Any]]
+```
+
+Polls the `events:{event_type}` stream directly (XREAD, not consumer group) until `filter_fn` matches or timeout elapses. Used by `execute_action()` to race the Redis path against the Socket.IO path.
+
+---
+
+## TaskCancellationManager
+
+**File:** `Agent/Services/task_cancellation_manager.py`
+
+Provides distributed task cancellation via Redis. Supports both standalone Redis and Redis Cluster (auto-detected). Also cleans up device locks stored by `DeviceLockManager` / `CloudPCAccessManager`.
+
+### Redis Keys
+
+| Key | TTL | Purpose |
+|---|---|---|
+| `agent:task:{session_id}:cancel` | 1h | Cancellation signal; presence means cancel |
+| `agent:task:{session_id}:active` | 2h | Active task record; value = `device_id` or `"1"` |
+| `device_lock:{{{device_id}}}` | — | Device lock (hash-tagged); cleaned on unregister if ownership matches |
+
+### Constructor
+
+```python
+TaskCancellationManager(redis_url: str)
+```
+
+Cluster mode is auto-detected by checking for `"clustercfg"` or `"cluster"` in the URL. There is no `cluster_mode` parameter — detection is automatic.
+
+A module-level singleton is available via the async factory:
+
+```python
+async def get_cancellation_manager(redis_url: str = None) -> TaskCancellationManager
+```
+
+### Methods
+
+```python
+async def connect() -> None
+```
+
+Establishes the Redis connection with a 10-second ping timeout. Raises on failure.
+
+```python
+async def close() -> None
+```
+
+Closes the Redis connection.
+
+```python
+async def register_active_task(session_id: str, device_id: str = None) -> None
+```
+
+Sets `agent:task:{session_id}:active` to `device_id` (or `"1"` if no device) with TTL 2h. The stored `device_id` is used later by `unregister_active_task` to perform ownership-aware device lock cleanup.
+
+```python
+async def unregister_active_task(session_id: str) -> None
+```
+
+Deletes both the `active` and `cancel` keys for the session. If a `device_id` was stored and it is not `"1"`, also deletes `device_lock:{{{device_id}}}` — but only if the lock's `session_id` field matches this session (ownership check prevents releasing another session's lock).
+
+```python
+async def is_cancellation_requested(session_id: str) -> bool
+```
+
+Returns `True` if `agent:task:{session_id}:cancel` exists.
+
+```python
+async def request_cancellation(session_id: str) -> bool
+```
+
+Sets `agent:task:{session_id}:cancel` with TTL 1h. Returns `False` if the task is not currently active (no `active` key found).
+
+```python
+async def get_active_tasks() -> list[str]
+```
+
+Scans for all `agent:task:*:active` keys and returns the list of `session_id` values.
+
+### Usage in BrokerAgent
+
+`BrokerAgent._run_chat_with_cancel_watch()` creates a separate asyncio task that polls `is_cancellation_requested()` every 2 seconds:
+
+```python
+async def _cancel_watcher(session_id):
+    while True:
+        await asyncio.sleep(2)
+        if await cancellation_manager.is_cancellation_requested(session_id):
+            # Soft cancel: send STOP to agent inbox
+            await agent.inbox.send("", msg_type="STOP", sender_agent_id="broker")
+            await asyncio.sleep(10)
+            # Hard cancel: forcefully terminate if agent didn't stop
+            agent_task.cancel()
+            break
+```
+
+---
+
+## SandboxHeartbeat
+
+**File:** `Agent/Services/sandbox_heartbeat.py`
+
+Background asyncio task that keeps a Compute V2 sandbox lease alive by periodically calling `POST /compute/heartbeat`. The Backend refreshes the `sandbox:lease:{id}` Redis key (TTL 90s) on each ping so `auto_park_stale` skips live sandboxes.
+
+### Constructor
+
+```python
+SandboxHeartbeat()
+```
+
+No parameters. At most one heartbeat task runs per instance.
+
+### Properties
+
+```python
+@property
+def is_running: bool
+```
+
+`True` if the background task exists and has not completed.
+
+### Methods
+
+```python
+def start(
+    sandbox_id: str,
+    worker_id: str,
+    http_session,
+    backend_url: str,
+    auth_token: Optional[str] = None,
+) -> None
+```
+
+Launches (or restarts) the heartbeat for `sandbox_id`. Cancels any currently running heartbeat first. The background task calls `POST {backend_url}/compute/heartbeat` with body `{sandbox_id, worker_id}` every `_HEARTBEAT_INTERVAL_SECONDS=30` seconds.
+
+```python
+def stop() -> None
+```
+
+Cancels the background task. Safe to call when not running.
+
+### Lifecycle Notes
+
+- All logging is at DEBUG level — no INFO spam per tick.
+- When the agent's `PlanStep.compute` field changes (e.g. from `CLOUD_WORKSTATION` to `USER_PC`), the caller must `stop()` the current heartbeat and `start()` a new one with the new `sandbox_id`.
+- Missed heartbeats are non-fatal; the Backend auto-parks after TTL expiry.
+
+---
+
+## cost_tracking_middleware
+
+**File:** `Agent/Services/cost_tracking_middleware.py`
+
+Shared cost-tracking helpers that eliminate duplication between the LLM `ProviderFactory` and `EmbeddingProviderFactory`. All functions are async and swallow non-billing errors; `BillingLimitReached` is always re-raised.
+
+### `track_api_cost()`
+
+```python
+async def track_api_cost(
+    usage: Dict[str, Any],
+    model_name: str,
+    latency: float,
+    session: Any,
+    session_id: str = "unknown",
+    agent_type: str = "unknown",
+    user_id: Optional[str] = None,
+) -> None
+```
+
+Records cost for a standard LLM API call. Extracts token counts from `usage` (keys: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`, `prompt_tokens_details.cache_write_tokens`). Prefers server-reported USD totals from `usage.cost` / `usage.cost_details` over local pricing. `session` must have `_backend_session`, `_backend_url`, and `_http_session` attributes.
+
+### `track_flat_usd_cost()`
+
+```python
+async def track_flat_usd_cost(
+    model_name: str,
+    usd: float,
+    latency_seconds: float,
+    session: Any = None,
+    session_id: str = "unknown",
+    agent_type: str = "unknown",
+    user_id: Optional[str] = None,
+    backend_session: Any = None,
+    backend_url: Optional[str] = None,
+    http_session: Any = None,
+) -> None
+```
+
+Records a fixed USD amount for a non-token API call (e.g. web search billing units). Passes `server_total_cost_usd=usd` with zero tokens so the pricing math is bypassed.
+
+### `track_web_search_api_cost()`
+
+```python
+async def track_web_search_api_cost(
+    provider: str,
+    context: Any,
+    latency_seconds: float,
+    agent_type: str = "DataFetcherAgent",
+) -> None
+```
+
+Convenience wrapper for Brave or Tavily search spend. Reads cost per call from env:
+- `BRAVE_SEARCH_COST_USD_PER_CALL` (default 0.005)
+- `TAVILY_SEARCH_COST_USD_PER_CALL` (default 0.005)
+
+`context` is typically an `AgentContext` instance; extracts `session_id`, `user_id`, `backend_session`, `backend_url`, `http_session`, and `session_llm` from it. No-op if `context` is `None` or `provider` is unrecognized.

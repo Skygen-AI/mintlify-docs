@@ -1,184 +1,469 @@
 ---
-title: "Chat sessions"
-description: "The conversation container that binds a user, a device, and an agent together."
+title: "Chat Sessions"
+description: "The conversation container — device bindings, agent dispatching, and session lifecycle."
 ---
 
-A **chat session** is the container for one conversation with an agent. It holds the message history, the working memory the agent keeps, and the binding to a specific device. Every user message, every agent reply, every action, every token charge lives in exactly one session.
+A **chat session** is the persistent container for a conversation between a user and the Skygen agent. It holds the message history, binds to a device, and carries the `waiting_for_input` flag that governs whether the composer accepts new messages or shows a confirmation widget.
 
-Sessions can be bound to a device (`device_id` set — the normal case) or "chat-only" (`device_id = null`, no device actions possible).
+## Architecture
 
-## Why sessions matter
+```mermaid
+flowchart TD
+    User["User (browser / desktop app)"] -- "POST /chat-sessions" --> API["Backend"]
+    API -- "stores" --> DB["chat_sessions table"]
+    DB --> Messages["chat_messages\n(role, content, meta_data)"]
+    DB -- "device_id" --> Device["Device\n(REAL_DEVICE / E2B_SANDBOX)"]
+    DB -- "task_sandbox_device_id" --> SessionSandbox["Session Sandbox\n(SESSION_SANDBOX)"]
+    DB -- "paused_device_id" --> PausedDevice["Paused Cloud PC\n(auto-pause memo)"]
+    DB -- "emplogent_id" --> Emplogent["Emplogent (persona)"]
 
-- **Memory scope** — the agent only recalls context from the current session.
-- **Device lock** — when the agent is running, the session holds an exclusive Redis lock on its device so two agents cannot fight over the same mouse.
-- **Billing boundary** — the `/billing/transactions/grouped` endpoint groups all usage by session so you can see what each conversation cost.
-
-## Models
-
-**`ChatSession`** fields: `id`, `user_id`, `device_id` (nullable), `title`, `is_active`, `deleted_at`, `meta_data` (free-form JSON), timestamps. Composite index on `(user_id, device_id, is_active, deleted_at)` makes the common "my active sessions" query cheap.
-
-**`ChatMessage`** fields: `id`, `session_id` (cascade delete), `role`, `content`, `meta_data`, `task_id` (nullable), `created_at`. `attachments` relationship is eager-loaded.
-
-### Message roles
-
-```python
-class MessageRole(str, Enum):
-    user = "user"
-    assistant = "assistant"
-    system = "system"
+    API -- "POST /messages" --> RabbitMQ["RabbitMQ"]
+    RabbitMQ --> Agent["BrokerAgent"]
+    Agent -- "Socket.IO /agent" --> API
+    API -- "Socket.IO /user" --> User
 ```
 
-### What goes in `meta_data`
+## Data model
 
-`meta_data` is the escape hatch where the agent stashes context about a message. Some keys are user-visible, some are internal and filtered before responses.
+Source: `Backend/app/models/chat_sessions.py`
 
-**Filtered before API responses** (never shown to clients):
-- `worker_id`
-- `sub_agent_count`
-- `sleep_seconds`
-- `reasoning`
-- `condition`
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `String(36)` UUID | Primary key |
+| `title` | `String` | Display title (max 200 characters) |
+| `is_active` | `Boolean` | `false` when the session is archived by the user |
+| `meta_data` | `JSON` | Freeform dict; `waiting_for_input` lives here as a derived flag |
+| `device_id` | FK → `devices` | Primary active device; `ON DELETE SET NULL` |
+| `task_sandbox_device_id` | FK → `devices` | Compute V2 session sandbox; `ON DELETE SET NULL` |
+| `paused_device_id` | FK → `devices` | Auto-pause memo for Cloud PC resume; `ON DELETE SET NULL` |
+| `emplogent_id` | FK → `emplogents` | Optional persona injected into agent payload |
+| `user_id` | FK → `users` | Owner; `ON DELETE CASCADE` |
+| `created_at` | `DateTime` | Creation timestamp |
+| `updated_at` | `DateTime` | Last update (auto-updated by SQLAlchemy `onupdate`) |
+| `deleted_at` | `DateTime` | Soft-delete timestamp; `null` means not deleted |
 
-**User-visible**: `source`, `agent_mode`, `display_type`, `render_data`, `status`, and anything else the agent writes.
+### `waiting_for_input`
 
-## Real-time vs persistent events
+This flag is a **derived value** stored in `meta_data.waiting_for_input`, not a standalone column. The `ask_human_state` service recomputes it from the actual `chat_messages` rows:
 
-Not every agent event becomes a `ChatMessage`. Progress updates stream over Socket.IO but are not saved. Only user messages and final assistant responses land in the database.
+- Scans all `role = "assistant"` messages in the session.
+- Sets `waiting_for_input = true` if any message has `meta_data.type == "ask_human"` AND `meta_data.ask_human_action == "request"`.
+- Broadcasts `session_updated` via Socket.IO only when the value changes.
 
-| Event | Saved? | Description |
-|-------|--------|-------------|
-| `USER_MESSAGE` | yes | Your input |
-| `ASSISTANT_MESSAGE` | yes | The final agent reply |
-| `ASK_HUMAN_MESSAGE` | yes | The agent pauses for a decision (see [Confirmations](/concepts/confirmations)) |
-| `STATUS_UPDATE` | no | "thinking", "executing", "hibernated" |
-| `PLAN_UPDATE` | no | The agent's step tree (live) |
-| `MODE_PROGRESS` | no | Per-mode progress (`cua`, `deep_research`, `mcp`, `swe`, `ask_human`) |
-| `ATTACHMENT_READY` | no | File upload completion notice |
-| `BILLING_NOTICE` | no | Live billing alert (token-low, overage) |
+**Never flip `meta_data.waiting_for_input` directly.** Always go through `mark_ask_human_pending` / `mark_ask_human_resolved` in `app/services/ask_human_state.py`.
 
-The live feed stays clean; the database stays an audit log.
+### `ChatSessionRead` schema
+
+```json
+{
+  "id": "session-uuid",
+  "user_id": "user-uuid",
+  "device_id": "device-uuid",
+  "emplogent_id": null,
+  "title": "Book a flight to Tokyo",
+  "is_active": true,
+  "meta_data": { "waiting_for_input": false },
+  "waiting_for_input": false,
+  "created_at": "2026-05-01T10:00:00",
+  "updated_at": "2026-05-08T09:30:00"
+}
+```
+
+`waiting_for_input` at the top level is extracted from `meta_data` by the `@model_validator` in `ChatSessionRead` for convenience.
+
+## API reference
+
+### Create a session
+
+<ParamField path="POST /chat-sessions" type="endpoint">
+Create a new chat session. Optionally bind to a device and/or emplogent at creation time.
+
+**Request body:**
+
+<ParamField body="title" type="string" default="New Chat">
+  Display title. Empty or whitespace-only strings are coerced to `"New Chat"`. Maximum 200 characters.
+</ParamField>
+
+<ParamField body="device_id" type="string | null">
+  Device to bind. Pass empty string to explicitly unbind; the validator converts it to `null`.
+</ParamField>
+
+<ParamField body="emplogent_id" type="string | null">
+  Emplogent (persona) to bind. The persona's system prompt is injected into the agent payload, not into the message history.
+</ParamField>
+
+<ParamField body="meta_data" type="object" default="{}">
+  Initial metadata. Do not pass `waiting_for_input` here; it is managed internally.
+</ParamField>
+
+**Response `201`:** Returns `ChatSessionRead`.
+</ParamField>
+
+### List sessions
+
+<ParamField path="GET /chat-sessions" type="endpoint">
+Returns all non-deleted sessions for the current user, most-recently-updated first.
+
+Optional query parameters:
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `is_active` | bool | Filter by `is_active` flag |
+| `device_id` | string | Filter by bound device |
+| `limit` | int | Page size (default 50) |
+| `offset` | int | Pagination offset |
+
+**Response `200`:** Array of `ChatSessionRead`.
+</ParamField>
+
+### Get a session
+
+<ParamField path="GET /chat-sessions/{session_id}" type="endpoint">
+Returns a single session. Returns `404` if soft-deleted or owned by a different user.
+</ParamField>
+
+### Update a session
+
+<ParamField path="PATCH /chat-sessions/{session_id}" type="endpoint">
+Update title, device binding, `is_active` flag, or arbitrary metadata.
+
+**Request body** (`ChatSessionUpdate` schema):
+
+<ParamField body="title" type="string">New title (1–200 characters).</ParamField>
+<ParamField body="device_id" type="string | null">New device binding. Empty string coerced to `null`.</ParamField>
+<ParamField body="is_active" type="boolean">Archive (`false`) or restore (`true`) the session.</ParamField>
+<ParamField body="meta_data" type="object">Merge patch applied to `meta_data`.</ParamField>
+</ParamField>
+
+### Delete a session
+
+<ParamField path="DELETE /chat-sessions/{session_id}" type="endpoint">
+Soft-delete the session by setting `deleted_at = now()`. Associated messages are NOT deleted. Restore is possible by patching `deleted_at` to `null` via the admin API.
+</ParamField>
 
 ## Message flow
 
+Sending a message to an active session goes through RabbitMQ and the agent worker:
+
 <Steps>
-  <Step title="You POST a message">
-    `POST /sessions/{session_id}/messages` with role, content, and optional metadata.
+  <Step title="POST /messages">
+    The frontend posts `{ session_id, content, agent_mode }`. The backend validates billing access, inserts a `user` role message, and publishes a job to RabbitMQ.
   </Step>
-  <Step title="Pre-flight checks">
-    Client version (if enforcement enabled), billing access (`billing_service.can_user_access`), then task status (auto-resume a completed prior task if relevant).
+  <Step title="BrokerAgent picks up the job">
+    The BrokerAgent worker dequeues the `AgentProcessingPayload`, acquires session and device locks, and routes to the appropriate specialist agent based on `agent_mode`.
   </Step>
-  <Step title="Persist immediately">
-    The message lands in the DB with `role=user`.
+  <Step title="Agent produces a response">
+    The specialist agent runs its reasoning loop (up to `max_iter=100` steps), submits device actions, and streams intermediate progress as `TASK_PROGRESS` events to the frontend.
   </Step>
-  <Step title="Route">
-    If the session is already active (an agent worker is handling a previous message), deliver as a follow-up via Socket.IO directly to the agent's inbox. Otherwise acquire the device lock in Redis and publish to RabbitMQ.
+  <Step title="Response is persisted">
+    The final `assistant` role message is inserted into `chat_messages`. If the agent raised an `ask_human`, the message has `meta_data.type = "ask_human"` and `meta_data.ask_human_action = "request"`.
   </Step>
-  <Step title="Worker picks up">
-    A worker process consumes from the queue, opens a planning loop, calls tools, submits device actions, and streams updates back over the `/user` Socket.IO namespace.
-  </Step>
-  <Step title="Final reply lands">
-    The assistant response is saved to the DB and emitted as `agent_response` on Socket.IO. The device lock releases.
+  <Step title="Session updated event">
+    The backend emits `session_updated` via Socket.IO `/user` namespace with the updated `ChatSessionRead` including the new `waiting_for_input` value.
   </Step>
 </Steps>
 
-### Device locking (Redis)
+## Socket.IO events
 
-For device-bound sessions, `send_to_processing_queue` atomically SETNX-locks the device (`device:{device_id} → {session_id, locked_at, user_id}`). If another session already holds the lock, the request fails with `409 Conflict` and the response includes `active_session_id` so the client can point the user at the right place. Chat-only sessions skip the device lock.
+All session-related events are pushed to the `/user` Socket.IO namespace, keyed by `user_id`.
 
-## Socket.IO `/user` namespace
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `session_updated` | Any session metadata change (including `waiting_for_input` flip) | `ChatSessionRead` |
+| `new_message` | New `chat_messages` row inserted | `{ session_id, message }` |
+| `agent_response` | Agent sends final or streaming response | `{ session_id, content, role, meta_data }` |
+| `task_progress` | In-flight agent progress (step update, tool call result) | `{ session_id, task_id, step, ... }` |
+| `chat_message_meta_updated` | `meta_data` on an existing message changed (e.g., `ask_human_action` flipped to `"answered"`) | `{ session_id, message_id, meta_data }` |
 
-Connect with your JWT:
+## Device bindings
 
-```javascript
-const socket = io("https://api.skygen.ai", {
-  path: "/socket.io",
-  auth: { token: "YOUR_JWT", user_id: "YOUR_USER_ID" }
-});
+### Three FK slots
+
+```mermaid
+flowchart LR
+    S["ChatSession"] -- "device_id\n(active)" --> D1["Device\n(working)"]
+    S -- "task_sandbox_device_id\n(Compute V2)" --> D2["SESSION_SANDBOX\n(parallel)"]
+    S -- "paused_device_id\n(memo)" --> D3["E2B_SANDBOX\n(paused Cloud PC)"]
 ```
 
-Events you will see:
+- **`device_id`** — the primary device the agent sends actions to. Changes when the user connects a different device or a Cloud PC.
+- **`task_sandbox_device_id`** — Compute V2 slot: a `SESSION_SANDBOX` device that runs alongside the primary device within the same session (e.g., an isolated environment for a specific sub-task).
+- **`paused_device_id`** — written only on Cloud PC auto-pause (`reason='paused'`). The backend moves `device_id → paused_device_id` to unbind the session without losing the reference. On resume, `paused_device_id → device_id`.
 
-| Event | Payload (shape) | Persisted? |
-|-------|-----------------|------------|
-| `agent_response` | `{ session_id, message, status, tokens_remaining }` | yes |
-| `ui_meta_update` | `{ session_id, payload: { type, steps / plan / ... } }` | no |
-| `status_update` | `{ session_id, status, content? }` | no |
-| `plan_update` | `{ plan_version, steps[] }` | no |
-| `mode_progress` | `{ mode, stage, status, progress, detail }` | no |
-| `confirmation_request` | `{ input_config: { type, prompt, choices } }` | yes (as ask_human message) |
-| `task_progress` | `{ session_id, progress, status, message }` | no |
-| `device_status_update` | `{ device_id, status }` | n/a |
-| `attachments_ready` | `{ session_id, message_id, attachments[] }` | n/a |
+### Compound index
 
-If you are offline when an event fires, the backend stores it in Redis and replays on reconnect (max 30 seconds per replay task).
+```sql
+CREATE INDEX ix_chat_sessions_user_device_active
+  ON chat_sessions (user_id, device_id, is_active, deleted_at);
+```
+
+Used for the common query pattern: "list active sessions for this user on this device".
+
+## Session lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active : POST /chat-sessions
+    Active --> Archived : PATCH is_active=false
+    Archived --> Active : PATCH is_active=true
+    Active --> SoftDeleted : DELETE /chat-sessions/{id}
+    Archived --> SoftDeleted : DELETE /chat-sessions/{id}
+    SoftDeleted --> Active : admin restore
+```
+
+The `is_active` flag is user-controlled archiving. `deleted_at` is a soft-delete for recovery. Neither cascades to `chat_messages`.
+
+## Composite index and query patterns
+
+The backend retrieves sessions with patterns such as:
+
+```python
+# All active, non-deleted sessions for a user on a specific device
+SELECT * FROM chat_sessions
+WHERE user_id = :user_id
+  AND device_id = :device_id
+  AND is_active = true
+  AND deleted_at IS NULL
+ORDER BY updated_at DESC;
+```
+
+The compound index `ix_chat_sessions_user_device_active` covers this query.
+
+## Gotchas
+
+<Warning>
+**Do not set `meta_data.waiting_for_input` directly.** The field is managed by `app/services/ask_human_state.py`. Writing it directly bypasses the Socket.IO broadcast and will leave the frontend in a stale state. Call `mark_ask_human_pending` / `mark_ask_human_resolved` instead.
+</Warning>
 
 <Note>
-Skygen does **not** stream tokens for assistant replies. The agent sends one complete `agent_response` when it finishes. Use `ui_meta_update`, `status_update`, and `mode_progress` for live progress indication.
+**`emplogent_id` affects agent payload, not message history.** When an emplogent is bound, its system prompt is injected into the `AgentProcessingPayload` sent to the BrokerAgent — it does not appear as a message row. Changing the emplogent mid-session takes effect on the next message.
 </Note>
 
-## Endpoints
+<Note>
+**Soft-delete does not cascade.** Deleting a session does NOT delete its messages. They remain in `chat_messages` with their `session_id` FK intact. This is intentional for audit and billing history.
+</Note>
 
-### Sessions
+## Creating a session (full example)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/sessions` | Create. Body: `{ title, device_id?, meta_data?, reuse_existing? }` |
-| `GET` | `/sessions` | List with pagination. `limit` ∈ [1, 100], default 20. Sorted by `updated_at` DESC. |
-| `GET` | `/sessions/{id}` | Fetch one. |
-| `PATCH` | `/sessions/{id}` | Update `title`, `device_id`, `is_active`, `meta_data`. Title-only updates **preserve** `updated_at` so the sidebar does not re-shuffle. |
-| `DELETE` | `/sessions/{id}` | Soft-delete. Releases device and session locks. |
-| `POST` | `/sessions/{id}/restore` | Un-soft-delete. |
-| `DELETE` | `/sessions/{id}/permanent` | Hard-delete. Cascades to messages, attachments, ratings. |
-| `GET` | `/sessions/{id}/plan` | Latest `plan` payload from system messages. |
-| `GET` | `/sessions/{id}/summary` | Simplified transcript: user messages + final assistant replies, no intermediates. |
+<Steps>
+  <Step title="Create the session">
+    ```bash
+    curl -X POST https://api.skygen.ai/chat-sessions \
+      -H "Authorization: Bearer <token>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "title": "Book a flight to Tokyo",
+        "device_id": "device-uuid"
+      }'
+    ```
+    Returns `ChatSessionRead` with `id`, `waiting_for_input: false`, and the device binding.
+  </Step>
+  <Step title="Send a message">
+    ```bash
+    curl -X POST https://api.skygen.ai/messages \
+      -H "Authorization: Bearer <token>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "session_id": "session-uuid",
+        "content": "Find the cheapest flight to Tokyo on May 20",
+        "agent_mode": "auto"
+      }'
+    ```
+    The message is published to RabbitMQ. The agent picks it up asynchronously.
+  </Step>
+  <Step title="Stream progress">
+    Connect to Socket.IO `/user` namespace and listen for:
+    - `task_progress` — step-by-step action log
+    - `agent_response` — final answer
+    - `session_updated` — if `waiting_for_input` changes
+  </Step>
+  <Step title="Handle confirmations">
+    If `session_updated.waiting_for_input == true`, show the confirmation UI.
+    The user's reply is another `POST /messages` call to the same session.
+  </Step>
+</Steps>
 
-### Messages
+## Message schema
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/sessions/{id}/messages` | Send a message. Triggers queueing or inbox delivery. |
-| `GET` | `/sessions/{id}/messages` | Full transcript, ordered by `created_at ASC`, capped at 5000. Internal `meta_data` keys stripped. |
-| `DELETE` | `/sessions/{id}/messages/{msg_id}` | Remove a single message. |
-| `POST` | `/sessions/{id}/messages/{msg_id}/rate` | Rate a message 1–5 with optional `comment`. Low ratings (≤ 2) trigger a Telegram alert asynchronously. |
-| `GET` | `/sessions/{id}/messages/{msg_id}/rating` | Your existing rating if any. |
+Source: `Backend/app/models/chat_messages.py`
 
-## End to end
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `String(36)` UUID | Primary key |
+| `session_id` | FK → `chat_sessions` | Parent session |
+| `role` | `String` | `"user"` \| `"assistant"` \| `"system"` |
+| `content` | `Text` | Message text |
+| `meta_data` | `JSON` | Structured metadata (see below) |
+| `task_id` | FK → `tasks` | Associated task (optional) |
+| `created_at` | `DateTime` | Timestamp |
+
+### `meta_data` structure
+
+| Key | Present when | Value |
+|-----|-------------|-------|
+| `type` | Agent confirmation | `"ask_human"` |
+| `ask_human_action` | `type == "ask_human"` | `"request"` or `"answered"` |
+| `ui_meta` | Agent step output | `{ step_type, input, ... }` |
+| `status` | Terminal message | `"completed"` \| `"error"` \| etc. |
+| `final_outcome` | Terminal message | `"DONE"` \| `"FAIL"` \| `"CANCELLED"` |
+| `agent_mode` | Any agent message | The mode used for this turn |
+| `safety_violation` | Safety block | `true` |
+
+## Pagination
+
+The default `GET /chat-sessions` response is most-recently-updated-first. For large histories:
 
 ```bash
-# 1. Create a session
-curl -X POST https://api.skygen.ai/sessions \
+# Page 2, 20 sessions per page
+GET /chat-sessions?limit=20&offset=20
+```
+
+Messages within a session are paginated via `GET /messages?session_id=...&limit=50&before=<message_id>`.
+
+## Emplogent binding
+
+An **emplogent** is a custom persona that shapes agent behaviour (system prompt, tone, constraints). When `emplogent_id` is set on a session:
+
+- The emplogent's system prompt is appended to the agent's base system prompt.
+- The emplogent's name and avatar may appear in the UI.
+- Changing `emplogent_id` mid-session via `PATCH /chat-sessions/{id}` takes effect on the **next** message — existing messages in the history are not re-processed.
+
+## SQLAlchemy model
+
+Source: `Backend/app/models/chat_sessions.py`
+
+```python
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid_str, index=True)
+    title = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    meta_data = Column(JSON, default=dict)
+    deleted_at = Column(DateTime, nullable=True)   # soft delete
+
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), ...)
+    device_id = Column(String(36), ForeignKey("devices.id", ondelete="SET NULL"), ...)
+
+    # Parallel SESSION_SANDBOX slot (Compute V2)
+    task_sandbox_device_id = Column(
+        String(36), ForeignKey("devices.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # One-shot memo for Cloud PC auto-pause
+    paused_device_id = Column(
+        String(36), ForeignKey("devices.id", ondelete="SET NULL"), nullable=True
+    )
+
+    emplogent_id = Column(String(36), ForeignKey("emplogents.id", ondelete="SET NULL"), ...)
+
+    __table_args__ = (
+        Index(
+            "ix_chat_sessions_user_device_active",
+            "user_id", "device_id", "is_active", "deleted_at",
+        ),
+    )
+```
+
+## Creating and managing sessions via API
+
+<CodeGroup>
+
+```bash cURL
+# Create a session
+curl -X POST https://api.skygen.ai/chat-sessions \
   -H "Authorization: Bearer $TOKEN" \
-  -d '{"title": "Research task", "device_id": "dev_abc"}'
-# → { "id": "sess_123", "is_active": true, ... }
+  -H "Content-Type: application/json" \
+  -d '{"title": "Quarterly report research", "device_id": "device-uuid"}'
 
-# 2. Subscribe to the user namespace (JS)
-# (see Socket.IO example above)
+# List sessions
+curl https://api.skygen.ai/chat-sessions?limit=20&offset=0 \
+  -H "Authorization: Bearer $TOKEN"
 
-# 3. Send a message
-curl -X POST https://api.skygen.ai/sessions/sess_123/messages \
+# Rename a session
+curl -X PATCH https://api.skygen.ai/chat-sessions/session-uuid \
   -H "Authorization: Bearer $TOKEN" \
-  -H "agent_mode: auto" \
-  -H "client_version: 1.0.0" \
-  -d '{
-    "role": "user",
-    "content": "Navigate to example.com and summarize the homepage."
-  }'
-# → 201 { "id": "msg_456", "display_type": "user_message", ... }
+  -H "Content-Type: application/json" \
+  -d '{"title": "Q2 2026 Research"}'
 
-# 4. Watch `ui_meta_update` / `mode_progress` / `agent_response` stream on the socket.
-
-# 5. Fetch history later
-curl https://api.skygen.ai/sessions/sess_123/messages \
+# Delete a session (soft delete)
+curl -X DELETE https://api.skygen.ai/chat-sessions/session-uuid \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-## Attachments
+```javascript JavaScript
+// Create a session
+const session = await fetch('/chat-sessions', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ title: 'Quarterly report research', device_id: deviceId }),
+}).then(r => r.json());
 
-Attachments hang off messages via `ChatMessage.id` FK (nullable, `ON DELETE SET NULL`). A file uploaded before a message exists can later be linked to one. See [Files and uploads](/guides/screenshots) for the upload flow. Internal metadata is filtered from responses the same way as `meta_data`.
+// List sessions
+const sessions = await fetch('/chat-sessions?limit=20').then(r => r.json());
+
+// Update title
+await fetch(`/chat-sessions/${session.id}`, {
+  method: 'PATCH',
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ title: 'Q2 2026 Research' }),
+});
+```
+
+```python Python
+import httpx
+
+client = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"})
+
+# Create
+session = (await client.post("/chat-sessions",
+    json={"title": "Research", "device_id": device_id})).json()
+
+# List
+sessions = (await client.get("/chat-sessions", params={"limit": 20})).json()
+
+# Patch
+await client.patch(f"/chat-sessions/{session['id']}",
+    json={"title": "Q2 2026 Research"})
+```
+
+</CodeGroup>
+
+## Session lifecycle
+
+A session is active (`is_active = true`) while the device is connected and no terminal event has occurred. Common transitions:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active : POST /chat-sessions
+    Active --> WaitingForInput : agent emits ask_human
+    WaitingForInput --> Active : user replies / OAuth completes
+    Active --> Active : more messages
+    Active --> SoftDeleted : DELETE /chat-sessions/{id}
+    SoftDeleted --> Active : POST /chat-sessions/{id}/restore
+    Active --> [*] : hard delete (cascade)
+```
+
+Sessions are never hard-deleted by the user — only by admin cleanup jobs or explicit cascade when the owning user is deleted.
+
+## Fetching messages in a session
+
+Messages are retrieved separately via the messages endpoint:
+
+```bash
+# Most recent 50 messages in a session
+GET /messages?session_id=session-uuid&limit=50
+
+# Cursor-based pagination (older messages)
+GET /messages?session_id=session-uuid&limit=50&before=message-uuid
+```
+
+Each message has `role` (`user` | `assistant` | `system`), `content` (string), optional `task_id` FK, and `meta_data` JSON.
 
 ## See also
 
-- [Agents](/concepts/agents) — what happens after you send a message
-- [Confirmations](/concepts/confirmations) — the `ask_human` pause
-- [Devices](/concepts/devices) — what sessions bind to
-- [Billing](/concepts/billing) — per-session usage accounting
+- [Confirmations](/concepts/confirmations) — how `waiting_for_input` is set and cleared
+- [Devices](/concepts/devices) — the three device FK slots in detail
+- [Agents](/concepts/agents) — how the BrokerAgent processes messages for a session
+- [Tasks](/concepts/tasks) — the task rows created per agent run
+- [Notifications](/concepts/notifications) — the Socket.IO events that update the UI in real time

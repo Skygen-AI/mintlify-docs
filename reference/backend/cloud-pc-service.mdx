@@ -1,0 +1,481 @@
+---
+title: "CloudPCService"
+description: "E2B sandbox lifecycle, S3 backup/restore, distributed locking, and maintenance sweeper for Cloud Desktop."
+---
+
+## Overview
+
+`CloudPCService` (`app/services/cloud_pc/`) manages the full lifecycle of Cloud PCs — E2B-backed Linux desktop sandboxes that agents use for computer-use tasks. It is composed of four mixins:
+
+| Mixin | File | Responsibility |
+|---|---|---|
+| `LifecycleMixin` | `lifecycle.py` | connect, disconnect, heartbeat, file management, device linking |
+| `LockingMixin` | `locking.py` | per-user/per-cpc Redis op locks, input control ownership |
+| `RecoveryMixin` | `recovery.py` | S3 backup/restore, retention sweep |
+| `MaintenanceMixin` | `maintenance.py` | auto-pause sweeper, stale recovery |
+
+The entry point `cloud_pc_service.py` is a compatibility shim that re-exports from `app.services.cloud_pc`.
+
+**Singleton:** `get_cloud_pc_service()` returns the process-level instance.
+
+**Constructor dependencies:** `E2BSandboxManager`, `CloudPCFileManager`, S3 bucket name, E2B API key.
+
+---
+
+## LifecycleMixin
+
+### CloudPCService.connect()
+
+```python
+async def connect(
+    self,
+    db,
+    user_id: str,
+    cloud_pc_id: Optional[str] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+Connect a user to a Cloud PC. Handles four paths:
+
+1. **Create new** (`cloud_pc_id=None`): checks `max_cloud_pcs` and `max_concurrent_active_cpcs` limits, creates a DB record under a short user-scoped lock, then spins up the E2B sandbox under a per-cpc lock.
+2. **Reconnect to active** (`cloud_pc_id` given, status=ACTIVE): extends E2B TTL and returns connection info.
+3. **Resume from pause** (`cloud_pc_id` given, status=PAUSED): reconnects E2B, restarts stream, emits `cloud_pc_online_for_user` to wake hibernated agent sessions.
+4. **Recreate terminated** (`cloud_pc_id` given, status in stale set): optionally kills orphan sandbox, creates a fresh one, optionally restores from S3 backup.
+
+<ResponseField name="db" type="AsyncSession" required>SQLAlchemy async session.</ResponseField>
+<ResponseField name="user_id" type="str" required>User UUID string.</ResponseField>
+<ResponseField name="cloud_pc_id" type="str">Existing Cloud PC UUID for reconnect/resume. Omit to create a new one.</ResponseField>
+<ResponseField name="name" type="str">Optional display name for a new Cloud PC.</ResponseField>
+
+**Returns:** `{"status": str, "cloud_pc_id": str, "stream_url": str, "auth_key": str, "message": str}`
+
+**Raises:**
+- `ValueError` — Cloud PC not found, limit reached, or creation timed out (>120s)
+- `HTTPException 409` — concurrent-active limit reached (includes `paused_cpcs` list in detail)
+- `CloudPCOperationInProgress` — operation lock already held (surfaced as 409 by router)
+
+**Side effects:** Creates `cloud_pcs` row, starts E2B sandbox, links Device, emits `cloud_pc_status_changed` via Socket.IO `/user`, emits `cloud_pc_online_for_user` via Socket.IO `/agent`.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — POST `/cloud-pc/connect`, `services/scheduled_task_service.py:_ensure_cloud_pc_running()`.
+
+```python
+svc = get_cloud_pc_service()
+result = await svc.connect(db, user_id=str(current_user.id))
+stream_url = result["stream_url"]
+```
+
+---
+
+### CloudPCService.disconnect()
+
+```python
+async def disconnect(
+    self, db, user_id: str, cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Graceful disconnect: reconciles billing, backs up `/home/user/` to S3, pauses the E2B sandbox. Falls back to terminate if pause fails. Releases Redis access locks and emits `cloud_pc_session_released` to all bound chat sessions.
+
+**Returns:** `{"status": "paused" | "terminated", "message": str, "backed_up": bool}`
+
+**Side effects:** S3 backup, updates `cloud_pcs` status to PAUSED or TERMINATED, calls `_release_session_bindings()`, emits Socket.IO events.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — POST `/cloud-pc/disconnect`, `MaintenanceMixin.auto_pause_check()`.
+
+---
+
+### CloudPCService.heartbeat()
+
+```python
+async def heartbeat(
+    self,
+    db,
+    user_id: str,
+    is_active: bool = False,
+    cloud_pc_id: Optional[str] = None,
+) -> None
+```
+
+Updates `last_activity_at` and extends the E2B sandbox TTL. If `is_active=True`, also updates `last_interaction_at` (resets the idle timer). Detects dead sandbox (E2B unreachable) and transitions the Cloud PC to ERROR status, notifying the frontend.
+
+<ResponseField name="is_active" type="bool">True if the user had real mouse/keyboard interaction since the last heartbeat. Controls idle auto-pause behavior.</ResponseField>
+
+**Raises:** `ValueError("sandbox_lost")` if E2B sandbox cannot be reached.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — POST `/cloud-pc/heartbeat`.
+
+---
+
+### CloudPCService.record_user_interaction()
+
+```python
+async def record_user_interaction(
+    self, db, user_id: str, cloud_pc_id: Optional[str] = None
+) -> None
+```
+
+Records a user interaction event (file operation, take-control, etc.) to reset the max-idle auto-pause timer.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — POST `/cloud-pc/interaction`.
+
+---
+
+### CloudPCService.get_status()
+
+```python
+async def get_status(
+    self, db, user_id: str, cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Returns the current Cloud PC status from DB. Recovers stale transitional states (CREATING/RESUMING stuck >5 minutes → TERMINATED).
+
+**Returns:** Dict with `status`, `cloud_pc_id`, `sandbox_id`, `stream_url` (null unless ACTIVE), `last_backup_at`, `backup_size_bytes`, `paused_at`, `last_activity_at`, `total_active_seconds`, `linked_device_id`, `controller`.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — GET `/cloud-pc/status`.
+
+---
+
+### CloudPCService.list_cloud_pcs()
+
+```python
+async def list_cloud_pcs(
+    self, db, user_id: str, include_deleted: bool = False
+) -> list
+```
+
+Returns all Cloud PCs for a user, applying stale transitional recovery (age >5 minutes → TERMINATED). Checks Redis for `device_lock:{linked_device_id}` to populate `is_agent_active`.
+
+**Returns:** List of dicts with `cloud_pc_id`, `name`, `status`, `stream_url`, `created_at`, `last_activity_at`, `linked_device_id`, `is_agent_active`, `backup_size_bytes`, `last_backup_at`, `deleted_at`.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — GET `/cloud-pc/list`.
+
+---
+
+### CloudPCService.get_max_cloud_pcs()
+
+```python
+async def get_max_cloud_pcs(self, db, user_id: str) -> int
+```
+
+Maximum number of Cloud PCs (alive, including paused) allowed for the user. Read from `plan.features_config["max_cloud_pcs"]`. Default: 1.
+
+---
+
+### CloudPCService.get_max_concurrent_active_cpcs()
+
+```python
+async def get_max_concurrent_active_cpcs(self, db, user_id: str) -> int
+```
+
+Maximum simultaneously-active (sandbox-holding) Cloud PCs. Read from `plan.features_config["max_concurrent_active_cpcs"]`. Paused CPCs do not consume a slot. Legacy subs without the explicit key get a per-plan-name default (Free/Lite=1, Pro=2, Enterprise=5). Default: 1.
+
+---
+
+### CloudPCService.reconcile_billing()
+
+```python
+async def reconcile_billing(self, db, user_id: str, cloud_pc) -> bool
+```
+
+Calculates elapsed minutes since `billing_last_charged_at` and calls `billing_service.deduct_tokens_for_cloud_pc()`. Resets `billing_last_charged_at` to `None` after successful deduction. No-op if `BILLING_ENABLED=False`.
+
+**Returns:** `True` on success or if billing is disabled, `False` on deduction failure.
+
+**Called by:** `disconnect()`, `MaintenanceMixin.auto_pause_check()`.
+
+---
+
+## File management methods
+
+All file methods resolve the active sandbox before delegating to `CloudPCFileManager`.
+
+### CloudPCService.list_files()
+
+```python
+async def list_files(
+    self, db, user_id: str, path: str = "/home/user", cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Lists directory contents in the active sandbox.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — GET `/cloud-pc/files`.
+
+---
+
+### CloudPCService.publish_output_files()
+
+```python
+async def publish_output_files(
+    self, db, user_id: str, session_id: str, cloud_pc_id: Optional[str] = None
+) -> list
+```
+
+Publishes all files from `/home/user/output/` to persistent S3. Returns list of published file metadata. Returns `[]` on any failure (safe to call unconditionally).
+
+**Called by:** `routers/message/service.py` — after agent completes.
+
+---
+
+### CloudPCService.publish_specific_files()
+
+```python
+async def publish_specific_files(
+    self, db, user_id: str, session_id: str, file_paths: list
+) -> list
+```
+
+Publishes specific files by path (from agent's `emitted_files`). Resolves the Cloud PC bound to `session_id` via `ChatSession.device_id → CloudPC.linked_device_id` to target the correct sandbox in multi-CPC setups.
+
+**Called by:** `routers/message/service.py` — agent emitted_files forwarding.
+
+---
+
+### CloudPCService.download_file()
+
+```python
+async def download_file(
+    self, db, user_id: str, file_path: str, cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Reads a file from the sandbox, uploads to S3 temp key, returns a presigned GET URL. Falls back to S3 cache if the sandbox is not active.
+
+**Called by:** `routers/cloud_pc/cloud_pc_router.py` — GET `/cloud-pc/files/download`.
+
+---
+
+### CloudPCService.get_upload_url()
+
+```python
+async def get_upload_url(
+    self, db, user_id: str, dest_path: str, filename: str, cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Generates a presigned S3 POST URL for direct client upload.
+
+---
+
+### CloudPCService.upload_callback()
+
+```python
+async def upload_callback(
+    self, db, user_id: str, s3_key: str, dest_path: str, cloud_pc_id: Optional[str] = None
+) -> None
+```
+
+After the frontend uploads a file to S3, moves it into the sandbox at `dest_path`.
+
+---
+
+### CloudPCService.delete_file()
+
+```python
+async def delete_file(
+    self, db, user_id: str, file_path: str, cloud_pc_id: Optional[str] = None
+) -> None
+```
+
+Deletes a file or directory from the sandbox.
+
+---
+
+### CloudPCService.copy_attachment_to_sandbox()
+
+```python
+async def copy_attachment_to_sandbox(
+    self, db, user_id: str, attachment_id: str, cloud_pc_id: Optional[str] = None
+) -> dict
+```
+
+Copies an uploaded attachment from the S3 attachments bucket into the sandbox at `/home/user/output/`.
+
+**Returns:** `{"status": "ok", "file_path": str, "filename": str, "size": int}`
+
+**Raises:** `FileNotFoundError` — attachment not found. `ValueError` — access denied.
+
+---
+
+## Device linking
+
+### CloudPCService.link_as_device()
+
+```python
+async def link_as_device(
+    self, db, user_id: str, cloud_pc_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Creates a `Device(type=E2B_SANDBOX)` row for this Cloud PC and links it via `cloud_pcs.linked_device_id`. Each CPC owns exactly one Device (enforced by unique index). Idempotent if the device already exists.
+
+**Returns:** `{"device_id": str, "device_name": "Cloud PC"}`
+
+**Raises:** `HTTPException 409` on unique-index race.
+
+**Side effects:** Inserts `devices` row, updates `cloud_pcs.linked_device_id`, commits.
+
+---
+
+### CloudPCService.heal_user_cloud_pcs()
+
+```python
+async def heal_user_cloud_pcs(self, db, user_id: str) -> Dict[str, int]
+```
+
+Idempotent migration helper for pre-Этап-1 shared-device state. Detects Cloud PCs sharing a single `linked_device_id` and splits them — each loser gets a new Device row. Also detaches chat sessions pointing to the old shared device.
+
+**Returns:** `{"shared_devices_split": int, "chat_sessions_detached": int}`
+
+**Called by:** `connect()` on first post-flag-flip request (gated on `MULTI_PARALLEL_CLOUD_PC_ENABLED`).
+
+---
+
+### CloudPCService.unlink_device()
+
+```python
+async def unlink_device(
+    self, db, user_id: str, cloud_pc_id: Optional[str] = None
+) -> None
+```
+
+Soft-deletes the linked Device row and clears `cloud_pcs.linked_device_id`.
+
+---
+
+## LockingMixin
+
+### CloudPCService._user_operation_lock()
+
+```python
+@asynccontextmanager
+async def _user_operation_lock(self, user_id: str)
+```
+
+Per-user/per-cpc distributed Redis lock (`cloud_pc:op_lock:{user_id}`, 90s TTL). Uses a unique `lock_id` + Lua compare-and-delete to prevent cross-pod accidental release. Background heartbeat renews TTL every 30s during long operations (e.g. S3 backup).
+
+**Raises:** `CloudPCOperationInProgress` if lock cannot be acquired within 5 attempts (~5s).
+
+---
+
+### CloudPCService.acquire_control()
+
+```python
+async def acquire_control(self, user_id: str, controller: str) -> bool
+```
+
+Acquires exclusive input control of the Cloud PC (`"user"` or `"agent"`). Uses Redis SETNX with 120s TTL. Blocked if a finalizing flag is set (prevents phantom agent control after session ends).
+
+**Returns:** `True` if acquired, `False` otherwise.
+
+**Side effects:** Emits `cloud_pc_control_changed` via Socket.IO.
+
+**Called by:** `routers/agent/device_control.py`, `Agent/CUA_Agents/`.
+
+---
+
+### CloudPCService.release_control()
+
+```python
+async def release_control(self, user_id: str, controller: str) -> bool
+```
+
+Atomically releases control only if `controller` matches the current holder (Lua compare-and-delete).
+
+**Returns:** `True` if released, `False` if not the current holder.
+
+**Side effects:** Emits `cloud_pc_control_changed(null)` via Socket.IO.
+
+---
+
+### CloudPCService.get_controller()
+
+```python
+async def get_controller(self, user_id: str) -> Optional[str]
+```
+
+Returns current controller (`"user"`, `"agent"`, or `None`).
+
+---
+
+### CloudPCService.renew_control()
+
+```python
+async def renew_control(self, user_id: str, controller: str) -> bool
+```
+
+Extends the control TTL to 120s, only if `controller` matches the current holder.
+
+---
+
+### CloudPCService.mark_finalising()
+
+```python
+async def mark_finalising(self, user_id: str) -> None
+```
+
+Sets a 5-second Redis flag to block concurrent agent `acquire_control` calls during session finalization. Best-effort — Redis errors are swallowed.
+
+---
+
+## RecoveryMixin
+
+### CloudPCService._backup_to_s3()
+
+```python
+async def _backup_to_s3(
+    self, user_id: str, sandbox, cloud_pc_id: str = ""
+) -> Tuple[str, int]
+```
+
+Creates `tar.gz` of `/home/user/` inside the sandbox (excluding caches), uploads to `cloud-pc-profiles/{user_id}/{cloud_pc_id}/latest.tar.gz`, makes a timestamped copy, and prunes old backups (keeps last 3).
+
+**Returns:** `(s3_key, size_bytes)`. 
+
+**Raises:** `RuntimeError` if tar exits with code ≥2. `ValueError` if backup exceeds `CLOUD_PC_MAX_BACKUP_SIZE_MB`.
+
+---
+
+### CloudPCService._restore_from_s3()
+
+```python
+async def _restore_from_s3(
+    self, user_id: str, sandbox, s3_key: str
+) -> None
+```
+
+Downloads S3 backup and extracts into `/home/` inside the sandbox. Cleans up Chromium lock files after extraction.
+
+---
+
+### CloudPCService.retention_paused_check()
+
+```python
+async def retention_paused_check(self, db) -> None
+```
+
+Terminates Cloud PCs that have been paused longer than `CLOUD_PC_PAUSED_RETENTION_DAYS` (default: 30 days). Best-effort kills orphan sandboxes before termination. Emits `cloud_pc_status_changed(terminated, reason="retention_expired")` via Socket.IO.
+
+---
+
+## MaintenanceMixin
+
+### CloudPCService.auto_pause_check()
+
+```python
+async def auto_pause_check(self, db) -> None
+```
+
+Called once per minute from `app/main.py` background task. Uses Redis SETNX to ensure only one pod runs per cycle.
+
+Performs in order:
+1. **Inactivity pause sweep** — pauses Cloud PCs where `last_activity_at` is older than `CLOUD_PC_AUTO_PAUSE_MINUTES`
+2. **Idle sweep** — pauses Cloud PCs with heartbeat but no real interaction older than `CLOUD_PC_MAX_IDLE_MINUTES`. Skips if `device_lock:{linked_device_id}` is held (agent active), unless the lock appears stale (age >30 minutes)
+3. **Orphan sandbox pruning** — removes stale `_active_sandboxes` cache entries for terminated CPCs
+4. **Stale transitional recovery** — CPCs stuck in CREATING/RESUMING/RESTORING/PAUSING for >10 minutes → TERMINATED (skips if user op lock is held)
+5. **Stale ERROR recovery** — attempts E2B reconnect for CPCs in ERROR >5 minutes; falls back to TERMINATED
+6. **Retention sweep** — delegates to `retention_paused_check()`
+
+**Side effects:** May call `disconnect()`, emit Socket.IO events, kill orphan E2B sandboxes.

@@ -1,170 +1,246 @@
 ---
-title: "Ask-human (ARCH-001)"
-description: "How an agent asks the user a question, hibernates the worker, and resumes when the user replies — end-to-end across agent, backend, and frontend."
+title: "Ask Human / Confirmations"
+description: "How Skygen agents pause execution and request user input mid-task, including the hibernate/wake lifecycle."
 ---
 
-Ask-human is how an agent **asks** the user mid-task — a free-text question, a choice between options, a yes/no confirmation, or an MCP connect prompt. The agent does **not** block a worker: it writes a hibernation blob to Redis, exits the ReAct loop, and wakes when the user's reply arrives as a regular chat message. This is the ARCH-001 successor to the old blocking `AgentConfirmationService` path (see [Confirmations](/concepts/confirmations) for the legacy flow kept for back-compat).
+## Overview
 
-## Why hibernate instead of block
+When a Skygen agent encounters a situation that requires human judgment — a missing credential, an ambiguous instruction, or a permission gate — it suspends itself and surfaces a structured prompt in the chat interface. The user provides the answer, and the agent resumes exactly where it left off. This is called the **ask-human** pattern, implemented through the hibernate/wake lifecycle in the agent runtime.
 
-The agent worker is a shared resource — one Python process serving many tasks. If a worker blocks on `await user_response_future`, that worker slot is gone until the user answers (often minutes, sometimes never). Under load, waiting on N humans parks N workers. Hibernation decouples "the task is waiting for a human" from "a worker is holding the task in memory":
+Unlike a naive polling loop, ask-human uses Redis-backed sentinel tasks. The agent pod exits its worker loop, persists state, and consumes zero CPU while waiting. A waker process monitors the sentinel store and re-enqueues the agent as soon as the wake condition is satisfied.
 
-1. Agent writes hibernation blob to Redis and **returns from the ReAct loop**.
-2. Worker slot is free to pick up the next task.
-3. User reply lands in `message_router.send_message` like any other chat message.
-4. Backend atomically claims the hibernation blob (`HDEL`) and publishes a resume payload.
-5. **Any** worker (not necessarily the original one) picks up the resume, rehydrates state from the blob, and continues the ReAct loop.
+---
 
-Pool utilization stays flat regardless of how long humans take.
+## When ask-human triggers
 
-## Input types
+The agent calls `communicate(wait_for_reply=True)` when it decides it cannot proceed safely or correctly without user input. Concrete situations:
 
-A single `AskHumanInput` schema covers every ask surface:
+- **Missing MCP connection** — the task requires a Gmail or Slack toolkit that is not yet connected. The agent emits an `mcp_connect_prompt` card with an OAuth button.
+- **Cloud PC not running** — the task needs a Cloud PC session but none is active for the user. The agent emits a `start_cloud_pc_prompt` card.
+- **Text input required** — the agent needs a value it cannot infer: a password, a URL, a choice among multiple options.
+- **Safety clarification** — the guardrail pipeline returned `NEED_HUMAN_CLARIFICATION` and the agent needs explicit permission before continuing.
+- **Sub-agent confirmation** — a child agent (CUA Orchestrator, MCPToolsAgent) needs approval from the parent BrokerAgent to take a destructive action.
 
-| `type` | UX | Answer source |
-|---|---|---|
-| `text` | TaskInput placeholder = "Reply to the agent…" | User types free text and presses Send |
-| `multiline` | Same as `text` | User types multi-line free text |
-| `choice` | Chip buttons above the TaskInput | Click sends the chip `label` as the answer (free text also works) |
-| `confirmation` | Yes / No pills above the TaskInput | Yes sends `"Yes"`; No cancels the task |
-| `mcp_connect_prompt` | Provider cards inline in the chat bubble | User connects an integration |
+---
 
-The schema:
+## What the user sees
 
-```ts
-interface AskHumanInput {
-  type: "text" | "choice" | "multiline" | "confirmation" | "mcp_connect_prompt";
-  action_id: string;
-  prompt: string;
-  placeholder?: string | null;
-  choices: ChoiceOption[];           // non-empty when type === "choice"
-  required: boolean;
-  validation?: string | null;        // regex for text/multiline
-}
+When ask-human is active, the chat interface enters a distinctive state:
 
-interface ChoiceOption {
-  value: string;
-  label: string;
-}
-```
+1. The message composer shows the ask-human input card instead of the normal text box.
+2. The session sidebar shows a pulsing badge indicating the session is waiting for input.
+3. The `session.meta_data.waiting_for_input` flag is set to `true` and broadcast via Socket.IO `session_updated` to all connected browser tabs.
 
-## End-to-end flow
+The input card varies by type:
+
+| Card type | `input.type` | User action |
+|-----------|-------------|-------------|
+| Free text | `input` | Type and submit a reply |
+| Choice | `choice` | Select from a list of options |
+| MCP connect | `mcp_connect_prompt` | Click the OAuth button for a toolkit |
+| Cloud PC start | `start_cloud_pc_prompt` | Click to provision a Cloud PC session |
+
+The backend stores each ask-human request as a `ChatMessage` row with `meta_data.type = "ask_human"` and `meta_data.ask_human_action = "request"`. This is the source of truth — `waiting_for_input` is always derived from these rows, never managed imperatively.
+
+---
+
+## How to respond
 
 <Steps>
-  <Step title="Agent emits a terminal ask_human action">
-    `BaseAgent` Gate 1 classifies the action as terminal. Terminal actions are:
-    - `hibernate_and_watch`
-    - `communicate` where `message_type ∈ {result, ask_text, ask_choice}`
-    - `request_confirmation`
-
-    Non-terminal actions in the same step execute normally; exactly one terminal action ends the loop.
+  <Step title="Read the agent's question">
+    The chat message explains what information is needed and why. For MCP connect cards, a Connect button appears. For text prompts, a text field appears inline.
   </Step>
-  <Step title="Hibernation Store writes the blob">
-    `Utilities/Hibernation/Store.py` serializes the agent's resumable state (conversation, pending tool calls, memory) and writes it to Redis under `TASK_DATA_HASH` keyed by `task_id`. Input metadata (type, choices, prompt) goes with it.
+  <Step title="Provide your answer">
+    Type your response in the ask-human composer and press Send. For OAuth cards, click the Connect button — the OAuth flow runs in the same tab and on completion the agent wakes automatically.
   </Step>
-  <Step title="Agent exits the ReAct loop">
-    The worker returns. No `await`, no blocking. The slot is immediately reusable.
-  </Step>
-  <Step title="Backend transforms to display_message">
-    `ui_meta_update → display_transformer → display_message` produces a payload with `display_type = "ask_human_message"` and `render_data.input_config` carrying the full `AskHumanInput`. The transformer persists the message to the DB and fans out over Socket.IO `/user`.
-  </Step>
-  <Step title="Frontend renders two surfaces">
-    - **In the chat**: `AskHumanMessage` — a read-only bubble with a gradient border and a `Waiting` badge. No interactive controls here (except `mcp_connect_prompt`, which stays inline because provider cards do not fit in the bottom bar).
-    - **Above the TaskInput**: `AskHumanQuickReply` — chips for `choice`, Yes/No pills for `confirmation`, nothing for `text` / `multiline` (the TaskInput itself is the reply surface).
-
-    The TaskInput picks up `askHumanMode` styling (gradient border) and the placeholder `Reply to the agent…`.
-  </Step>
-  <Step title="User replies">
-    On chip click, text submit, or Yes-press, the frontend calls `submitInlineAskHuman(value)` — which sends the answer as a **regular chat message** via `storeSendMessage`. No special API. The agent sees the user's answer as if the user typed it.
-  </Step>
-  <Step title="Backend atomically claims and resumes">
-    `message_router.send_message` detects a pending hibernation blob for the session, calls `HibernationStore.ClaimForWake(task_id)` (backed by Redis `HDEL` — atomic, single-claim), and publishes `ResumeHibernationPayload`. Any worker picks it up, rehydrates the agent state from the blob, and re-enters the ReAct loop with the user's reply as the next observation.
-  </Step>
-  <Step title="Frontend marks the question answered">
-    The next user message after an `ask_human_message` marks the ask-human as answered (derivation in `ChatPage`). The bubble's badge switches from `Waiting` to `Answered`, the `AskHumanQuickReply` bar disappears, and the TaskInput returns to its normal placeholder.
+  <Step title="Wait for the agent to resume">
+    After submitting, the composer returns to its normal state and the agent re-activates. The session badge clears. The agent continues from the step where it paused, injecting your answer as a user message into its context.
   </Step>
 </Steps>
 
-## Atomicity — why single-claim matters
+---
 
-The Socket.IO fan-out broadcasts `message_router.send_message` events across all backend pods subscribed to the same user. Without a distributed claim, every pod that receives the fan-out would try to resume the task — the user would get N duplicate "I'm back" replies, one per pod.
+## The hibernate/wake lifecycle
 
-`ClaimForWake` uses Redis `HDEL` as the claim primitive:
+### Hibernation
+
+When `communicate(wait_for_reply=True)` executes, the BrokerAgent calls `HibernationController.Hibernate()` which:
+
+1. Selects a **strategy** from the registry based on the config dict the agent emitted (e.g., `user_reply` for text input, `mcp_oauth` for OAuth-gated waits).
+2. Creates a `SentinelTask` record with a unique ID, session/user/device IDs, the strategy config, and an expiry time (`expires_at = now + timeout_seconds`, default **300 seconds / 5 minutes**).
+3. Writes the task to a Redis sorted set (`hibernation:tasks`) with `next_check_at` as the score.
+4. Checks for a **race-window replay**: if an MCP OAuth callback arrived while the agent was still executing the LLM turn that produced this hibernate, a `pending_user_wake` key is present in Redis. If found, the task is immediately claimed and woken.
+5. The agent worker loop exits — the pod thread is freed.
 
 ```python
-async def ClaimForWake(self, task_id: str) -> bool:
-    removed = await self.redis.hdel(self.TASK_DATA_HASH, task_id)
-    return bool(removed)  # exactly one caller sees True
+# Simplified — see Agent/Utilities/Hibernation/Controller.py
+task = await controller.Hibernate(
+    session_id=session_id,
+    user_id=user_id,
+    device_id=device_id,
+    config={"strategy": "user_reply", "timeout": 300},
+)
 ```
 
-Only the pod whose `HDEL` returns non-zero publishes the resume. The rest see `False` and drop the event silently.
+### Sentinel monitoring
 
-## Frontend state derivation
+A background loop (the **Sentinel**) iterates the Redis sorted set on a timer. For each overdue task it evaluates the strategy's `ShouldWake()` method. If the condition is not yet met and the task has not expired, it reschedules. If expired, it publishes a timeout wake to let the agent terminate gracefully.
 
-No extra Zustand state. Two pure derivations over `displayMessages`:
+### Waking
 
-- **`submittedAskHumanIds`** — the set of ask-human message ids that have been superseded. An ask-human is superseded either by a user reply that follows it, or by a **newer** ask-human before the user has answered (the agent moved on). Rendered bubbles get `isSubmitted={true}` → badge flips to `Answered`.
-- **`activeAskHuman`** — the most recent ask-human with no user reply after it, and not of type `mcp_connect_prompt`. Drives `AskHumanQuickReply` and the `askHumanMode` styling on `TaskInput`.
+Wake can be triggered by multiple paths:
 
-Both survive reload: the DB has the full message history with `display_type` and `render_data`, so on fresh load the same derivation recomputes the same state.
+| Trigger | Function called |
+|---------|----------------|
+| User submits a reply | `WakeSession(session_id, reason=reply_text)` |
+| MCP OAuth completes | `WakeUserSessions(user_id, reason="mcp_connect_completed")` |
+| Cloud PC becomes active | `mark_user_cloud_pc_resolved(user_id)` then wake |
+| Sentinel timeout fires | Internal wake with `reason="timeout"` |
+| Admin force-wake | `Wake(task_id)` |
 
-## Which surface to answer in
+All wake paths use atomic Redis `HDEL` to claim the task before publishing, preventing multiple agent pods from waking the same session simultaneously when a broadcast event is received by all pods.
 
-| `input.type` | Interactive surface | Why |
-|---|---|---|
-| `text`, `multiline` | **TaskInput** (bottom bar) | A free-text field is already there. Placeholder changes to `Reply to the agent…`, border gets the ask-human gradient. |
-| `choice` | **Chips** above TaskInput. User can also type free text in TaskInput. | Parity with legacy `QuickReplyButtons`. Sending label text (not an opaque id) keeps the agent-facing answer semantically meaningful. |
-| `confirmation` | **Yes / No pills** above TaskInput | Yes → `"Yes"`. No → cancel the task (same behavior as the legacy reject path). |
-| `mcp_connect_prompt` | **Inline card in the chat bubble** | Provider cards do not fit in the bottom bar, and the flow is distinct — user is connecting an integration, not replying to a question. |
+```python
+# Wake a specific session
+woken = await controller.WakeSession(session_id, reason="User replied: yes")
 
-## Sending the chip label, not the value
+# Wake all sessions for a user (e.g., after OAuth)
+sessions_woken = await controller.WakeUserSessions(user_id, reason="gmail connected")
+```
 
-Choice chips send `choice.label` (with `choice.value` as a fallback), matching the legacy `QuickReplyButtons` contract. Two reasons:
+After a wake, the waker publishes the original payload plus the wake reason back to the BrokerAgent's input queue. The agent resumes the worker loop with the wake reason injected as context.
 
-1. **Semantic parity.** The agent sees the user's answer as a plain chat message. If we send an opaque id (`"opt1"`), the agent would have to reverse-lookup the label to understand the decision. Sending the label that the user saw on the button is what the agent would expect from a user typing their answer.
-2. **Defensive.** If the backend emits an empty `value`, the downstream `trim()` in `submitInlineAskHuman` would silently drop the answer. `label` is the human-visible string and always non-empty in practice.
+---
 
-## Files of interest
+## ask_human_state module
 
-**Agent**
-- `Agents/BaseAgent/base.py` — Gate 1 terminal-action classification
-- `Utilities/Hibernation/Store.py` — Redis blob storage and `ClaimForWake`
+The backend module `app/services/ask_human_state.py` owns the `waiting_for_input` flag lifecycle:
 
-**Backend**
-- `app/services/display_transformer.py` — `ui_meta_update → display_message`
-- `app/routers/message/message_router.py` — detects the pending blob and publishes `ResumeHibernationPayload`
-- `app/socketio/agent.py` — agent subscription / resume-payload delivery
+- `mark_ask_human_pending(session_id)` — called after a new ask_human ChatMessage row is inserted; triggers `_recompute_and_emit`.
+- `mark_ask_human_resolved(session_id, kind="any")` — flips matching `ask_human_action` from `"request"` to `"answered"` and recomputes. `kind` can filter to a specific input type.
+- `mark_user_mcp_connect_resolved(user_id, toolkit)` — resolves only the `mcp_connect_prompt` rows for that specific toolkit across all user sessions.
+- `mark_user_cloud_pc_resolved(user_id)` — resolves all `start_cloud_pc_prompt` rows for the user.
 
-**Frontend** (`ui-shared-tauri`)
-- `src/types/display.ts` — `AskHumanInput`, `ChoiceOption`, `DisplayMessage`
-- `src/hooks/useChatWebSocket.ts` — `display_message` handler, writes `ask_human_message` into the store
-- `src/hooks/useChatSend.ts` — `submitInlineAskHuman` (sends the answer as a regular chat message, guards against empty values)
-- `src/pages/ChatPage.tsx` — `activeAskHuman` and `submittedAskHumanIds` derivations
-- `src/components/chat/InputPanel.tsx` — wires `AskHumanQuickReply` above the `TaskInput`
-- `src/components/messages/AskHumanMessage.tsx` — read-only bubble (header + badge + text + optional MCP prompt)
-- `src/components/messages/AskHumanQuickReply.tsx` — chips / Yes-No pills above the TaskInput
+`_recompute_and_emit` queries the database for any remaining pending ask_human rows and updates `session.meta_data.waiting_for_input`. It emits `session_updated` via Socket.IO only when the flag actually changes — avoiding spurious UI flickers.
 
-## Gotchas
+Additionally, it emits `chat_message_meta_updated` per resolved message row so the frontend can drop ask-human styling without a reload.
 
-<Warning>
-**Store content-dedup can swallow the ask_human upgrade.** `messageSlice.addMessage` deduplicates by `role + content` within a 60s window. If the backend emits a partial `assistant_message` with the same question text **before** the final `ask_human_message`, the second event is dropped as a duplicate and `display_type` never upgrades — chips only appear after a refresh re-reads from the DB. Either the backend must stop emitting the interim `assistant_message`, or the store dedup must allow a `display_type` upgrade. Under investigation.
-</Warning>
+---
 
-<Note>
-**Text replies while on a choice question.** The TaskInput remains usable while chips are showing — the user can type a custom answer if none of the chips fits. The submit path goes through `submitInlineAskHuman` just like a chip click.
-</Note>
+## Timeout behavior
 
-<Note>
-**Rejecting a confirmation cancels the task.** This matches the legacy `QuickReplyButtons` behavior — a `No` on a risk confirmation is treated as "stop, do not proceed," not as a negative answer that the agent processes. Use `text` / `choice` if the agent should continue with a negative response.
-</Note>
+The default timeout is **300 seconds (5 minutes)**. This is configurable per hibernate strategy. When the timeout fires:
 
-<Note>
-**The legacy `QuickReplyButtons` / `useConfirmations` path is still wired.** It is driven by the old `ConfirmationRequest` Redis record and handled by `approveConfirmation` / `rejectConfirmation`. On ARCH-001 flows `activeConfirmation` is always `null`, but both paths coexist until the legacy code is removed.
-</Note>
+- The agent is woken with `reason="timeout"`.
+- The agent's termination guard recognizes the timeout reason and terminates the session with an appropriate user-facing message.
+- All pending ask_human rows are marked resolved via `mark_ask_human_resolved`.
 
-## See also
+If the user has multiple browser tabs open, all tabs reflect the session state change within milliseconds via Socket.IO broadcasts.
 
-- [Confirmations](/concepts/confirmations) — the blocking, legacy `AgentConfirmationService` path that ask-human replaces
-- [Agents](/concepts/agents) — the ReAct loop, terminal-action classification
-- [Chat sessions](/concepts/chat-sessions) — where ask-human messages live in the transcript
-- [Safety](/concepts/safety) — what triggers a `confirmation`-type ask
+---
+
+## Multiple pending requests
+
+A session can have multiple pending ask_human rows simultaneously (e.g., an MCP connect prompt followed immediately by a text input). The `waiting_for_input` flag remains `true` until every pending row is resolved. The composer stays in ask-human mode for the latest unresolved request.
+
+Resolving an MCP connect prompt does not touch sibling text-input rows — `mark_ask_human_resolved(kind="mcp_connect_prompt")` is scoped. This ensures the user is not confused by a composer that silently drops out of ask-human mode when they still owe the agent a text reply.
+
+---
+
+## Socket.IO events
+
+| Event | Direction | Payload |
+|-------|-----------|---------|
+| `session_updated` | Server → Client | Full `ChatSessionRead` object with updated `meta_data.waiting_for_input` |
+| `chat_message_meta_updated` | Server → Client | `{session_id, message_id, meta_data}` with `ask_human_action: "answered"` |
+| `user_followup` | Client → Server | User reply that triggers `WakeSession` |
+
+---
+
+## Developer notes
+
+When adding a new resolution path (e.g., a new OAuth provider completing), call `mark_ask_human_resolved` or the appropriate scoped variant. Do not manually flip `waiting_for_input` — it is a derived value and manual edits will be overwritten on the next recompute.
+
+Sub-agent sentinels are automatically cleaned up by `HibernationController.CancelChildrenOf(parent_session_id)` when the parent Planner completes. This prevents phantom wake-up events from orphaned child sentinels.
+
+---
+
+## Ask-human prompt types reference
+
+### Free text input
+
+```python
+ui_meta = {
+    "type": "ask_human",
+    "input": {
+        "type": "input",
+        "placeholder": "Type your answer here...",
+        "label": "What is the target URL?",
+    }
+}
+```
+
+The user sees a text field in the chat composer. Their reply is injected as a user message.
+
+### Choice / multi-choice
+
+```python
+ui_meta = {
+    "type": "ask_human",
+    "input": {
+        "type": "choice",
+        "label": "Which account should I use?",
+        "options": [
+            {"value": "personal", "label": "Personal Gmail"},
+            {"value": "work", "label": "Work Gmail"},
+        ]
+    }
+}
+```
+
+The user sees a list of buttons or a dropdown. The selected value is injected as a user message.
+
+### MCP connect prompt
+
+```python
+ui_meta = {
+    "type": "ask_human",
+    "input": {
+        "type": "mcp_connect_prompt",
+        "providers": [
+            {"toolkit_slug": "slack", "display_name": "Slack"}
+        ],
+        "message": "To post to Slack, please connect your Slack workspace."
+    }
+}
+```
+
+The user sees a Connect button. On OAuth completion, the session wakes automatically via `mark_user_mcp_connect_resolved`.
+
+### Cloud PC start prompt
+
+```python
+ui_meta = {
+    "type": "ask_human",
+    "input": {
+        "type": "start_cloud_pc_prompt",
+        "message": "This task requires a Cloud PC. Click Start to provision one."
+    }
+}
+```
+
+The user sees a Start button. When the Cloud PC reaches ACTIVE status, the session wakes via `mark_user_cloud_pc_resolved`.
+
+---
+
+## Race condition handling
+
+A subtle race condition can occur when an MCP OAuth callback arrives while the agent is still executing its final LLM turn — the turn that will produce the Hibernate() call. The wake event fires but finds no hibernation task to wake because the task hasn't been created yet.
+
+The `HibernationController.Hibernate()` method handles this automatically:
+
+1. After writing the `SentinelTask` to Redis, it calls `ConsumePendingUserWake(user_id)`.
+2. If a pending wake reason was stored (from the OAuth callback that fired early), it is consumed and the task is immediately claimed and woken.
+3. The agent resumes within milliseconds instead of waiting for the next sentinel poll cycle.
+
+This ensures that even in race conditions, the user's OAuth authorization is never lost.

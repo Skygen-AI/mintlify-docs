@@ -1,0 +1,504 @@
+---
+title: "Repositories"
+description: "Data access layer — async SQLAlchemy repository functions for all Skygen domain models. All functions accept an AsyncSession and are pure async."
+---
+
+## Overview
+
+Repositories are the data access layer in Skygen's Clean Architecture stack:
+
+```
+Routers → Services → Repositories → Models (SQLAlchemy)
+```
+
+All repository functions:
+- Accept `db: AsyncSession` as first parameter (injected via FastAPI `Depends(get_db)` or passed from services)
+- Return ORM model instances or `None` / typed lists
+- Use soft-delete (`deleted_at` timestamp) everywhere except where noted
+- Never raise HTTP exceptions — callers in services/routers handle 404/403 mapping
+
+Location: `Backend/app/repositories/`
+
+---
+
+## BaseRepository
+
+**File:** `Backend/app/core/repository.py`
+
+Generic async repository providing CRUD, pagination, and soft-delete. All domain repositories subclass it.
+
+```python
+class MyRepo(BaseRepository[MyModel]):
+    model = MyModel
+
+repo = MyRepo()
+obj = await repo.get_by_id(db, some_uuid)
+```
+
+**Design rules (read the comments in the file):**
+- Uses `flush()`, NOT `commit()`. The caller (route handler via `get_db` context manager) owns the transaction boundary. This enables atomic multi-entity operations.
+- `db: AsyncSession` is passed to every method, never stored on the instance — keeps repositories stateless and safe for concurrent use.
+- Soft-delete is automatic when the model has `SoftDeleteMixin` (column `deleted_at`).
+
+### Methods
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `get_by_id` | `(db, id, *, include_deleted=False) → Optional[T]` | Fetch by primary key. Excludes soft-deleted by default. |
+| `get_by` | `(db, *, include_deleted=False, **filters) → Optional[T]` | Fetch first match for arbitrary field filters. |
+| `list_all` | `(db, *, filters=None, active_only=True, limit=50, offset=0, order_by=None) → List[T]` | Paginated listing. `limit` capped at 200. |
+| `count` | `(db, *, filters=None, active_only=True) → int` | Count matching records. |
+| `create` | `(db, **kwargs) → T` | Insert + flush + refresh. Does not commit. |
+| `update` | `(db, obj, **kwargs) → T` | Set fields + flush + refresh. Does not commit. |
+| `soft_delete` | `(db, obj) → None` | Sets `obj.deleted_at = utcnow()`. Raises `AttributeError` if model lacks `SoftDeleteMixin`. |
+| `hard_delete` | `(db, obj) → None` | `db.delete(obj)` + flush. Use only for non-soft-deletable models. |
+
+---
+
+## Core Domain Repositories
+
+### user_repo.py
+
+Owned model: `models/users.py` — `User`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_user_by_email` | `(db, email) → Optional[User]` | Lookup by email (case-sensitive) |
+| `get_user` | `(db, user_id) → Optional[User]` | Lookup by UUID |
+| `create_user` | `(db, user_in: UserCreate) → User` | Register new user, hashes password |
+| `get_user_by_google_id` | `(db, google_id) → Optional[User]` | OAuth Google lookup |
+| `link_google_to_user` | `(db, user, google_id, google_email) → User` | Attach Google OAuth to existing account |
+| `create_google_user` | `(db, google_id, email, name, ...) → User` | Create user from Google OAuth |
+| `update_user` | `(db, user, data: dict) → User` | Partial update, applies only provided keys |
+| `deactivate_user` | `(db, user) → None` | Set `is_active=False` |
+| `verify_user_email` | `(db, user) → None` | Set `email_verified=True` |
+| `get_users` | `(db, skip, limit, search, is_active) → List[User]` | Admin paginated listing with optional search |
+| `count_users` | `(db, search, is_active) → int` | Count matching users |
+
+---
+
+### devices_repo.py
+
+Owned model: `models/devices.py` — `Device`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_device` | `(db, device_id) → Optional[Device]` | Lookup by UUID |
+| `get_device_by_kid` | `(db, kid) → Optional[Device]` | Lookup by device KID (JWT key ID) |
+| `get_device_by_machine_id` | `(db, machine_id) → Optional[Device]` | Lookup by hardware machine ID |
+| `get_devices_by_user` | `(db, user_id, include_deleted, limit, offset) → List[Device]` | User's devices with pagination |
+| `get_all_devices` | `(db, skip, limit, search, device_type) → List[Device]` | Admin device listing |
+| `count_devices_by_user` | `(db, user_id) → int` | Active device count for user |
+| `count_all_devices` | `(db) → int` | Global device count |
+| `create_device` | `(db, user_id, name, machine_id, device_type, ...) → Device` | Register new device |
+| `update_device` | `(db, device, data: dict) → Device` | Partial update |
+| `soft_delete_device` | `(db, device) → None` | Set `deleted_at` |
+| `restore_device` | `(db, device) → Device` | Clear `deleted_at` |
+| `rotate_device_kid` | `(db, device) → Device` | Generate new KID, enforce 5-min cooldown |
+| `set_device_online` | `(db, device_id) → None` | Mark online, update `last_seen_at` |
+| `set_device_offline` | `(db, device_id) → None` | Mark offline |
+| `touch_device_last_seen` | `(db, device_id) → None` | Update `last_seen_at` without status change |
+
+---
+
+### chat_session_repo.py
+
+Owned model: `models/chat_sessions.py` — `ChatSession`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_session` | `(db, session_id) → Optional[ChatSession]` | Lookup by UUID (returns soft-deleted too) |
+| `list_sessions_for_user` | `(db, user_id, include_deleted) → List[ChatSession]` | All sessions, no pagination |
+| `list_sessions_for_user_paged` | `(db, user_id, limit, offset) → Tuple[List[ChatSession], int]` | Paginated with window-function count |
+| `get_active_session_for_user_and_device` | `(db, user_id, device_id) → Optional[ChatSession]` | Find existing active session to reuse |
+| `create_session` | `(db, user_id, device_id, emplogent_id, title, meta_data) → ChatSession` | Create new session |
+| `update_session` | `(db, session, data: dict) → ChatSession` | Partial update |
+| `deactivate_session` | `(db, session) → None` | Soft-delete (set `deleted_at`) |
+| `restore_session` | `(db, session) → ChatSession` | Clear `deleted_at` |
+| `hard_delete_session` | `(db, session) → None` | Permanent delete, cascades to `chat_messages` |
+
+---
+
+### chat_message_repo.py
+
+Owned model: `models/chat_messages.py` — `ChatMessage`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_message` | `(db, message_id) → Optional[ChatMessage]` | Lookup by UUID |
+| `find_recent_backend_terminal_message` | `(db, session_id, within_seconds) → Optional[ChatMessage]` | Dedup helper: find backend-saved terminal message within time window |
+| `list_messages_for_session` | `(db, session_id, limit, offset) → List[ChatMessage]` | Paginated message history |
+| `create_message` | `(db, data: dict) → ChatMessage` | Insert message row (handles optional `id` override) |
+| `delete_message` | `(db, msg) → None` | Hard delete single message |
+
+---
+
+### task_repo.py
+
+Owned model: `models/tasks.py` — `Task`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_task` | `(db, task_id) → Optional[Task]` | Lookup by UUID |
+| `list_tasks_for_user` | `(db, user_id, limit, offset) → List[Task]` | User's tasks |
+| `create_task_legacy` | `(db, data: dict) → Task` | Low-level create from raw dict |
+| `create_task` | `(db, user_id, task_create: TaskCreate) → Task` | Schema-validated create |
+| `update_task` | `(db, task, data: dict) → Task` | Partial update |
+| `delete_task` | `(db, task) → None` | Hard delete |
+| `update_task_status` | `(db, task_id, status, result) → Optional[Task]` | Status transition with optional result payload |
+
+---
+
+## Billing & Subscription
+
+### billing_repository.py
+
+Owned models: `models/billing.py` — `TokenBalance`, `Subscription`, `SubscriptionPlan`, `TransactionLog`
+
+Class: `BillingRepository` — all methods are instance methods, injected via `get_billing_repo(db)`.
+
+**Key methods:**
+
+| Method | Description |
+|---|---|
+| `get_token_balance(user_id)` | Fetch current token balance row |
+| `create_token_balance(user_id, tokens)` | Initialize balance |
+| `update_token_balance(balance, delta)` | Atomic delta update |
+| `get_subscription(user_id)` | Active subscription row |
+| `create_subscription(user_id, plan_id, ...)` | New subscription |
+| `update_subscription(sub, data)` | Partial update |
+| `get_plan(plan_id)` | Subscription plan by ID |
+| `get_plan_by_stripe_price_id(price_id)` | Lookup by Stripe price ID |
+| `list_plans(active_only)` | All available plans |
+| `create_transaction(user_id, type, amount, ...)` | Audit transaction log entry |
+| `get_transactions(user_id, limit, offset)` | Transaction history |
+
+---
+
+### api_cost_repository.py
+
+Owned model: `models/api_cost.py` — `APICostRecord`
+
+Class: `APICostRepository` — tracks LLM API call costs per user/session.
+
+**Key methods:** `record_cost(user_id, session_id, model, tokens_in, tokens_out, cost_usd)`, `get_costs_by_user(user_id, from_date, to_date)`, `get_total_cost_by_user(user_id)`, `get_costs_by_session(session_id)`.
+
+---
+
+## Cloud Infrastructure
+
+### cloud_pc_repo.py
+
+Owned model: `models/cloud_pc.py` — `CloudPC`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_cloud_pc_by_user` | `(db, user_id) → Optional[CloudPC]` | First non-terminated PC for user |
+| `get_cloud_pc_by_id` | `(db, cloud_pc_id, user_id) → Optional[CloudPC]` | Lookup with ownership check |
+| `get_cloud_pcs_by_user` | `(db, user_id, include_terminated) → List[CloudPC]` | All PCs for user |
+| `count_alive_by_user` | `(db, user_id) → int` | Non-terminated PC count |
+| `count_active_by_user` | `(db, user_id) → int` | Status=ACTIVE count |
+| `get_paused_cpc_ids_by_user` | `(db, user_id) → List[str]` | IDs of paused PCs |
+| `create_cloud_pc` | `(db, user_id, template_id, name) → CloudPC` | Provision new PC record |
+| `update_status` | `(db, cloud_pc_id, status, error_msg) → None` | Status transition |
+| `update_sandbox_info` | `(db, cloud_pc_id, sandbox_id, vnc_url, ...)` | Store E2B sandbox connection details |
+| `update_backup_info` | `(db, cloud_pc_id, backup_path, ...)` | Store backup/snapshot metadata |
+| `set_paused` / `set_terminated` | `(db, cloud_pc_id) → None` | Terminal state transitions |
+| `record_activity` / `record_interaction` | `(db, cloud_pc_id) → None` | Timestamp updates for idle detection |
+| `get_idle_cloud_pcs` | `(db, idle_threshold_minutes) → List[CloudPC]` | PCs inactive beyond threshold |
+| `accumulate_active_time` | `(db, cloud_pc_id, seconds) → None` | Billing time accumulation |
+| `get_stale_transitional` | `(db, max_age_minutes) → List[CloudPC]` | PCs stuck in starting/stopping |
+| `get_stale_error` | `(db, max_age_hours) → List[CloudPC]` | PCs in error state beyond threshold |
+| `link_device` / `unlink_device` | `(db, cloud_pc_id, device_id) → None` | Link Cloud PC to OSWorld device |
+| `get_active_cloud_pc_for_device` | `(db, device_id) → Optional[CloudPC]` | Active PC linked to a device |
+| `get_cloud_pc_for_device` | `(db, device_id) → Optional[CloudPC]` | Any PC linked to a device |
+| `get_paused_older_than` | `(db, threshold_dt) → List[CloudPC]` | Stale paused PCs for reclaim |
+
+---
+
+## MCP & Integrations
+
+### mcp_repository.py
+
+Owned models: `models/mcp.py` — `MCPIntegration`, `UserMCPIntegration`, `MCPToken`
+
+| Function | Signature | Description |
+|---|---|---|
+| `get_all_integrations` | `(db) → List[MCPIntegration]` | All configured MCP integrations |
+| `get_integration_by_provider` | `(db, provider) → Optional[MCPIntegration]` | By provider type |
+| `ensure_integration` | `(db, provider, name, config) → MCPIntegration` | Upsert integration record |
+| `get_user_integrations` | `(db, user_id, provider) → List[UserMCPIntegration]` | User's connected integrations |
+| `get_user_integration` | `(db, user_id, provider) → Optional[UserMCPIntegration]` | Single integration |
+| `get_all_user_integrations_by_provider` | `(db, provider) → List[UserMCPIntegration]` | All users for a provider |
+| `create_user_integration` | `(db, user_id, integration_id, ...) → UserMCPIntegration` | Register new connection |
+| `upsert_token` | `(db, user_integration_id, token_data) → MCPToken` | Store/update OAuth token |
+| `delete_user_integration` | `(db, user_integration_id) → None` | Remove integration |
+
+---
+
+### composio_repository.py
+
+Owned model: `models/composio.py` — `ComposioConnection`, `TriggerConfiguration`, `TriggerEvent`
+
+Class: `ComposioRepository` — instance methods.
+
+**Key methods:** `get_connection(user_id, toolkit)`, `create_connection(user_id, toolkit, connection_id, status)`, `update_connection_status(connection_id, status)`, `get_trigger_config(trigger_id)`, `create_trigger_config(user_id, toolkit, trigger_name, ...)`, `delete_trigger_config(trigger_id)`, `create_trigger_event(trigger_id, payload)`, `update_trigger_event(event_id, status, result, ...)`, `list_trigger_events(user_id, limit)`.
+
+---
+
+## Scheduling & Tasks
+
+### scheduled_task_repo.py
+
+Owned models: `models/scheduled_task.py` — `ScheduledTask`, `ScheduledTaskRun`
+
+**Task management:**
+
+| Function | Description |
+|---|---|
+| `create_scheduled_task(db, user_id, data)` | Create new scheduled task |
+| `get_scheduled_task(db, task_id)` | Lookup by UUID |
+| `get_scheduled_task_for_user(db, task_id, user_id)` | Ownership-checked lookup |
+| `list_scheduled_tasks_for_user(db, user_id, active_only, limit, offset)` | Paginated listing |
+| `update_scheduled_task(db, task, data)` | Partial update |
+| `soft_delete_scheduled_task(db, task)` | Soft delete |
+| `toggle_scheduled_task(db, task_id, is_active)` | Enable/disable |
+| `get_due_tasks(db, now)` | Tasks due for execution (cron + one-shot) |
+| `sync_connectors(db, task_id, connector_ids)` | Update MCP connector associations |
+
+**Run tracking:**
+
+| Function | Description |
+|---|---|
+| `create_run(db, scheduled_task_id, session_id, ...)` | Start a run record |
+| `update_run(db, run, **fields)` | Update run status/result |
+| `list_runs_for_task(db, task_id, limit)` | Run history for a task |
+| `list_completed_runs_for_user(db, user_id, limit)` | All completed runs across tasks |
+| `count_active_runs(db, scheduled_task_id)` | Running count for concurrency guard |
+| `get_run_by_session(db, session_id)` | Find run by session ID |
+| `fail_stale_runs(db, cutoff_dt)` | Mark abandoned runs as failed |
+
+---
+
+## Knowledge Base
+
+### kb_repository.py
+
+Owned models: `models/kb_models.py` — `KBInsight`, `TrajectoryPlan`, `TaskEvaluation`, `ConversationSummary`
+
+Uses pgvector for semantic search. Large and complex — 843 lines.
+
+**Insights (user/global knowledge):**
+
+| Function | Description |
+|---|---|
+| `create_insight(db, user_id, agent_type, content, embedding, ...)` | Store knowledge chunk with vector |
+| `read_insight(db, insight_id, user_id)` | Ownership-checked read |
+| `update_insight(db, insight_id, user_id, data)` | Partial update |
+| `delete_insight(db, insight_id, user_id)` | Ownership-checked delete |
+| `list_insights(db, user_id, agent_type, scope, limit, offset)` | Filtered paginated listing |
+| `search_similar_insights(db, embedding, user_id, agent_type, limit, threshold)` | pgvector ANN search |
+| `find_user_override(db, user_id, key)` | Lookup explicit user preference/override |
+| `find_emplogent_override(db, emplogent_id, key)` | Lookup emplogent-scoped override |
+| `delete_all_general_insights(db, user_id)` | Bulk delete general scope insights |
+| `delete_all_user_knowledge(db, user_id)` | Full wipe of all KB rows for user |
+
+**Trajectory plans:**
+
+| Function | Description |
+|---|---|
+| `create_trajectory_plan(db, user_id, agent_type, content, embedding, ...)` | Store task execution plan |
+| `get_trajectory_plans_by_agent(db, user_id, agent_type)` | List plans for agent |
+| `search_similar_plans(db, embedding, user_id, agent_type, limit)` | pgvector plan similarity search |
+| `delete_trajectory_plan(db, plan_id, user_id)` | Ownership-checked delete |
+
+**Evaluations & summaries:**
+
+| Function | Description |
+|---|---|
+| `create_task_evaluation(db, user_id, session_id, score, feedback, ...)` | Store post-task eval |
+| `get_task_evaluation(db, session_id)` | Fetch eval for a session |
+| `get_user_evaluations(db, user_id, limit)` | Recent evals for a user |
+| `create_conversation_summary(db, user_id, session_id, content, ...)` | Store session summary |
+| `get_conversation_summaries_by_session(db, session_id)` | All summaries for a session |
+| `get_conversation_summaries_by_user(db, user_id, limit)` | Recent summaries for a user |
+
+**COW filter (`build_cow_filter`):** Returns the correct SQLAlchemy filter expression for "Copy-on-Write" scoped insights (global → user override → emplogent override). Used by `search_similar_insights` and `list_insights`.
+
+---
+
+## Messaging & Communication
+
+### send_msg_to_agent_repo.py
+
+**Not a standard CRUD repository.** Contains `get_payload_for_agent(db, redis, session_id, user_id, message_content, ...)` — the primary pre-flight check before dispatching a user message to the agent.
+
+**Responsibilities:**
+- Load session + device state
+- Acquire device lock via `DeviceLockManager`
+- Check Cloud PC availability
+- Build the full payload dict for `BrokerAgent`
+
+**Raises:**
+- `CloudPCSessionConflict` — session conflicts with an active Cloud PC session
+- `CloudPCNotReady` — Cloud PC is not in ACTIVE state
+
+---
+
+### message_services.py
+
+Shared helpers for message routing: `get_session_for_message(db, session_id, user_id)`, `validate_device_ownership(db, device_id, user_id)`. Used by both REST and Socket.IO message handlers.
+
+---
+
+### tasks_services.py
+
+Shared helpers for agent task orchestration: `prepare_task_payload(db, user_id, session_id, task_data)`, `update_task_from_result(db, task_id, result)`. Used by message router and worker handlers.
+
+---
+
+### summiries_services.py
+
+Session summary helpers: `get_session_summary(db, session_id, max_messages)` — filters messages to user queries + final assistant responses (excludes `agent_step` intermediate messages).
+
+---
+
+## Support & Safety
+
+### helpdesk_repo.py
+
+Owned models: `models/helpdesk.py` — `HelpdeskTicket`, `HelpdeskMessage`, `HelpdeskAttachment`, `HelpdeskKBArticle`, `HelpdeskKBVote`, `HelpdeskCannedResponse`, `HelpdeskSLAPolicy`
+
+932 lines covering full helpdesk feature set.
+
+**Tickets:**
+
+| Function | Description |
+|---|---|
+| `create_ticket(db, user_id, subject, priority, ...)` | Open new support ticket |
+| `get_ticket(db, ticket_id)` | Basic ticket fetch |
+| `get_ticket_detail(db, ticket_id, include_internal)` | Ticket with messages + attachments |
+| `list_user_tickets(db, user_id, status, limit, offset)` | User's own tickets |
+| `list_all_tickets(db, status, priority, search, limit, offset)` | Admin listing with filters |
+| `update_ticket(db, ticket, **kwargs)` | Update allowed fields |
+| `soft_delete_ticket(db, ticket)` | Soft delete |
+| `create_status_change(db, ticket_id, from_status, to_status, user_id)` | Audit log entry |
+| `get_ticket_stats(db)` | Admin dashboard stats |
+| `get_analytics(db, period)` | Analytics breakdown by period |
+
+**Messages & attachments:**
+
+| Function | Description |
+|---|---|
+| `create_message(db, ticket_id, author_id, content, is_internal)` | Add message to ticket |
+| `get_ticket_messages(db, ticket_id, include_internal)` | Message thread |
+| `create_attachment(db, ticket_id, message_id, filename, s3_key, ...)` | Store file attachment |
+| `get_attachment(db, attachment_id)` | Fetch attachment |
+
+**Knowledge base:**
+
+| Function | Description |
+|---|---|
+| `create_kb_article(db, title, content, category, ...)` | Create KB article (auto-slugifies) |
+| `get_kb_article(db, article_id)` | Fetch by ID |
+| `get_kb_article_by_slug(db, slug)` | Fetch by URL slug |
+| `list_kb_articles(db, category, is_published, search, limit, offset)` | Filtered listing |
+| `update_kb_article(db, article, **kwargs)` | Update article |
+| `soft_delete_kb_article(db, article)` | Soft delete |
+| `increment_kb_view_count(db, article)` | Track views |
+| `increment_kb_feedback(db, article, helpful)` | Track helpful/not-helpful |
+| `get_kb_vote` / `create_kb_vote` | Per-user vote dedup |
+
+**Canned responses:**
+
+| Function | Description |
+|---|---|
+| `create_canned_response(db, title, content, category)` | Quick reply template |
+| `list_canned_responses(db, category, search)` | Listing |
+| `update_canned_response` / `delete_canned_response` | CRUD |
+| `increment_canned_usage(db, response)` | Usage counter |
+
+**SLA policies:**
+
+| Function | Description |
+|---|---|
+| `list_sla_policies(db)` | All SLA definitions |
+| `get_sla_policy_by_priority(db, priority)` | By priority level |
+| `create_sla_policy` / `update_sla_policy` / `delete_sla_policy` | CRUD |
+
+---
+
+### safety_repository.py
+
+Owned model: `models/safety.py` — `SafetyViolation`
+
+| Function | Description |
+|---|---|
+| `create_safety_violation(db, user_id, session_id, task_id, device_id, violation_type, content, severity)` | Record a safety policy violation |
+| `get_safety_violation(db, violation_id)` | Fetch by ID |
+| `get_user_violations(db, user_id, limit, offset)` | User's violation history |
+| `get_task_violations(db, task_id)` | Violations for a specific task |
+| `get_device_violations(db, device_id, days)` | Recent device violations |
+| `update_violation_approval(db, violation_id, approved, reviewed_by)` | Admin approval/rejection |
+| `get_violation_stats_by_user(db, user_id, days)` | Per-user stats |
+| `get_global_violation_stats(db, days)` | Platform-wide stats |
+| `get_most_common_triggers(db, limit, days)` | Top violation categories |
+
+---
+
+## Access & Identity
+
+### invite_codes_repo.py
+
+Owned model: `models/invite_codes.py` — `InviteCode`
+
+| Function | Description |
+|---|---|
+| `generate_invite_code(length)` | Generate random alphanumeric code |
+| `create_invite(db, plan_id, max_uses, expires_at, created_by)` | Single invite |
+| `create_invites_batch(db, count, plan_id, ...)` | Bulk invite generation |
+| `get_by_code(db, code)` | Lookup by code string |
+| `mark_used(db, invite, user_id)` | Consume invite, enforce max_uses |
+| `deactivate(db, invite)` | Disable without deletion |
+| `list_invites(db, active_only, limit, offset)` | Admin listing |
+
+---
+
+### emplogent_repo.py
+
+Owned models: `models/emplogents.py` — `Emplogent`, `EmplogentTemplate`
+
+| Function | Description |
+|---|---|
+| `list_templates_for_user(db, user_id)` | Available AI persona templates |
+| `get_template(db, template_id)` | Single template |
+| `create_template(db, data)` | Add template |
+| `delete_template(db, template)` | Remove template |
+| `list_emplogents_for_user(db, user_id)` | User's custom AI personas |
+| `get_emplogent(db, emplogent_id)` | Lookup by UUID |
+| `get_emplogent_by_name_ci(db, user_id, name)` | Case-insensitive name lookup |
+| `create_emplogent(db, user_id, data)` | Create persona |
+| `update_emplogent(db, emplogent, data)` | Partial update |
+| `delete_emplogent(db, emplogent)` | Hard delete |
+
+---
+
+### connectors_repo.py
+
+Owned model: `models/connectors.py` — `Connector` (user-linked external service connections)
+
+Thin CRUD: `get_connector(db, connector_id)`, `list_connectors_for_user(db, user_id)`, `create_connector(db, user_id, data)`, `update_connector(db, connector, data)`, `delete_connector(db, connector)`.
+
+---
+
+### email_segment_repo.py
+
+Owned model: `models/email_segments.py` — `EmailSegment`, `EmailSegmentMember`
+
+Used for email marketing segmentation: `create_segment(db, name, criteria)`, `get_segment(db, segment_id)`, `list_segments(db)`, `add_member(db, segment_id, user_id)`, `remove_member(db, segment_id, user_id)`, `get_segment_members(db, segment_id)`.
+
+---
+
+## Coverage Notes
+
+All 22 repository files are documented. Files without a dedicated heading above (`message_services.py`, `tasks_services.py`, `summiries_services.py`) are shared helper modules that are called by multiple routers/services rather than owning a DB model directly.

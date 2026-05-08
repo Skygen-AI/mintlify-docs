@@ -1,402 +1,200 @@
 ---
-title: "Cost optimization"
-description: "Where the AWS money goes, what's wasted, and what to do about it. All numbers from the March 2026 bill."
+title: "Cost Optimization"
+description: "Practical strategies for reducing AWS infrastructure costs: Karpenter Spot, right-sizing, storage tiering, and CloudWatch cost reduction."
 ---
 
-This page analyses the Skygen AWS bill, identifies waste, and ranks recommendations by how confident we are in the savings. For the inventory of services themselves, see [AWS stack inventory](/deployment/aws-inventory).
+## Overview
 
-<Note>
-Every savings figure below is anchored to a line item in the **March 2026** bill — no theoretical pricing fantasies. Where we can't verify the reduction percentage, we say so.
-</Note>
+Skygen's infrastructure runs on EKS with Karpenter for dynamic node provisioning. The main cost levers are: Spot instances for stateless workloads, right-sizing persistent resources (RDS, ElastiCache, Amazon MQ), eliminating unused services, and reducing data transfer costs. This guide covers concrete changes that reduce monthly spend.
 
-## TL;DR
+---
 
-- Current run rate: **~$2,200/mo (~$26k/yr)** including tax.
-- Verified waste (fix without decisions): **~$105/mo, ~$1,260/yr**.
-- Architectural savings (need team decision): **~$280/mo, ~$3,400/yr**.
-- Needs investigation first (can't estimate): up to **~$100/mo** depending on answers.
-- **Total addressable: ~$385/mo, ~$4,600/yr** — roughly a 17 % reduction without touching production scale.
+## Karpenter Spot instances
 
-## Current state
+Agent and worker pods are stateless and can be safely interrupted. Using EC2 Spot instances for these workloads typically saves 60–80% over On-Demand pricing.
 
-March 2026 breakdown ($2,219.66 total, pre-tax $1,913.50):
-
-| Rank | Service | Cost | Share |
-|------|---------|------|-------|
-| 1 | EC2 Compute | $558.16 | 25.1 % |
-| 2 | Tax (VAT) | $306.16 | 13.8 % |
-| 3 | EC2 – Other (EBS, NAT, IPv4, data) | $300.67 | 13.5 % |
-| 4 | EKS control plane | $165.88 | 7.5 % |
-| 5 | ALB/NLB | $156.51 | 7.1 % |
-| 6 | ElastiCache Valkey | $146.28 | 6.6 % |
-| 7 | VPC (Client VPN + public IPv4) | $144.62 | 6.5 % |
-| 8 | RDS | $120.09 | 5.4 % |
-| 9 | ECS Fargate | $93.20 | 4.2 % |
-| 10 | CloudWatch | $62.48 | 2.8 % |
-| 11 | ECR | $58.61 | 2.6 % |
-| 12 | Secrets Manager | $50.80 | 2.3 % |
-| 13 | Amazon MQ | $46.33 | 2.1 % |
-| 14 | S3 | $5.52 | 0.2 % |
-| 15 | Lightsail | $3.71 | 0.2 % |
-| 16 | Route 53 | $0.50 | <0.1 % |
-
-Month-over-month trend: **ECR doubled** (Feb $29 → Mar $59 → Apr MTD $58). Everything else is stable.
-
-## Tier 1: Verified waste {#tier-1}
-
-Fix without new information. Low risk.
-
-### 1. ECR lifecycle policies — **$47/mo, $564/yr** {#ecr-lifecycle}
-
-**Current:** 7 repos, `MUTABLE` tags, no lifecycle policies. Top repos hold hundreds of images each:
-
-- `skygen/backend`: 1,281 images, ~450 GB
-- `skygen/backend-worker`: 760 images, ~500 GB
-- `skygen/agent`: 585 images, ~450 GB
-
-ECR is billed at `$0.10/GB-mo`. March cost: `$58.61`. Cost has doubled every two months as images accumulate.
-
-**Fix:** add a lifecycle policy per repo keeping the 15 newest `prod` / 5 newest `dev` / 10 newest untagged.
-
-```json
-{
-  "rules": [
-    { "rulePriority": 1, "description": "Keep last 15 prod", "selection": { "tagStatus": "tagged", "tagPrefixList": ["prod"], "countType": "imageCountMoreThan", "countNumber": 15 }, "action": { "type": "expire" } },
-    { "rulePriority": 2, "description": "Keep last 10 dev", "selection": { "tagStatus": "tagged", "tagPrefixList": ["dev"], "countType": "imageCountMoreThan", "countNumber": 10 }, "action": { "type": "expire" } },
-    { "rulePriority": 3, "description": "Expire untagged after 7 days", "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7 }, "action": { "type": "expire" } }
-  ]
-}
-```
-
-Apply per repo:
-
-```bash
-aws ecr put-lifecycle-policy --repository-name skygen/backend --lifecycle-policy-text file://lifecycle.json --region us-east-1
-# ...repeat for each repo
-```
-
-Expected reduction: ~80 % of storage. March: `$58.61 → ~$12/mo = $46/mo saved`. Grows larger over time since current rate is climbing.
-
-### 2. CloudWatch Logs retention — **$5–10/mo, $60–120/yr** {#cloudwatch-retention}
-
-**Current:** 3 EKS log groups hold 54 GB combined with retention = `never`.
-
-**Fix:** set a retention policy on each:
-
-```bash
-for lg in /aws/eks/skygen-us-dev/cluster /aws/eks/skygen-us-prod/cluster /aws/eks/skygen-us-dev/containers; do
-  aws logs put-retention-policy --log-group-name "$lg" --retention-in-days 14 --region us-east-1
-done
-```
-
-Storage savings are modest (`$0.03/GB-mo` × 54 GB = $1.60/mo). The bigger win is not eating CloudWatch queries (`$0.005/GB scanned`) on stale data.
-
-<Note>
-Ingestion (`$0.50/GB`) is the main CloudWatch cost and is unchanged by retention — logs are still emitted. To reduce ingestion, filter noisy log lines at source (EKS control plane logging can be scoped to `api,audit` instead of `all`).
-</Note>
-
-### 3. Karpenter public IP misconfiguration — **$7/mo, $88/yr + risk** {#karpenter-public-ip}
-
-**Current:** 2 Karpenter-provisioned dev nodes (`i-0fd1f9d800614bca2`, `i-0b585fc7cf6b49199`) have public IPv4 addresses. Karpenter workloads should live in private subnets routed through NAT.
-
-**Why it matters:**
-- $3.65/mo × 2 IPs direct cost.
-- Larger concern: exposing dev pod-hosting nodes to the public internet. Security posture > cost here.
-
-**Fix:** Review the Karpenter `EC2NodeClass` `subnetSelector`. Likely pointing at public subnets, should point at private.
+### Node pool configuration
 
 ```yaml
-apiVersion: karpenter.k8s.aws/v1
-kind: EC2NodeClass
-metadata:
-  name: default
-spec:
-  subnetSelectorTerms:
-    - tags:
-        karpenter.sh/discovery: skygen-us-dev
-        kubernetes.io/role/internal-elb: "1"   # private subnets only
-```
-
-### 4. Empty S3 bucket cleanup — **$0 direct, hygiene** {#s3-cleanup}
-
-Empty buckets cost nothing but are future namespace pollution. Delete after double-checking they're not referenced in env vars or IAM policies:
-
-```
-skygen-screenshots (empty)
-skygen-files (empty)
-skygen-releases (empty)
-skygen-releases-dev (empty)
-skygen-assets-us (empty)
-skygen-landing-assets-prod (empty)
-skygen-agent-trajectories (empty)
-```
-
-**Verify first:**
-
-```bash
-grep -r "skygen-releases-dev\|skygen-files[^-]\|skygen-screenshots[^-]" Backend/ Agent/ ui-shared-tauri/ k8s/ k8s_prod/
-```
-
-### 5. Orphan VPC cleanup — **$0 direct, hygiene** {#vpc-cleanup}
-
-Two VPCs named `skygen-prod-vpc` have no instances, no ENIs, no NAT. One has 3 empty subnets.
-
-```
-vpc-0d86174a8da367553  10.1.0.0/16  (0 subnets)
-vpc-0748d29fba830613d  10.0.0.0/16  (3 empty subnets)
-```
-
-CIDRs overlap with active EKS VPCs, so keeping them is mildly dangerous (route table mistakes, VPC peering confusion). Delete.
-
-### 6. Empty ECS cluster `Skygen-kuber-dev` (us-east-1) — **$0, hygiene** {#ecs-cleanup-dev}
-
-0 tasks, 0 services, 0 container instances. Only holds one task definition family (`skygen-backend-dev`) which is unreferenced.
-
-```bash
-aws ecs deregister-task-definition --task-definition skygen-backend-dev:1 --region us-east-1  # check first
-aws ecs delete-cluster --cluster Skygen-kuber-dev --region us-east-1
-```
-
-### 7. Dev Valkey cluster 3 → 1 node — **$24/mo, $288/yr** {#elasticache-dev}
-
-**Current:** `skygen-dev-kuber` runs 3 × `cache.t4g.small` nodes (`$0.017/hr × 3 × 720h = $36.72/mo`) with **replication disabled**. Three copies of the same data, no failover benefit.
-
-**Fix:** resize to 1 node. Data loss during resize is acceptable in dev.
-
-Savings: `2 × $0.017/hr × 720 = $24.48/mo`.
-
-### Tier 1 total: **~$84/mo direct + $7/mo Karpenter + cleanup = ~$91/mo, ~$1,100/yr**
-
-## Tier 2: Architectural decisions {#tier-2}
-
-Larger savings but require team alignment before execution.
-
-### 1. Complete ECS → EKS migration — **~$70/mo net, ~$840/yr** {#ecs-migration}
-
-**Current:** ECS Fargate in `eu-north-1` runs 9 services for legacy webapp / landing / adminpanel while EKS prod has a new `landing-ssr` deployment behind `ssr.skygen.ai` (8 days old). Mid-migration.
-
-**Finish it:**
-1. Point `skygen.ai` marketing at `landing-ssr` in EKS; retire `skygen-landing` / `landing-backend` on ECS.
-2. Add `webapp` deployment to EKS prod; retire `webapp` service on ECS.
-3. Add `adminpanel` deployment to EKS prod; retire `skygen-adminpanel-service`.
-4. Delete `skygen-production` ECS cluster (eu-north-1).
-5. Delete `database-landing-prod` / `database-landing-dev` RDS — or migrate their data into `skygen-prod-db` / `skygen-dev-db1-use1-eks`.
-
-**Savings:**
-- ECS Fargate compute: **$93/mo eliminated**.
-- Needs ~1 extra Karpenter node to absorb load in EKS: **-$22/mo**.
-- Plus `database-landing-*` RDS removed: **$24/mo** (`$10 dev + $14 prod`).
-- Net: **~$95/mo = ~$1,140/yr**.
-
-**Also gets rid of:**
-- Cross-region traffic between ECS (eu-north-1) and RDS in us-east-1.
-- A second deployment pipeline (ECS task definitions, eu-north-1 networking, separate observability).
-
-<Warning>
-Before deleting ECS services: verify DNS for `skygen.ai`, `www.skygen.ai`, `admin.skygen.ai` is actually pointing to the new EKS ingresses, not the ECS task ALBs. `dig` queries from this audit returned CGNAT-style `198.18.x.x` addresses (Cloudflare tunnel?), so resolution depends on the DNS provider, not the AWS side.
-</Warning>
-
-### 2. Savings Plans / Reserved Instances — **~$130–180/mo, ~$1,600–2,150/yr** {#savings-plans}
-
-Steady-state components have run for months without meaningful idle time — these are exactly what Savings Plans are for. Conservative estimates:
-
-| Target | Monthly on-demand | Plan type | Discount | Monthly savings |
-|--------|-------------------|-----------|----------|-----------------|
-| RDS `skygen-prod-db` (`db.t4g.medium`) | $24 | 1-yr RI, no upfront | ~30 % | $7 |
-| RDS `skygen-dev-db1-use1-eks` | $24 | 1-yr RI | ~30 % | $7 |
-| ElastiCache prod (`cache.t4g.medium × 2`) | $44 | 1-yr reserved | ~30 % | $13 |
-| EC2 Compute (baseline, not HPA peaks) | ~$280 | 1-yr Compute Savings Plan | ~28 % | $78 |
-| Fargate baseline (2 FARGATE base) | ~$20 | Compute Savings Plan (covers Fargate) | ~15 % | $3 |
-| **Subtotal** | | | | **$108/mo = $1,296/yr** |
-
-3-year commitment pushes discounts to ~45 % but locks in assumptions. Start with 1-year.
-
-<Warning>
-**Do not buy Savings Plans for ECS Fargate if you plan to retire it** (see [ECS migration](#ecs-migration)). Sequence: finish ECS migration first, then buy SP.
-</Warning>
-
-### 3. Dev RDS consolidation — **~$30/mo, ~$360/yr** {#rds-consolidation}
-
-**Current dev RDS footprint:**
-- `skygen-dev-db1-use1` (`db.t4g.micro`, ~$10/mo) — older instance
-- `skygen-dev-db1-use1-eks` (`db.t4g.medium`, ~$24/mo) — in-use by EKS dev
-- `database-landing-dev` (`db.t4g.micro`, ~$10/mo) — landing dev
-
-Pick one dev DB and schema-isolate. The `db1-use1` instance (not `-eks`) may already be unused — check connection metrics. Merging landing into the same instance under a different database name is fine for dev.
-
-Savings: 2 × $10/mo = ~$20/mo, plus retire unused = ~$30/mo.
-
-### 4. Fargate Spot for agent/worker — **~$20/mo, ~$240/yr** {#fargate-spot}
-
-Agent pods are batch-ish: a pod restart is survivable. Move `agent-pool` Karpenter nodepool to spot-preferred consolidation:
-
-```yaml
-apiVersion: karpenter.sh/v1
-kind: NodePool
-metadata:
-  name: agent-pool
+# Backend/k8s/karpenter/nodepool-agent.yaml
 spec:
   template:
     spec:
+      nodeClassRef:
+        name: default
       requirements:
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["spot", "on-demand"]   # spot first
-        - key: karpenter.k8s.aws/instance-category
+          values: ["spot", "on-demand"]   # prefer spot
+        - key: node.kubernetes.io/instance-type
           operator: In
-          values: ["t", "c", "m"]
+          values: ["t3.small", "t3.medium", "t3a.small", "t3a.medium"]
   disruption:
-    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
 ```
 
-Spot nodes are ~70 % cheaper. Agent workloads on `t3a.medium` (~$22/mo) × 3 = $66/mo on-demand → ~$20/mo on spot = **~$45/mo savings**, conservatively halved to $20/mo accounting for interruption overhead.
+The `consolidateAfter: 30s` setting aggressively consolidates underutilized nodes. Backend pods should use `on-demand` only if they require guaranteed availability; agent and worker pods are good Spot candidates.
 
-### 5. Dev MQ → in-cluster — **~$15/mo, ~$180/yr** {#dev-mq}
+### Disruption handling
 
-`Broker-kuber-dev-eks2` is a managed `mq.t3.micro` (~$15/mo). Dev tolerates broker restarts — replace with a single `rabbitmq:3-management-alpine` pod in `skygen-agent` namespace:
+Backend pods handle graceful shutdown via `preStop` hooks and the default SIGTERM handler in uvicorn. Agents checkpoint task state to Redis before termination, so Spot interruption does not lose user work.
+
+---
+
+## Right-sizing compute
+
+### Backend pods
+
+Current resource requests are conservative. Monitor actual usage via Prometheus `container_cpu_usage_seconds_total` and `container_memory_working_set_bytes`:
+
+```promql
+# P95 CPU usage for backend pods over 7 days
+histogram_quantile(0.95, 
+  sum(rate(container_cpu_usage_seconds_total{pod=~"backend.*"}[5m])) by (le)
+)
+```
+
+If P95 CPU stays below 200m, reduce requests from `300m` to `150m` and limits from `1000m` to `500m`. This allows the HPA to pack more pods per node.
+
+### RDS
+
+Switch `db.t3.medium` (dev) to `db.t3.small` if the database is not CPU-bound. Enable RDS auto-scaling storage to avoid over-provisioning. In dev, consider stopping the RDS instance during off-hours using EventBridge Scheduler:
+
+```bash
+aws rds stop-db-instance --db-instance-identifier skygen-dev
+```
+
+### ElastiCache
+
+`cache.t3.micro` is adequate for dev. In prod, monitor `CurrConnections` and `CacheHits` to right-size. Enable cluster mode only if you need horizontal scaling beyond a single node.
+
+---
+
+## Node pool consolidation
+
+Karpenter's `WhenUnderutilized` consolidation policy deletes nodes that are below a utilization threshold. Key settings:
 
 ```yaml
+disruption:
+  consolidationPolicy: WhenUnderutilized
+  consolidateAfter: 60s    # wait 60s before consolidating
+  budgets:
+    - nodes: "20%"         # never terminate more than 20% at once
+```
+
+During business hours when load is high, consolidation is automatically inhibited by Karpenter because pods would not fit on remaining nodes. At night with low load, nodes consolidate to as few as the minimum.
+
+---
+
+## Storage tiering
+
+### S3 Intelligent-Tiering
+
+Enable Intelligent-Tiering on the screenshots bucket to automatically move infrequently-accessed objects to cheaper storage tiers:
+
+```bash
+aws s3api put-bucket-intelligent-tiering-configuration \
+  --bucket skygen-files \
+  --id tiering \
+  --intelligent-tiering-configuration '{
+    "Id": "tiering",
+    "Status": "Enabled",
+    "Tierings": [
+      {"Days": 90, "AccessTier": "ARCHIVE_ACCESS"},
+      {"Days": 180, "AccessTier": "DEEP_ARCHIVE_ACCESS"}
+    ]
+  }'
+```
+
+Screenshots older than 90 days can move to Archive Access (68% cheaper than S3 Standard). Agent trajectory files are write-once read-rarely — good candidates.
+
+### S3 lifecycle rules
+
+Delete temporary presigned-upload objects that were never completed:
+
+```json
+{
+  "Rules": [{
+    "Status": "Enabled",
+    "Filter": {"Prefix": "uploads/tmp/"},
+    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+  }]
+}
+```
+
+---
+
+## CloudWatch cost reduction
+
+CloudWatch is the largest hidden cost for EKS clusters. The control plane log types enabled are `api`, `audit`, `authenticator`, `controllerManager`, `scheduler`. The `audit` log stream is the most expensive.
+
+**Option 1:** Disable `audit` logs if not required for compliance:
+
+```bash
+aws eks update-cluster-config \
+  --name skygen-us-dev \
+  --logging '{"clusterLogging":[{"types":["api","authenticator","controllerManager","scheduler"],"enabled":true},{"types":["audit"],"enabled":false}]}'
+```
+
+**Option 2:** Route application logs to Loki instead of CloudWatch. Skygen already does this — ensure no Fluent Bit sidecar is accidentally shipping application logs to CloudWatch in addition to Promtail.
+
+---
+
+## Amazon MQ vs self-hosted RabbitMQ
+
+Amazon MQ charges per broker-hour plus data transfer. For dev, consider replacing Amazon MQ with a self-hosted RabbitMQ pod in the same cluster:
+
+```yaml
+# Single-node RabbitMQ for dev
 apiVersion: apps/v1
-kind: StatefulSet
-metadata: { name: rabbitmq, namespace: skygen-agent }
-# ...
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: skygen-agent
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
 ```
 
-Prod stays on managed MQ — the reliability cost on prod is higher than $15/mo.
+This eliminates the Amazon MQ hourly charge (~$50/month for a `mq.t3.micro` broker) at the cost of no managed HA.
 
-### 6. Secrets Manager audit — **~$10–15/mo, ~$120–180/yr** {#secrets-audit}
+---
 
-127 secrets × $0.40 = $50.80. Some show `LastAccessedDate: None` — never read since creation.
+## Data transfer optimization
 
-```bash
-aws secretsmanager list-secrets --region us-east-1 \
-  --query "SecretList[?LastAccessedDate==null].[Name,CreatedDate]" --output table
-```
-
-Candidates for review:
-- Per-MCP-integration OAuth pairs for integrations that were never launched.
-- Old `skygen/google-drive-*` if `skygen/google-restricted-*` replaced them.
-
-For non-sensitive config, **SSM Parameter Store** (Standard tier) is free up to 10,000 parameters.
-
-### 7. Prod MultiAZ RDS — **negative savings, reliability decision** {#rds-multiaz}
-
-`skygen-prod-db` is single-AZ. Enabling MultiAZ ~doubles RDS cost (~$24/mo extra). This is *added* spend, but pays for itself if an AZ outage stops revenue for 15 minutes. Flag for the team as a reliability decision, not a cost decision.
-
-### Tier 2 total (excluding MultiAZ add): **~$260–320/mo, ~$3,100–3,800/yr**
-
-## Tier 3: Needs investigation {#tier-3}
-
-Savings depend on what the resource actually does. Investigate before acting.
-
-### 1. OSWorld EC2 instances — **up to $100/mo = $1,200/yr if idle** {#osworld-cost}
-
-Three instances (`OSWorld Host` t3.large, 2× `OSWorld-Client-1` t3.xlarge) have been running since Feb–April 2026. t3.xlarge on-demand = ~$121/mo each. Total: **~$315/mo of compute** for the OSWorld trio.
-
-**Questions to answer:**
-- Is OSWorld benchmarking a continuous workload, or is it run for periodic evaluations?
-- If periodic: schedule start/stop via EventBridge (e.g., run 4 hrs/day = 83 % savings).
-- If continuous: look at utilization. CloudWatch `CPUUtilization` average — if <15 %, downsize.
-
-### 2. Lightsail `Ubuntu-1` (eu-north-1) — **$3.71–$10/mo = $45–120/yr** {#lightsail}
-
-Running since 2026-01-11, 2 vCPU / 2 GB. IP `13.62.245.190`. Purpose not documented.
-
-**Investigate:**
-- SSH into it: what's running? (`systemctl list-units --type=service --state=running`)
-- Does any DNS record point here? Any Skygen service reference this IP?
-- Delete if unused.
-
-### 3. Client VPN `eu-north-1` — **$5/mo = $60/yr** {#client-vpn-cost}
-
-March bill shows `EUN1-ClientVPN-EndpointHours = $5.05`. `describe-client-vpn-endpoints` returns empty. Either it's a stale association or there's a billing ghost.
-
-```bash
-aws ec2 describe-client-vpn-endpoints --region eu-north-1 --output json
-aws ec2 describe-client-vpn-routes --region eu-north-1 --client-vpn-endpoint-id ... 
-```
-
-### 4. `remote_desktop` EC2 (`i-0b2eb7657fb495db2`) — **~$30/mo if idle** {#remote-desktop}
-
-t3.medium, public IP `44.223.39.209`, running since April 3. Purpose not documented. Used for Cloud PC development? Orphaned demo host?
-
-### 5. Dev cluster monitoring scale-down — **~$15–25/mo, ~$180–300/yr** {#dev-monitoring}
-
-Dev Prometheus has 20 Gi PVC, Loki 10 Gi, Grafana 5 Gi — same as prod. Dev retention is rarely worth 15 days. Possible tune:
+EC2 data transfer within the same AZ is free. Within a region, cross-AZ traffic costs $0.01/GB each way. Pin pods and their data dependencies to the same AZ using topology spread constraints:
 
 ```yaml
-prometheus:
-  retention: 3d          # from 15d
-  retentionSize: 8GB     # from 20GB
-loki:
-  table_manager:
-    retention_period: 72h  # from 168h
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: backend
 ```
 
-Needs confirmation that nobody depends on 15-day dev retention for incident postmortems.
+---
 
-## Execution plan {#execution-plan}
+## Summary of potential savings
 
-Priority sorted by `savings / effort ratio × risk`. Do top-to-bottom.
+| Action | Estimated monthly saving |
+|--------|------------------------|
+| Spot instances for agent/worker nodes | $80–$150 |
+| Right-size backend pod requests | $20–$40 (fewer nodes needed) |
+| S3 Intelligent-Tiering on screenshots | $10–$30 (after 3 months) |
+| Disable CloudWatch audit logs (dev) | $15–$30 |
+| Self-hosted RabbitMQ in dev | $50 |
+| RDS dev instance scheduling (nights/weekends) | $40–$60 |
+| **Total** | **~$215–$360/month** |
 
-<Steps>
-  <Step title="Week 1 — Tier 1 verified waste">
-    1. Apply ECR lifecycle policies to all 7 repos → **$46/mo**
-    2. Set CloudWatch retention to 14d on 3 EKS log groups → **$5/mo**
-    3. Fix Karpenter `EC2NodeClass` subnetSelectorTerms → **$7/mo + security**
-    4. Resize dev Valkey 3→1 node → **$24/mo**
-    5. Delete 7 empty S3 buckets, 2 orphan VPCs, `Skygen-kuber-dev` ECS cluster → **$0 + hygiene**
-  </Step>
-  <Step title="Week 2 — Investigation">
-    1. SSH into Lightsail `Ubuntu-1`, document purpose, decide.
-    2. Check CloudWatch metrics for OSWorld CPU utilization.
-    3. Audit secrets with `LastAccessedDate: None`.
-    4. Query Client VPN endpoints in eu-north-1.
-  </Step>
-  <Step title="Week 3 — Complete ECS → EKS migration">
-    1. Verify DNS for `skygen.ai`, `www.skygen.ai`, `admin.skygen.ai` targets.
-    2. Port `webapp` and `adminpanel` to EKS deployments.
-    3. Switch traffic, observe for 48h.
-    4. Delete ECS `skygen-production` cluster + `database-landing-*` RDS.
-  </Step>
-  <Step title="Week 4 — Commit to Savings Plans">
-    Only after migration is done (so baseline is stable):
-    1. Buy 1-yr RI: RDS prod + RDS dev-eks + ElastiCache prod.
-    2. Buy 1-yr Compute Savings Plan at ~$0.40/hr commit level (covers EC2 + Fargate baseline).
-  </Step>
-  <Step title="Ongoing — Tier 2 architectural">
-    Fargate Spot for agent, dev MQ in-cluster, dev RDS consolidation, dev monitoring scale-down. Each is independent; sequence by what's least disruptive.
-  </Step>
-</Steps>
-
-## Cumulative savings table
-
-| Item | Monthly | Annual | Confidence |
-|------|---------|--------|------------|
-| ECR lifecycle | $46 | $552 | High |
-| Karpenter public IP | $7 | $84 | High |
-| Dev Valkey 3→1 | $24 | $288 | High |
-| CloudWatch retention | $5 | $60 | High |
-| **Tier 1 subtotal** | **$82** | **$984** | |
-| Complete ECS migration (net) | $95 | $1,140 | Medium (coordination risk) |
-| Savings Plans / RIs | $108 | $1,296 | High |
-| Dev RDS consolidation | $30 | $360 | Medium |
-| Fargate Spot | $20 | $240 | Medium |
-| Dev MQ in-cluster | $15 | $180 | Medium |
-| Secrets audit | $12 | $144 | Low–Medium |
-| **Tier 2 subtotal** | **$280** | **$3,360** | |
-| OSWorld scheduled start/stop | up to $100 | up to $1,200 | Needs investigation |
-| Lightsail delete (if unused) | $4 | $48 | Needs investigation |
-| Client VPN delete (if unused) | $5 | $60 | Needs investigation |
-| Dev monitoring scale-down | $20 | $240 | Low (non-critical) |
-| **Tier 3 subtotal** | **up to $130** | **up to $1,548** | |
-| **Grand total** | **up to $490/mo** | **up to $5,892/yr** | |
-
-Realistic target assuming all verified + most architectural + half of investigative: **~$350/mo, ~$4,200/yr** (~16 % of current bill).
-
-## See also
-
-- [AWS stack inventory](/deployment/aws-inventory) — what we use and why
-- [Deployment overview](/deployment/overview) — service topology
-- [Kubernetes](/deployment/k8s) — Karpenter, HPA, ingress
-- [Monitoring](/deployment/monitoring) — what runs in the `monitoring` namespace
+Apply changes incrementally and monitor Prometheus metrics after each change to detect regressions.

@@ -1,418 +1,295 @@
 ---
-title: "SOC 2 readiness"
-description: "Gap analysis and phased roadmap to SOC 2 Type 1 → Type 2. What's done, what's missing, what it costs."
+title: "SOC 2 Readiness"
+description: "Security controls, compliance status, and gap analysis for Skygen's SOC 2 Type 1 readiness."
 ---
 
-This page is Skygen's internal SOC 2 readiness plan. It lists what we already have, where we fall short, and the exact sequence of work to reach a Type 1 attestation and then a Type 2 observation window.
+## Overview
 
-<Note>
-**Target:** SOC 2 Type 1 report in ~3–4 months, then 6–12 month observation window for Type 2. Start scope: **Security** Trust Service Criterion only (Availability, Confidentiality, Processing Integrity, Privacy can be added later).
-</Note>
+Skygen is working toward SOC 2 Type 1 compliance. This document tracks the current state of security controls across the five Trust Service Criteria (Security, Availability, Processing Integrity, Confidentiality, Confidentiality). It identifies existing controls, known gaps, and remediation priorities.
 
-## TL;DR
+---
 
-- **Ready today:** core encryption, IRSA-based keyless auth, protected-branch CI/CD, subprocessor list, in-app TOTP for end-users, Loki + Prometheus observability.
-- **Blocks Type 1:** no CloudTrail, no IAM MFA for team members, no password policy, no GuardDuty/Security Hub/Config, no vulnerability scanning in CI, no WAF, no written policies, no formal incident response.
-- **Estimated cost:** $15k–30k/yr compliance-automation platform (Vanta/Drata/Secureframe), $10k–25k for auditor (Type 1 + Type 2), plus small AWS service uplift (~$100/mo).
-- **Effort:** ~1 FTE for 10–14 weeks to get to Type 1. Thereafter continuous evidence collection.
+## Encryption
 
-## What is SOC 2 (30-second version)
+### Encryption in transit
 
-SOC 2 is an **auditor's attestation** that your controls work as advertised for at least one of five Trust Service Criteria:
+| Control | Status | Implementation |
+|---------|--------|----------------|
+| TLS 1.2+ on all public endpoints | Implemented | ACM wildcard cert on ALB; `*.skygen.ai` |
+| HTTPS enforced (no HTTP) | Implemented | ALB listener redirect 80 → 443 |
+| WebSocket (WSS) | Implemented | Socket.IO over HTTPS |
+| Internal pod-to-pod | Partial | EKS pods communicate over VPC; mTLS not yet enforced |
+| Database in transit | Implemented | RDS SSL enforced via `?sslmode=require` in DATABASE_URL |
+| Redis in transit | Implemented | ElastiCache in-transit encryption enabled |
 
-1. **Security** — required. Protection against unauthorized access.
-2. **Availability** — uptime commitments.
-3. **Confidentiality** — protection of customer-designated confidential data.
-4. **Processing Integrity** — operations are complete, valid, accurate.
-5. **Privacy** — personal information is handled per the privacy notice.
+### Encryption at rest
 
-**Type 1** = controls are designed correctly at a point in time. **Type 2** = controls operated effectively over 3–12 months. Most enterprise buyers accept Type 1 short-term and require Type 2 after a year.
+| Control | Status | Implementation |
+|---------|--------|----------------|
+| RDS encryption | Implemented | EBS-backed encryption enabled at cluster creation |
+| S3 encryption | Implemented | S3 SSE-S3 (AES-256) on all buckets |
+| ElastiCache encryption | Implemented | At-rest encryption enabled |
+| MCP credentials (connector secrets) | Implemented | AES encryption via `MCP_CRYPTO_KEY` in `connectors_crypto.py` |
+| Telegram session data | Implemented | Encrypted with `MCP_CRYPTO_KEY` |
+| JWT secret | Implemented | `SECRET_KEY` stored in AWS Secrets Manager |
 
-## Current state audit
+---
 
-### What's in place (evidence exists today) {#have}
+## Access control
 
-| Control family | Control | Evidence |
-|---------------|---------|----------|
-| Encryption at rest | RDS `skygen-prod-db` encrypted (KMS) | `aws rds describe-db-instances` shows `StorageEncrypted=true` on 4 of 5 instances |
-| Encryption at rest | S3 buckets server-side encryption (AES256) | `skygen-files-prod`, `skygen-screenshots-us`, `skygen-cloudpc-profiles-prod` all `AES256` |
-| Encryption at rest | ElastiCache Valkey at-rest + in-transit encrypted, prod auth token enabled | `AtRestEncryptionEnabled=true`, `AuthTokenEnabled=true` on prod |
-| Encryption in transit | ACM certs on all public ALBs, TLS 1.2+ enforced | 4 issued certs, ALB redirect `:80 → :443` |
-| Access control | IRSA (keyless auth for pods) | `skygen-prod-backend`, `skygen-dev-backend`, `skygen-eks-external-secrets` IAM roles |
-| Access control | Root account MFA enabled | `AccountMFAEnabled=1` |
-| Access control | S3 public access blocked (most buckets) | BlockPublicAcls = true on 3/4 sampled buckets |
-| Secrets management | AWS Secrets Manager + ExternalSecrets | 127 secrets, no plaintext in git |
-| Application security | JWT with configurable TTL, HMAC-SHA256 | `Backend/app/routers/security/` |
-| Application security | **User-facing TOTP 2FA** | `pyotp` + `qrcode`, `Backend/app/routers/security/security.py` |
-| Application security | Password hashing via `passlib` / `bcrypt` | standard |
-| Change management | Protected branches (`main`, `develop`) require PR | per CLAUDE.md: "user cannot push to main or develop" |
-| Change management | Zero-downtime rolling deploys | K8s `RollingUpdate` with `maxUnavailable: 0` |
-| Backup | RDS automated backups 7 days | all instances except `database-landing-dev` |
-| Monitoring | Prometheus + Grafana + Loki + Alertmanager → Telegram | `monitoring` namespace |
-| Network | Private subnets for prod EKS nodes (mostly) | 6/8 prod-context instances private |
-| Subprocessor tracking | Vendor inventory page published | [Subprocessors](/security/subprocessors) |
+### Identity and authentication
 
-### Critical gaps (Type 1 blockers) {#blockers}
-
-These must be fixed before an auditor will sign off.
+| Control | Status | Gap |
+|---------|--------|-----|
+| JWT-based API authentication | Implemented | — |
+| Admin role (`is_admin`) | Implemented | No role hierarchy beyond binary admin/user |
+| AWS IAM for infrastructure | Partial | 0/9 IAM users have MFA enabled (Type 1 blocker) |
+| IAM password policy | Not implemented | No minimum length, complexity, or rotation policy |
+| Service account IRSA | Implemented | Backend and agent SAs use IRSA for S3/Secrets Manager |
+| Stale access keys | Not remediated | Some IAM users have access keys older than 90 days |
 
 <Warning>
-Each row here is a Type 1 blocker — a common control that auditors flag on almost every SOC 2 engagement.
+  IAM MFA and password policy are **Type 1 blockers**. These must be remediated before an auditor engagement. Enable MFA for all IAM users and attach a password policy via `aws iam update-account-password-policy`.
 </Warning>
 
-| Gap | Why it blocks SOC 2 | Fix effort |
-|-----|---------------------|------------|
-| **No CloudTrail** | CC6.1 / CC7.2: no audit log of AWS API actions. "Who did what in AWS" is unanswerable. | 30 min |
-| **IAM users without MFA** | CC6.1: 9 human IAM users (`Arseniy`, `Dima`, `Egor`, `Mike`, `Nikita`, `Pavel`, `Ruslan`, `Said`, `Valentina`) all have `MFA=0`. | 1 hr (enforce + user enrolment) |
-| **No IAM password policy** | CC6.1: `get-account-password-policy` returns NoSuchEntity. | 15 min |
-| **No GuardDuty** | CC7.1: threat detection is a "standard" AWS control auditors expect. | 10 min |
-| **No Security Hub** | CC7.2: central compliance posture view. | 10 min |
-| **No AWS Config** | CC7.1: can't evidence "drift detection" on security-relevant resources. | 1 hr |
-| **No Access Analyzer** | CC6.3: can't show you detect overly-permissive IAM. | 5 min |
-| **No SECURITY.md** | CC7.1: no published vulnerability disclosure path. | 30 min |
-| **No vulnerability scanning in CI** | CC7.1: dependencies are not continuously scanned. | 2 hr (enable Dependabot + CodeQL) |
-| **No written policies** | CC1.1–CC1.4: Information Security, Access Control, Incident Response, etc. | 20–40 hr to draft from templates |
-| **RDS `DeletionProtection=False`** on prod | CC6.1: single command erases production. | 5 min |
-| **S3 versioning disabled everywhere** | CC7.2: no rollback path from object overwrite/delete. | 15 min per critical bucket |
-| **Access keys rotation** | Arseniy (Dec 2025), Ruslan (Jan 2026) — >90 days old. | ongoing (90-day rotation policy) |
-| **Prod RDS single-AZ** | A1.2 (Availability, if scoped): no failover capability. | 5 min config change + ~30 min downtime |
-| **`database-landing-dev` unencrypted** | CC6.7: inconsistent encryption posture. | encrypted snapshot → restore = ~30 min + downtime |
+### Network access control
 
-### Good-to-have gaps (not Type 1 blockers, but expected by Type 2)
+| Control | Status | Notes |
+|---------|--------|-------|
+| VPC isolation | Implemented | Private subnets for RDS, ElastiCache, Amazon MQ |
+| Security groups | Implemented | Least-privilege inbound rules per resource type |
+| WAF | Not implemented | No AWS WAF in front of ALB — blocker for Type 1 |
+| Public API HTTPS only | Implemented | ALB + ACM |
 
-| Gap | Notes |
-|-----|-------|
-| No WAF on internet-facing ALBs | Cloudflare may provide DNS-level WAF; confirm and document. Auditors accept either. |
-| No SIEM aggregation beyond Loki | Auditors accept Loki as long as retention is documented. Needs 30d retention proof. |
-| No background checks on new hires | HR-side control, required by most SOC 2 auditors. |
-| No annual security training records | Need evidence that engineers completed it annually. |
-| No formal access review cadence | Quarterly manual review is standard. |
-| No penetration test | Annual pentest is expected by most customers at SOC 2 time. |
-| No BCDR drill log | Quarterly tabletop exercise, documented outcome. |
+---
 
-## Phased roadmap
+## Logging and monitoring
 
-### Phase 0: AWS-level fixes (Week 1) {#phase-0}
+| Control | Status | Notes |
+|---------|--------|-------|
+| Application logging | Implemented | JSON logs in Loki (JSON_LOGS=true in configmap) |
+| HTTP request logging | Implemented | `logging_middleware.py` logs all requests with caller type, latency, status |
+| Safety violation logging | Implemented | All `UNSAFE` and `NEED_HUMAN_CLARIFICATION` verdicts persisted |
+| CloudTrail | Not implemented | Type 1 blocker — no AWS API audit trail |
+| GuardDuty | Not implemented | No threat detection enabled |
+| AWS Config | Not implemented | No configuration compliance monitoring |
+| Security Hub | Not implemented | No centralized security finding aggregation |
+| Alerting | Implemented | Alertmanager → Telegram for application errors |
 
-One focused half-day. Cheap, high-value, no code changes.
+<Warning>
+  CloudTrail must be enabled before SOC 2 audit. Enable for all regions: `aws cloudtrail create-trail --name skygen-audit --s3-bucket-name skygen-cloudtrail-logs --is-multi-region-trail`
+</Warning>
 
-<Steps>
-  <Step title="Enable CloudTrail (multi-region, log file validation on)">
-    ```bash
-    aws cloudtrail create-trail \
-      --name skygen-management-events \
-      --s3-bucket-name skygen-cloudtrail-logs-us \
-      --is-multi-region-trail \
-      --enable-log-file-validation \
-      --region us-east-1
-    aws cloudtrail start-logging --name skygen-management-events --region us-east-1
-    ```
-    Create the log bucket with object-lock (WORM) if possible. CloudTrail costs: first trail free for management events, ~$2/100k events for data events.
-  </Step>
-  <Step title="Enable IAM password policy">
-    ```bash
-    aws iam update-account-password-policy \
-      --minimum-password-length 14 \
-      --require-symbols \
-      --require-numbers \
-      --require-uppercase-characters \
-      --require-lowercase-characters \
-      --max-password-age 90 \
-      --password-reuse-prevention 10 \
-      --allow-users-to-change-password
-    ```
-  </Step>
-  <Step title="Enforce IAM MFA for all human users">
-    For each of the 9 users: walk them through adding a virtual MFA device (Google Authenticator / 1Password / Authy).
-    ```bash
-    # Attach deny-without-mfa policy to all human users
-    aws iam put-user-policy --user-name Arseniy \
-      --policy-name DenyAllExceptListedIfNoMFA \
-      --policy-document file://require-mfa-policy.json
-    ```
-    Standard AWS MFA-enforcement policy: [docs.aws.amazon.com/IAM/latest/UserGuide/tutorial_users-self-manage-mfa-and-creds.html](https://docs.aws.amazon.com/IAM/latest/UserGuide/tutorial_users-self-manage-mfa-and-creds.html)
-  </Step>
-  <Step title="Enable GuardDuty, Security Hub, Access Analyzer, Config">
-    ```bash
-    # GuardDuty
-    aws guardduty create-detector --enable --region us-east-1
+---
 
-    # Security Hub (auto-enables AWS Foundational + CIS benchmarks)
-    aws securityhub enable-security-hub --enable-default-standards --region us-east-1
+## Data protection
 
-    # IAM Access Analyzer (account-level)
-    aws accessanalyzer create-analyzer --analyzer-name skygen-account --type ACCOUNT --region us-east-1
+| Control | Status | Notes |
+|---------|--------|-------|
+| Data classification | Partial | PII (email, phone) stored; no formal classification policy |
+| Data retention policy | Partial | Soft-delete on sessions/messages; no automated purge |
+| Backup / PITR | Implemented | RDS PITR enabled; S3 versioning recommended |
+| Data isolation per user | Implemented | All queries filter by `user_id`; row-level enforcement |
+| Subprocessors documented | Partial | See [Subprocessors](/security/subprocessors) |
 
-    # Config (record all supported resources)
-    aws configservice put-configuration-recorder \
-      --configuration-recorder name=default,roleARN=arn:aws:iam::118183257315:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig,recordingGroup.allSupported=true \
-      --region us-east-1
-    aws configservice start-configuration-recorder --configuration-recorder-name default --region us-east-1
-    ```
-    Combined add-on cost: ~$30–80/mo depending on resource volume.
-  </Step>
-  <Step title="Turn on RDS DeletionProtection and S3 Versioning on critical buckets">
-    ```bash
-    for db in skygen-prod-db skygen-dev-db1-use1-eks database-landing-prod; do
-      aws rds modify-db-instance --db-instance-identifier $db --deletion-protection --apply-immediately --region us-east-1
-    done
-    for b in skygen-files-prod skygen-screenshots-us skygen-cloudpc-profiles-prod; do
-      aws s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled
-    done
-    ```
-  </Step>
-  <Step title="Encrypt `database-landing-dev`">
-    No in-place encryption on RDS — take encrypted snapshot, restore as new instance, cut over.
-  </Step>
-</Steps>
+---
 
-Cost: ~$80–150/mo ongoing AWS uplift. Effort: 1 engineer, 1 day.
+## Vulnerability management
 
-### Phase 1: Code & CI/CD hardening (Weeks 2–3) {#phase-1}
+| Control | Status | Notes |
+|---------|--------|-------|
+| Container image scanning | Not implemented | No ECR image scanning enabled |
+| Dependency scanning | Not implemented | No automated CVE scanning on Python/Node deps |
+| Penetration testing | Not performed | Required for Type 2 |
+| Secret scanning | Partial | `.env` in `.gitignore`; no automated git-secrets hook |
 
-<Steps>
-  <Step title="Add GitHub Dependabot config">
-    In every repo root — `.github/dependabot.yml`:
-    ```yaml
-    version: 2
-    updates:
-      - package-ecosystem: pip
-        directory: "/Backend"
-        schedule: { interval: weekly }
-      - package-ecosystem: pip
-        directory: "/Agent"
-        schedule: { interval: weekly }
-      - package-ecosystem: npm
-        directory: "/WebApp"
-        schedule: { interval: weekly }
-      - package-ecosystem: docker
-        directory: "/Backend"
-        schedule: { interval: weekly }
-    ```
-  </Step>
-  <Step title="Enable CodeQL (static analysis)">
-    Add `.github/workflows/codeql.yml` using GitHub's default CodeQL setup. Covers Python + JavaScript/TypeScript for free on public repos, Advanced Security on private.
-  </Step>
-  <Step title="Add secret scanning">
-    GitHub Advanced Security → Secret scanning on. If not licensed: use Gitleaks as a CI step.
-  </Step>
-  <Step title="Add container vulnerability scanning in CI">
-    After `docker push`, run Trivy or AWS ECR's built-in scan-on-push:
-    ```bash
-    aws ecr put-image-scanning-configuration \
-      --repository-name skygen/backend \
-      --image-scanning-configuration scanOnPush=true \
-      --region us-east-1
-    # repeat for all 7 repos
-    ```
-  </Step>
-  <Step title="Publish SECURITY.md">
-    Root-level `SECURITY.md` with vulnerability-disclosure address (e.g., `security@skygen.ai`), response SLA, and scope.
-  </Step>
-  <Step title="Tighten branch protection">
-    Required on `main` / `develop`:
-    - Pull request required, 1+ approver
-    - Status checks must pass (CodeQL, tests, Dependabot alerts reviewed)
-    - Dismiss stale approvals on new commits
-    - Require signed commits (optional, recommended)
-    - No force-push
-  </Step>
-</Steps>
+---
 
-Effort: 1 engineer, 3–5 days.
+## Incident response
 
-### Phase 2: Documented policies (Weeks 3–6) {#phase-2}
+| Control | Status | Notes |
+|---------|--------|-------|
+| Incident response plan | Not documented | Required for Type 1 |
+| On-call rotation | Informal | Telegram alerts to team; no formal runbook |
+| Post-mortem process | Informal | Issues tracked in ClickUp |
 
-SOC 2 requires *written, approved, communicated* policies. Draft from templates, have the CEO/CTO sign, store in `mintlify-docs/security/policies/`.
+---
 
-Minimum policy set:
+## Availability
 
-1. **Information Security Policy** — top-level commitment
-2. **Access Control Policy** — who gets what, review cadence
-3. **Data Classification Policy** — what's confidential, how it's labeled
-4. **Acceptable Use Policy** — what employees can and can't do on company systems
-5. **Incident Response Plan** — detection, triage, escalation, RCA, post-mortem
-6. **Business Continuity / Disaster Recovery Plan** — RTO, RPO, test schedule
-7. **Change Management Policy** — the PR + review + deploy process you already use, written down
-8. **Vendor Management Policy** — how subprocessors are added (the [Subprocessors](/security/subprocessors) page plus a vetting checklist)
-9. **Data Retention & Destruction Policy** — how long we keep what, how we delete
-10. **Secure SDLC Policy** — coding standards, review requirements, dependency hygiene
-11. **Risk Assessment Policy** — annual risk register + review
-12. **HR / Personnel Security Policy** — onboarding checklist, background-check requirement, training, offboarding
-13. **Physical Security Policy** — laptops, office access (even remote-first teams need this)
-14. **Cryptographic Controls Policy** — what's encrypted, how keys are managed
-15. **Privacy / Data Subject Rights Policy** — GDPR/CCPA handling
+| Control | Status | Notes |
+|---------|--------|-------|
+| Multi-replica deployment | Implemented | 2+ replicas with HPA |
+| PodDisruptionBudget | Implemented | `minAvailable: 1` on backend |
+| Health checks | Implemented | `/health` (liveness) and `/ready` (readiness) probes |
+| Database HA | Implemented | RDS Multi-AZ in production |
+| RTO/RPO defined | Not defined | Required for availability trust criterion |
 
-Don't write from scratch. Start from:
-- Compliance-automation platforms (Vanta/Drata/Secureframe) bundle ~40 template policies.
-- **Free alternative:** [JupiterOne policy templates](https://github.com/JupiterOne/security-policy-templates) (MIT-licensed).
+---
 
-Effort: 20–40 hours over 3 weeks, split across founder-level approvers.
+## Remediation roadmap
 
-### Phase 3: Compliance-automation platform (Week 4 onwards, parallel) {#phase-3}
+### Phase 1 — Type 1 blockers (30 days)
 
-An automation platform collects evidence continuously so Type 2 is not a scramble at the end of the observation window. Three leaders in the space:
+1. Enable MFA for all AWS IAM users
+2. Set IAM account password policy (min 12 chars, require uppercase, lowercase, numbers, symbols, 90-day rotation)
+3. Enable CloudTrail in all regions, ship to S3
+4. Enable AWS WAF on the ALB with OWASP managed rule group
+5. Enable GuardDuty on the AWS account
+6. Rotate all stale IAM access keys
 
-| Platform | Strength | Indicative price (50 employees) |
-|----------|----------|------------------------------|
-| **Vanta** | Most mature, biggest integration library, SOC 2 playbooks are opinionated | ~$11k/yr base + SOC 2 add-on |
-| **Drata** | Strongest automation of evidence collection, good UX | ~$14k/yr |
-| **Secureframe** | Cheaper entry point, solid for SOC 2 + ISO 27001 dual track | ~$7k/yr base |
-| **Sprinto** | Startup-focused, best budget option | ~$6k/yr |
+### Phase 2 — Operational controls (60 days)
 
-All four integrate with AWS (via read-only IAM role), GitHub, Google Workspace, Slack, MDM, Okta, etc. They auto-import users, run daily checks, produce auditor-ready evidence.
+7. Enable ECR image scanning on push
+8. Add automated dependency scanning (e.g., `pip-audit`, `npm audit`) to CI pipeline
+9. Document data retention policy and implement automated purge for deleted sessions
+10. Write formal incident response plan
+11. Enable AWS Config with CIS AWS Foundations benchmark rules
 
-**Recommendation:** pick **Vanta** if you can afford it, **Secureframe** or **Sprinto** if budget-constrained. All three will cut audit prep time by ~60%.
+### Phase 3 — Type 2 preparation (90 days)
 
-### Phase 4: People & process (Weeks 6–10) {#phase-4}
+12. Engage pen testing firm for external assessment
+13. Implement formal on-call rotation with runbooks
+14. Enable S3 versioning on all buckets
+15. Implement mTLS for internal pod-to-pod communication
 
-- **Background checks** on new hires (e.g., Certn, Checkr) — $50–100 per hire.
-- **Annual security training** — KnowBe4, Ninjio, or free Federal Virtual Training Environment + attestation form.
-- **Phishing simulation** — KnowBe4 or Hoxhunt.
-- **MDM for company laptops** — Kandji (macOS) or Fleet/Jamf. Enforces disk encryption, screen lock, OS updates.
-- **Quarterly access reviews** — each manager confirms their team's AWS / GitHub / SaaS permissions.
-- **Quarterly IR tabletop exercise** — walk through a ransomware or data breach scenario, record outcomes.
-- **Onboarding / offboarding runbooks** — checklist with SaaS accounts, SSH keys, AWS IAM, GitHub.
+---
 
-### Phase 5: Penetration test (Week 10–12) {#phase-5}
+## Phase 1 remediation commands
 
-Most customers will ask for a third-party pentest report at SOC 2 time. Vendors:
+The following AWS CLI commands address the Type 1 blockers listed above. Run these from a shell with administrator-level AWS credentials.
 
-- **Cobalt** — Pentest-as-a-service, ~$8k–15k per engagement, 1–2 weeks turnaround
-- **Bishop Fox** — top-tier, $25k+, 2–3 weeks
-- **HackerOne / Bugcrowd** — bug-bounty model, pricing variable
+### Enable CloudTrail
 
-Plan to remediate findings before auditor comes on site.
+```bash
+# Create S3 bucket for CloudTrail logs
+aws s3api create-bucket \
+  --bucket skygen-cloudtrail-logs \
+  --region us-east-1
 
-### Phase 6: Select auditor & run Type 1 (Weeks 12–18) {#phase-6}
+# Apply bucket policy to allow CloudTrail writes
+aws s3api put-bucket-policy \
+  --bucket skygen-cloudtrail-logs \
+  --policy file://cloudtrail-bucket-policy.json
 
-**Auditor shortlist** — firms commonly used by YC-stage SaaS:
+# Create multi-region trail
+aws cloudtrail create-trail \
+  --name skygen-audit \
+  --s3-bucket-name skygen-cloudtrail-logs \
+  --is-multi-region-trail \
+  --include-global-service-events \
+  --enable-log-file-validation
 
-- **Prescient Assurance** — fast, startup-friendly, Vanta/Drata integrated
-- **A-LIGN** — large, well-known, slower
-- **Johanson Group** — mid-size, good pricing
-- **BARR Advisory** — tech-focused, deep cloud expertise
-
-Typical Type 1 price: $10k–18k. Type 2 (first year): $15k–25k. Observation window: 3 months minimum, 6 months more commonly accepted.
-
-**Timeline (conservative):**
-
-```
-Wk 1   AWS fixes              ────────
-Wk 2-3 CI/CD hardening              ──────
-Wk 3-6 Draft policies                       ─────────────
-Wk 4-10 Vanta/Drata onboarding               ─────────────────────
-Wk 6-10 People & process                             ──────────────
-Wk 10-12 Pentest                                              ───────
-Wk 12-14 Audit fieldwork (Type 1)                                   ──────
-Wk 14-18 Report issued + remediations                                   ────────
-Month 6+ Type 2 observation window begins
+# Start logging
+aws cloudtrail start-logging --name skygen-audit
 ```
 
-## Cost summary (first year)
+### Enforce IAM password policy
 
-| Bucket | Low | High |
-|--------|-----|------|
-| AWS service uplift (CloudTrail, GuardDuty, Config, Security Hub) | $1k | $2k |
-| Compliance automation platform | $6k (Sprinto) | $14k (Drata) |
-| Auditor (Type 1 + Type 2) | $25k | $40k |
-| Penetration test | $8k | $15k |
-| MDM + training + background checks | $3k | $6k |
-| Internal effort (~250 engineer-hours) | — | — |
-| **Total** | **$43k** | **$77k** |
-
-Many YC/Series-A companies come in around **$50k–60k** for year one.
-
-## Ownership
-
-SOC 2 work concentrates on one person or role:
-
-| Role | Responsibilities |
-|------|------------------|
-| **SOC 2 program lead** (founder/CTO) | Policy approvals, auditor selection, budget, final sign-off |
-| **Security engineer / DevOps** | AWS hardening, CI/CD, evidence collection, technical controls |
-| **HR / People Ops** | Background checks, training, offboarding |
-| **Every engineer** | Complete annual training, use MFA, log security bugs |
-
-## Checklist — ready to hand to an auditor?
-
-Copy-paste this into a spreadsheet and tick as you go.
-
-```
-Phase 0 — AWS
-[ ] CloudTrail enabled (multi-region, log file validation)
-[ ] CloudTrail logs in WORM-locked S3
-[ ] IAM password policy applied
-[ ] All human IAM users enrolled in MFA
-[ ] Force-MFA policy attached to all human users
-[ ] GuardDuty enabled
-[ ] Security Hub enabled (AWS Foundational + CIS)
-[ ] AWS Config enabled (all supported resources)
-[ ] IAM Access Analyzer created
-[ ] RDS DeletionProtection enabled on prod + landing-prod + dev-db1-eks
-[ ] S3 Versioning enabled on files-prod, screenshots-us, cloudpc-profiles-prod
-[ ] database-landing-dev encrypted
-[ ] Access keys rotated (Arseniy, Ruslan)
-[ ] Prod RDS MultiAZ enabled (if Availability in scope)
-
-Phase 1 — Code / CI
-[ ] Dependabot config in every repo
-[ ] CodeQL workflow added
-[ ] Secret scanning enabled (GitHub or Gitleaks)
-[ ] ECR scanOnPush=true on all 7 repos
-[ ] SECURITY.md published with security@skygen.ai contact
-[ ] Branch protection: required reviews, status checks, no force-push
-[ ] Signed commits (optional but recommended)
-
-Phase 2 — Policies (all approved + dated + shared)
-[ ] Information Security Policy
-[ ] Access Control Policy
-[ ] Data Classification Policy
-[ ] Acceptable Use Policy
-[ ] Incident Response Plan
-[ ] BCDR Plan
-[ ] Change Management Policy
-[ ] Vendor Management Policy
-[ ] Data Retention & Destruction Policy
-[ ] Secure SDLC Policy
-[ ] Risk Assessment Policy
-[ ] HR / Personnel Security Policy
-[ ] Physical Security Policy
-[ ] Cryptographic Controls Policy
-[ ] Privacy Policy
-
-Phase 3 — Automation
-[ ] Compliance platform selected (Vanta / Drata / Secureframe / Sprinto)
-[ ] AWS read-only role for platform
-[ ] GitHub, Google Workspace, Slack connected
-[ ] MDM integrated
-[ ] All open findings resolved to <10 medium/low
-
-Phase 4 — People
-[ ] Background checks on all current + future hires
-[ ] Annual security training platform live
-[ ] Phishing simulation run (at least one)
-[ ] MDM enrollment on every laptop
-[ ] Quarterly access review run (evidence kept)
-[ ] Quarterly IR tabletop exercise run
-[ ] Onboarding runbook documented
-[ ] Offboarding runbook documented
-
-Phase 5 — Validation
-[ ] Penetration test complete
-[ ] All critical + high findings remediated
-
-Phase 6 — Audit
-[ ] Auditor selected (Prescient / A-LIGN / Johanson / BARR)
-[ ] Audit scoping call complete
-[ ] Evidence handover complete
-[ ] Type 1 report issued
-[ ] Type 2 observation window started
+```bash
+aws iam update-account-password-policy \
+  --minimum-password-length 14 \
+  --require-symbols \
+  --require-numbers \
+  --require-uppercase-characters \
+  --require-lowercase-characters \
+  --allow-users-to-change-password \
+  --max-password-age 90 \
+  --password-reuse-prevention 12 \
+  --hard-expiry
 ```
 
-## See also
+### Enable GuardDuty
 
-- [Subprocessors](/security/subprocessors) — vendor inventory (feeds Vendor Management Policy)
-- [AWS stack inventory](/deployment/aws-inventory) — asset inventory for auditor
-- [Cost optimization](/deployment/cost-optimization) — concurrent work; some items overlap (CloudWatch retention, orphan resources)
-- [Deployment overview](/deployment/overview) — system description (required artifact in SOC 2 report)
+```bash
+# Enable GuardDuty detector in us-east-1
+aws guardduty create-detector \
+  --enable \
+  --finding-publishing-frequency FIFTEEN_MINUTES \
+  --region us-east-1
+
+# Retrieve detector ID
+DETECTOR_ID=$(aws guardduty list-detectors --region us-east-1 \
+  --query 'DetectorIds[0]' --output text)
+echo "GuardDuty detector: $DETECTOR_ID"
+```
+
+### Enable WAF on ALB
+
+```bash
+# Create WAF Web ACL with OWASP managed rule group
+aws wafv2 create-web-acl \
+  --name skygen-waf \
+  --scope REGIONAL \
+  --region us-east-1 \
+  --default-action Allow={} \
+  --rules '[
+    {
+      "Name": "AWSManagedRulesCommonRuleSet",
+      "Priority": 1,
+      "OverrideAction": {"None": {}},
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesCommonRuleSet"
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "AWSManagedRulesCommonRuleSetMetric"
+      }
+    }
+  ]' \
+  --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName=skygen-waf
+
+# Associate with the ALB
+ALB_ARN=$(aws elbv2 describe-load-balancers \
+  --query 'LoadBalancers[?contains(LoadBalancerName, `skygen`)].LoadBalancerArn' \
+  --output text)
+
+WAF_ACL_ARN=$(aws wafv2 list-web-acls --scope REGIONAL --region us-east-1 \
+  --query 'WebACLs[?Name==`skygen-waf`].ARN' --output text)
+
+aws wafv2 associate-web-acl \
+  --web-acl-arn $WAF_ACL_ARN \
+  --resource-arn $ALB_ARN \
+  --region us-east-1
+```
+
+---
+
+## Existing compliant controls
+
+The following controls are already in place and can serve as evidence in an audit engagement.
+
+### Evidence for CC6 (Logical and Physical Access)
+
+- **JWT authentication**: All API requests require `Authorization: Bearer <token>`. Tokens are signed with `HS256` using `SECRET_KEY` from AWS Secrets Manager. Implementation: `Backend/app/security.py`.
+- **IRSA for service accounts**: Pods access AWS services (S3, Secrets Manager) through IAM Roles for Service Accounts, not long-lived key pairs. IAM role annotations in `Backend/k8s/backend/deployment.yaml`.
+- **Per-user data isolation**: Every database query filters by `user_id`. No cross-user data access is possible at the API layer. Evidence: repository layer in `Backend/app/repositories/`.
+
+### Evidence for CC7 (System Operations)
+
+- **Application logging**: All HTTP requests logged with caller type, latency, and status code via `logging_middleware.py`. Logs shipped to Loki (`skygen-us-dev` and `skygen-us-prod` clusters).
+- **Alerting pipeline**: Prometheus → Alertmanager → Telegram for all `severity: critical` alerts. Alertmanager config in `Backend/k8s/monitoring/`.
+- **Safety violation audit trail**: All `UNSAFE` and `NEED_HUMAN_CLARIFICATION` verdicts persisted to the `safety_violations` table with user, task, input, and output captured.
+
+### Evidence for CC9 (Risk Mitigation)
+
+- **Connector secret encryption**: All custom connector credentials encrypted at rest using AES via `MCP_CRYPTO_KEY`. API responses redact secrets as `[REDACTED]`. Implementation: `Backend/app/routers/connectors_crypto.py`.
+- **SSRF protection**: All `base_url` and `spec_url` values in connector creation are validated against private IP ranges (RFC 1918, link-local, loopback) before saving. Implementation: `validate_url_not_ssrf()`.
+- **Webhook HMAC verification**: All inbound Composio webhooks are verified using HMAC-SHA256 with `COMPOSIO_WEBHOOK_SECRET` before processing.
+
+---
+
+## Compliance contacts
+
+| Role | Responsibility |
+|------|---------------|
+| Engineering Lead | Technical control implementation and evidence collection |
+| DevOps / Infrastructure | AWS hardening (CloudTrail, WAF, GuardDuty, MFA enforcement) |
+| Product Owner | Privacy policy, data retention policy, DPA agreements |
+| Auditor engagement | Scheduled for Q3 2026 (Type 1 target) |
+
+For DPA requests or compliance inquiries, contact the engineering team via the internal helpdesk.

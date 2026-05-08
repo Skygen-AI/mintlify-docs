@@ -1,0 +1,491 @@
+---
+title: "Agent Framework Architecture"
+description: "Class hierarchy, lifecycle state machine, BrokerAgent orchestration, Socket.IO connectivity, and end-to-end task flow for the Skygen Agent framework."
+---
+
+# Agent Framework Architecture
+
+The Skygen Agent framework is a multi-agent Python system that handles autonomous task execution across GUI automation, web research, software engineering, and MCP-based integrations. It is built around four design principles:
+
+- **ReAct loop** — every agent cycles through Think → Act → Observe until it terminates or hibernates.
+- **FADA (Fractal AsyncDual Architecture)** — any agent can operate as a pure performer *and* as an orchestrator that spawns and manages sub-agents. The role is not baked into the class; it is determined dynamically by whether the agent has active children.
+- **IoC (Inversion of Control)** — `BaseAgent.__init__` wires all sub-components via factory methods (`_create_tool_manager`, `_create_llm_manager`, etc.) that subclasses override to change behaviour without re-implementing the loop.
+- **Inbox / SharedEventLog** — asynchronous message passing between agents replaces direct method calls. Parent → child communication is via inbox; child → parent is via inbox messages of type `CHILD_DONE`, `CHILD_HIBERNATED`, `INFO`.
+
+---
+
+## Repository Layout
+
+```
+Agent/
+├── BrokerAgent/
+│   └── broker.py               # Top-level entry point; NOT a BaseAgent subclass
+├── Agents/
+│   ├── BaseAgent/
+│   │   ├── base.py             # BaseAgent — ReAct loop, all hooks, 2175 lines
+│   │   ├── Components.py       # Injected sub-components (LLMManager, ToolManager, …)
+│   │   ├── Tools.py            # All tool implementations (CommunicateTool, …)
+│   │   └── Prompts.py          # Prompt constants and templates
+│   ├── PlannerAgent/base.py    # Global orchestrator; TerminateGuard enabled
+│   ├── MCPToolsAgent/base.py   # Composio MCP integrations
+│   ├── DataFetcherAgent/base.py # Web research and search
+│   ├── ProjectSoftwareAgent/base.py  # Code development (SoftwareEngineerAgent)
+│   └── CUA_OrchestratorAgent/base.py # GUI automation orchestrator
+├── Services/
+│   ├── socketio_client.py      # AgentSocketIOClient — /agent namespace
+│   ├── cost_tracker.py         # Per-call billing accounting
+│   ├── redis_event_bus.py      # Redis Streams durable pub/sub
+│   └── task_cancellation_manager.py  # Distributed cancellation via Redis
+├── Utilities/
+│   ├── ModelRouter.py          # LLM selection and fallback
+│   ├── LLM_Providers/
+│   │   ├── ModelRegistry.py    # ModelCatalog — model metadata
+│   │   └── Base.py             # BaseProvider ABC
+│   ├── Hibernation/            # HibernationController, SentinelStore, strategies
+│   └── Toolkits/               # MCP tools, file ops, browser automation
+├── config.py                   # AgentConfig (Pydantic) loaded from env + YAML profiles
+└── model_profiles.yaml         # Model tier assignments per deployment profile
+```
+
+---
+
+## Class Hierarchy
+
+```
+BrokerAgent                         ← NOT a BaseAgent; owns the worker loop
+│
+└── (spawns via process_task)
+    │
+    └── PlannerAgent(BaseAgent)     ← Root orchestrator; TerminateGuard=True
+        │   subagent_classes: {
+        │     "mcp_tools_agent": MCPToolsAgent,
+        │     "cua_orchestrator": CUA_OrchestratorAgent,
+        │     "data_fetcher": DataFetcherAgent,
+        │     "software_engineer": SoftwareEngineerAgent,
+        │   }
+        │
+        ├── MCPToolsAgent(BaseAgent)         ← Composio integrations
+        ├── DataFetcherAgent(BaseAgent)      ← Web search / research
+        ├── SoftwareEngineerAgent(BaseAgent) ← Code generation / execution
+        └── CUA_OrchestratorAgent(BaseAgent) ← GUI automation
+
+BaseAgent                           ← Concrete class; all specialists inherit from it
+├── Components (injected via IoC factory methods)
+│   ├── LLMManager                  ← llm_call(), context compression
+│   ├── ToolManager                 ← tool registry, get_tool(), get_tools_block()
+│   ├── ActionExecutor              ← execute_bundle(), execute_single_action()
+│   ├── SafetyManager               ← guardrails, clarification hibernation
+│   ├── PromptBuilder               ← get_system_prompt(), construct_* blocks
+│   ├── MemoryManager               ← context window compression
+│   ├── KnowledgeManager            ← ICL insights from KnowledgeBase
+│   ├── SessionManager              ← cancellation polling, device-lock checks
+│   ├── AgentStateRepository        ← Redis persist/restore + KB sub-agent index
+│   ├── BudgetAlertManager          ← alert rules → system injections
+│   └── ForcedSummarizationManager  ← hard context compression at 90% of max tokens
+└── Tools (registered by ToolManager)
+    ├── CommunicateTool             ← inform / result / ask_text / ask_choice
+    ├── RequestConfirmationTool     ← ARCH-001 Approve/Reject hibernation card
+    ├── HibernateTool               ← hibernate_and_watch (timer / visual_condition)
+    ├── SwitchLifecycleModeTool     ← continuous / batch / time orchestration modes
+    ├── SubAgentManagerTool         ← create / query / interrupt_sleep sub-agents
+    ├── ManageScratchpadTool        ← append / edit / delete / clear personal notepad
+    ├── WaitTool                    ← short environmental delay (max 120s)
+    └── ParallelBranchesTool        ← concurrent tool branch execution
+```
+
+---
+
+## Lifecycle State Machine
+
+Each agent run produces one terminal status string returned by `BaseAgent.chat()`.
+
+```
+                    ┌─────────────┐
+                    │   CREATED   │
+                    └──────┬──────┘
+                           │ chat(context, state, llm_params)
+                           ▼
+              ┌────────────────────────┐
+              │       THINK PHASE      │  _execute_think_phase()
+              │   LLM call → JSON out  │
+              └────────────┬───────────┘
+                           │
+              ┌────────────▼───────────┐
+              │   GUARDRAILS PHASE     │  _execute_guardrails_phase()
+              │ safety check (async)   │  may → HIBERNATE for clarification
+              └────────────┬───────────┘
+                           │
+              ┌────────────▼───────────┐
+              │  PARSE + MEMORY PHASE  │  _execute_parse_and_memory_phase()
+              │ extract actions, ICL   │
+              └────────────┬───────────┘
+                           │
+              ┌────────────▼───────────┐
+              │      ACT PHASE         │  _execute_act_phase()
+              │  execute tool bundle   │
+              └────────────┬───────────┘
+                           │
+              ┌────────────▼───────────┐
+              │    OBSERVE PHASE       │  _observe_phase()
+              │ build observation msg  │
+              └────────────┬───────────┘
+                           │
+                    ╔══════╧══════╗
+                    ║  Terminal?  ║
+                    ╚══════╤══════╝
+              No ◄──────── │ ─────────► Yes
+              │             │              │
+              │       ╔═════╧═════╗        │
+              │       ║  Check    ║        │
+              │       ║ inbox /   ║        │
+              │       ║ cancel /  ║        │
+              │       ║ budget    ║        │
+              │       ╚═════╤═════╝        │
+              └─────── loop ┘        _terminal_return()
+                                          │
+              ┌───────────────────────────┤
+              │  Terminal status values:  │
+              │  "completed"              │ ← communicate(result)
+              │  "cancelled"              │ ← Redis cancel key set
+              │  "terminated_by_parent"   │ ← STOP inbox message
+              │  "max_iterations"         │ ← remaining_iter == 0
+              │  "billing_limit_reached"  │ ← BillingLimitReached exception
+              │  "unsafe"                 │ ← safety classifier hard block
+              │  "hibernating"            │ ← hibernate_and_watch / ask_text
+              │  "persisted"              │ ← state saved to Redis; woken later
+              │  "paused"                 │ ← PAUSE inbox message
+              └───────────────────────────┘
+```
+
+### Hibernation (ARCH-001)
+
+When an agent calls `hibernate_and_watch` or `request_confirmation`, or when `CommunicateTool.ask_text` returns `status="hibernate"`, the chat loop exits with status `"hibernating"` and a `_special_action: HIBERNATE` dict carrying `hibernate_config`. `SubAgentManagerTool._run_child_wrapper` detects this and calls `HibernationController.Hibernate()`, which registers a sentinel task in Redis. `BrokerAgent.sentinel_loop` drives the sentinel; when the condition fires (timer, user reply, visual), `BrokerWaker` enqueues the session for re-run and the agent resumes at exactly the point it hibernated.
+
+---
+
+## BrokerAgent Orchestration
+
+`BrokerAgent` is the entry point. It is **not** a `BaseAgent` subclass. It owns the RabbitMQ consumer, the internal asyncio queue, and the Socket.IO client. Each inbound task follows this path:
+
+```
+RabbitMQ queue (INPUT_QUEUE)
+      │
+      ▼
+BrokerAgent.start_consumer()          ← deserializes message, pushes to internal_queue
+      │
+      ▼
+BrokerAgent.worker_loop()             ← dequeues; max_workers concurrent workers
+      │
+      ▼
+BrokerAgent.process_task()            ← routes by agent_mode
+      │
+      ├── "auto"         → _run_planner_task()
+      ├── "llm"          → _run_llm_mode_task()    (no sub-agents, bare model)
+      ├── "deep_research"→ _run_datafetcher_task()  (with intent reclassify)
+      ├── "cua"          → _run_planner_task() + CUA specialist hint
+      └── "swe"          → _run_planner_task() + SWE specialist hint
+            │
+            ▼
+      BrokerAgent._run_chat_with_cancel_watch()
+            │   wraps agent.chat() with asyncio.wait()
+            │   polls Redis cancel key (soft cancel → STOP inbox msg;
+            │   hard cancel → asyncio.Task.cancel())
+            │
+            ▼
+      agent.chat(context, state, llm_params)  ← ReAct loop runs
+            │
+            ▼
+      BrokerAgent._publish_terminal_outcome()
+            │   posts final answer to Backend via Socket.IO or REST
+            └── _best_effort_task_cleanup()
+                  releases device lock, Redis markers, child sentinels
+```
+
+### Task Routing by `agent_mode`
+
+| `agent_mode` | Root agent spawned | Notes |
+|---|---|---|
+| `"auto"` | `PlannerAgent` | Default. Planner selects specialists automatically. |
+| `"llm"` | `PlannerAgent` (restricted) | No sub-agent delegation; single-turn or few-shot. |
+| `"deep_research"` | `DataFetcherAgent` | Intent may be reclassified before launch. |
+| `"cua"` | `PlannerAgent` | Cloud PC / desktop automation hint injected. |
+| `"swe"` | `PlannerAgent` | SWE specialist hint injected; sandbox pre-allocated. |
+
+---
+
+## Socket.IO Connectivity
+
+The Agent connects to the Backend via the `/agent` Socket.IO namespace through `AgentSocketIOClient`.
+
+```
+Backend /agent namespace
+        │
+        │  connect, heartbeat, session events
+        ▼
+AgentSocketIOClient (Services/socketio_client.py)
+        │
+        ├─ on("new_task")             → BrokerAgent internal_queue.put()
+        ├─ on("user_followup")        → BrokerAgent._handle_user_followup()
+        ├─ on("cancel_task")          → BrokerAgent._handle_user_cancel()
+        ├─ on("pause_agent")          → BrokerAgent._handle_agent_pause()
+        ├─ on("trigger_event")        → BrokerAgent._handle_trigger_event()
+        ├─ on("mcp_integration_active_changed")
+        │                             → BrokerAgent._handle_mcp_integration_active_changed()
+        ├─ on("mcp_connection_completed")
+        │                             → BrokerAgent._handle_mcp_connection_completed()
+        └─ on("cloud_pc_session_bound")
+                                      → BrokerAgent._handle_cloud_pc_session_bound()
+```
+
+**Reconnection strategy.** Python-socketio's built-in reconnect is disabled to prevent parallel reconnect storms. `AgentSocketIOClient` implements a custom exponential-backoff reconnect loop with jitter. On reconnect, it re-registers the device with the Backend and re-subscribes to all session events.
+
+**Redis event bus.** When `redis_url` is present, `AgentSocketIOClient` also creates a `RedisEventBus` (Redis Streams with consumer group `"agents"`). This allows horizontally scaled agent pods to receive session-specific events without each pod having a full Socket.IO connection to the Backend.
+
+---
+
+## End-to-End Task Flow
+
+The following sequence illustrates a typical `agent_mode="auto"` task from user message to final answer.
+
+<Steps>
+  <Step title="User sends message">
+    Frontend POSTs to `POST /api/v1/messages/send`. Backend validates billing, enqueues the task to RabbitMQ with `routing_key=INPUT_QUEUE`, and returns `202 Accepted`.
+  </Step>
+  <Step title="BrokerAgent dequeues">
+    `start_consumer()` reads the AMQP message. After deserialization, `process_task()` determines `agent_mode` and acquires a Redis device lock (`agent:task:{session_id}:active`, TTL 2h).
+  </Step>
+  <Step title="PlannerAgent spins up">
+    `BrokerAgent._run_planner_task()` instantiates `PlannerAgent` with a fully wired `AgentContext` (session_id, user_id, device_id, cancellation_manager, redis_client, send_chat_message_callback, status_callback).
+  </Step>
+  <Step title="ReAct loop begins">
+    `PlannerAgent.chat()` calls the parent `BaseAgent.chat()`. On the first iteration, `PromptBuilder.get_system_prompt()` assembles the XML-tagged instruction block. LLM is invoked via `LLMManager.llm_call()`. Model selection flows through `ModelRouter.Choose()`.
+  </Step>
+  <Step title="Sub-agent delegation">
+    When the Planner decides to delegate, it calls `SubAgentManagerTool(command="create", agent_type="data_fetcher", task="…")`. The tool spawns the specialist as a background `asyncio.Task`. The Planner then calls `SwitchLifecycleModeTool(mode="batch", steps_batch_size=15)` and waits.
+  </Step>
+  <Step title="Specialist executes">
+    The specialist runs its own ReAct loop. When complete, it calls `communicate(to="parent", message_type="result", content="…")`, which sends a `CHILD_DONE` inbox message to the Planner.
+  </Step>
+  <Step title="Planner synthesizes">
+    The Planner wakes from batch mode, reads the `CHILD_DONE` message from its inbox, synthesizes results, and eventually calls `communicate(to="user", message_type="result", content="…")`.
+  </Step>
+  <Step title="BrokerAgent publishes outcome">
+    `CommunicateTool` stamps `status=completed` on the message and returns `content_already_emitted=True`. `BrokerAgent._publish_terminal_outcome()` detects this and skips a second emit, preventing duplicate frontend bubbles. `_best_effort_task_cleanup()` releases all Redis locks.
+  </Step>
+</Steps>
+
+---
+
+## Redis Key Space
+
+| Key pattern | TTL | Purpose |
+|---|---|---|
+| `agent:task:{session_id}:active` | 2h | Device lock; prevents double-run |
+| `agent:task:{session_id}:cancel` | 1h | Cancellation signal |
+| `hibernation:user_reply:session:{session_id}` | configurable | Wake marker for ARCH-001 |
+| `agent_history:{agent_id}` | 24h | Per-agent conversation state (messages, scratchpad, plan) |
+| `sub_agents:uuid:{planner_id}` | — | Set of child agent UUIDs for a Planner |
+| `sub_agents:data:{agent_id}` | — | Hash of child agent metadata (task, summary, type) |
+| `sub_agents:events` | — | Stream of spawn/remove events |
+
+---
+
+## Alert and Budget System
+
+`BudgetAlertManager` evaluates registered `BaseAlertRule` implementations at the end of each loop iteration. If any rule fires, the resulting message is injected as a `role="system"` message into the next LLM call.
+
+| Rule | Trigger | Action |
+|---|---|---|
+| `TimeLimitAlertRule` | Checks at N_CHECKPOINTS=5 equal intervals | Progressive warnings + STOP at deadline |
+| `TokenBudgetAlertRule` | `soft_pct` (50%) and `hard_pct` (75%) of `max_context_tokens` | Warns to summarize; hard = escalate |
+| `ScratchpadUsageAlertRule` | Scratchpad idle for `scratchpad_alert_threshold_steps` | Prompts to update scratchpad |
+| `StepBudgetAlertRule` | `remaining_iter` below threshold | Warns to wrap up |
+| `PlanStagnationAlertRule` | No plan progress for N steps | Prompts re-evaluation |
+| `ReasoningOverlapAlertRule` | Cosine similarity ≥ 0.95 for 2 consecutive steps | COGNITIVE LOOP DETECTED alert; forces pivot |
+
+`ForcedSummarizationManager` is a parallel mechanism that fires at 90% of `max_context_tokens` and replaces the message history with a compressed summary, preserving only the system message and the first user message.
+
+---
+
+## BrokerAgent Reference
+
+`BrokerAgent` (`BrokerAgent/broker.py`) is the process entry point. It is **not** a `BaseAgent` subclass. All methods listed here are on the single `BrokerAgent` instance created by `run_agent.py`.
+
+### Constructor
+
+```python
+BrokerAgent(config: AgentConfig)
+```
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `config` | `AgentConfig` | Immutable process config. Never mutated — per-task model profile overrides are copied via `config.model_copy()` and stored on `payload._task_config`. |
+| `internal_queue` | `asyncio.Queue` | RabbitMQ messages land here after deserialization. Workers drain it. |
+| `ws_client` | `AgentSocketIOClient` | Socket.IO connection to Backend `/agent` namespace. |
+| `cancellation_manager` | `TaskCancellationManager` | Redis-backed cancel flag reads/writes. Built lazily; may be `None` if Redis is unavailable. |
+| `_active_agent_inboxes` | `Dict[str, Inbox]` | Maps `session_id → Inbox` for live agents. Used to deliver `USER_FOLLOWUP`, `PAUSE`, `USER_CANCEL` without going through RabbitMQ. |
+| `_pending_pauses` | `set` | Session IDs that received a pause signal before their inbox was registered. Delivered when `register_agent_inbox()` is called. |
+| `_hibernation_controller` | `HibernationController` | Lazily built. Manages Redis sentinel tasks for hibernate/wake. |
+| `_device_lock_manager` | `DeviceLockManager` | Lazily built from `cancellation_manager.redis_client`. |
+| `_session_lock_manager` | `SessionLockManager` | Lazily built alongside device manager. |
+| `_cloud_pc_binding_manager` | `CloudPcBindingManager` | Lazily built alongside device manager. |
+
+---
+
+### Lifecycle
+
+#### `async start()`
+
+1. Opens `aio_pika.connect_robust(rabbitmq_url)`.
+2. Creates Socket.IO client via `get_backend_session()` and registers all 7 event handlers.
+3. Creates `aiohttp.ClientSession` for cost tracking HTTP calls.
+4. Initializes `TaskCancellationManager` (Redis) — failure is non-fatal; cancellation degrades gracefully.
+5. Calls `start_workers()` to launch consumer + `max_workers` workers + 2 sentinel loops.
+
+#### `async stop()`
+
+Cancels all `worker_tasks`, drains them, closes HTTP session, disconnects Socket.IO, closes RabbitMQ connection.
+
+#### `rabbitmq_healthy → bool` (property)
+
+Checks `connection is not None and not connection.is_closed`. Used by K8s readiness probe at `GET /health/ready`.
+
+#### `async start_workers()`
+
+Launches:
+- 1 `start_consumer()` task — RabbitMQ → `internal_queue`
+- `config.max_workers` `worker_loop()` tasks — drain `internal_queue`
+- 2 `sentinel_loop()` tasks — drive hibernation timers; 2 replicas with Redis dedup prevent duplicate wakes
+
+#### `async start_consumer()`
+
+Declares `config.input_queue` (durable), iterates AMQP messages. Each message is deserialized to `AgentProcessingPayload` and pushed to `internal_queue`. On channel error, sleeps 5 s then restarts itself.
+
+#### `async worker_loop(worker_id: str)`
+
+Dequeues from `internal_queue` and calls `process_task()`. The `received_at` timestamp is preserved to compute queue wait time for metrics.
+
+---
+
+### `async process_task(payload, worker_id)`
+
+The main routing method. Runs for the full lifetime of one agent task.
+
+**Routing order:**
+1. Discards stale pending pauses for this `session_id` from a previous run.
+2. Applies `_get_effective_policy_meta()` — if `agent_mode` is in `forbidden_agent_modes`, emits `agent_error` and returns immediately.
+3. Builds a per-task `task_config` by deep-merging the global config with the payload's `model_profile` (if present). Stores as `payload._task_config`. The shared `self.config` is never mutated.
+4. If `config.mock_mode` or `agent_mode in {"mock", "stress", "load_test", "no_llm"}` → `_process_mock_mode()`.
+5. If `COMPUTE_V2_AGENT_ENABLED` env var is `"true"/"1"/"yes"` and `agent_mode != "deep_research"` → `_process_planner_mode()` for all modes (V2 gate overrides per-mode dispatch below).
+6. Normal mode dispatch:
+
+| `agent_mode` | Handler | Notes |
+|---|---|---|
+| `"auto"` | `_process_planner_mode()` | Live RPC device status check; `cua_preferred` if device `online/connected`. |
+| `"llm"` | `_process_llm_mode()` | No sub-agents. |
+| `"deep_research"` | `_process_deep_research_mode()` | But first: runs `_should_exit_deep_research()` — if true, falls back to `_process_planner_mode()` (Bug B3 fix). |
+| `"cua"` | `_process_planner_mode(cua_preferred=True)` | |
+| `"swe"` | `_process_planner_mode(cua_preferred=True, swe_enabled=True)` | |
+| unknown | `_process_planner_mode()` | Fallback with warning. |
+
+---
+
+### `async _run_chat_with_cancel_watch(agent, context, state, llm_params, session_id, *, graceful_window_s=3.0, poll_interval_s=1.0)`
+
+Wraps `agent.chat()` with a side-channel Redis cancel watcher. Necessary because the agent's built-in `check_cancellation()` only fires between ReAct phases — inside a long LLM call it can block for 10–20 s.
+
+**Two-stage cancellation:**
+
+1. **Soft cancel** — watcher reads Redis flag `agent:task:{session_id}:cancel`. If set: calls `agent.request_cancellation()` and waits `graceful_window_s` (default 3 s) for the agent to exit cleanly. Clean exit preserves all persist/cleanup invariants.
+2. **Hard cancel** — if the agent is still running after the grace window: calls `chat_task.cancel()`. `CancelledError` propagates through the async LLM call, unwinds `chat()`, runs the `finally` cleanup (shielded from cancel via `asyncio.shield`). Result is a synthetic cancel summary so downstream checks fire correctly.
+
+Returns `(result, final_messages)` — same shape as the wrapped `agent.chat()`.
+
+---
+
+### Lock Management
+
+All three lock managers are built lazily from `cancellation_manager.redis_client` on first call to `_get_lock_managers()`. Returns `None` when Redis is unavailable; all callers degrade gracefully.
+
+| Method | Redis key | Notes |
+|--------|-----------|-------|
+| `_lock_device(device_id, session_id) → bool` | via `DeviceLockManager.Acquire()` | `"chat-only"` device skipped (virtual). |
+| `_unlock_device(device_id, session_id)` | via `DeviceLockManager.Release()` | `"chat-only"` skipped. |
+| `_unlock_session(session_id)` | via `SessionLockManager.Clear()` | Clears session lock so follow-ups can create new tasks. |
+| `_unbind_cloud_pc_session(device_id, user_id)` | via `CloudPcBindingManager.Unbind()` | Releases Cloud PC binding so other sessions can use it. |
+
+---
+
+### `async _best_effort_task_cleanup(*, session_id, device_id, user_id, unregister_active_task=True, unlock_session=True, unlock_device=True, unbind_cloud_pc=True)`
+
+Called in the `finally` block of `_process_planner_mode()` (and other mode handlers) after `agent.chat()` completes. Each step is wrapped in its own `try/except` so a failure in one step never blocks the rest.
+
+Steps (in order):
+1. `cancellation_manager.unregister_active_task(session_id)` — clears the Redis "task active" flag.
+2. `_unlock_session(session_id)` — allows new tasks for this session.
+3. `_unlock_device(device_id, session_id)` — releases physical device lock.
+4. `_unbind_cloud_pc_session(device_id, user_id)` — releases Cloud PC binding.
+5. `_clear_user_reply_marker(session_id)` — clears the hibernation user-reply marker. Without this, a later follow-up routes to a dead session and hangs until 24 h TTL expires.
+6. `controller.CancelChildrenOf(session_id)` — drops orphaned child sentinels. Prevents the phantom-wake hallucination bug (session 25bdd96a: stale child sentinel fired into a completed parent, LLM fabricated a new task).
+
+**Flags:** The caller sets `unlock_*=False` when the session hibernates (so locks and child sentinels are preserved for the wake).
+
+---
+
+### Inbox Registration
+
+| Method | Purpose |
+|--------|---------|
+| `register_agent_inbox(session_id, inbox)` | Registers a running agent's inbox. If a pending pause for this session exists, delivers it immediately. |
+| `unregister_agent_inbox(session_id)` | Called when the task completes. Removes from `_active_agent_inboxes`. |
+
+**Delivery routing for `_handle_user_followup`:**
+- If `session_id` is in `_active_agent_inboxes` → push `USER_FOLLOWUP` to live inbox (fast path).
+- If the session has a registered sentinel → force-wake via `HibernationController.Wake()`.
+- Otherwise → logged as "no active agent" (message is dropped or replayed via RabbitMQ).
+
+---
+
+### Helper Methods
+
+| Method | Purpose |
+|--------|---------|
+| `_is_compute_v2_agent_enabled(payload) → bool` | Returns True when `COMPUTE_V2_AGENT_ENABLED` env var is `"true"/"1"/"yes"`. Per-user flag reserved for future use. |
+| `_should_exit_deep_research(user_message) → bool` | Keyword-based intent reclassifier. Returns True if the message implies a file-write / code-exec / system action. Uses `_NON_RESEARCH_INTENT_PATTERN` (Unicode word-boundary regex). Conservative: false positives only fall back to PlannerAgent. |
+| `_latest_user_message_text(payload) → Optional[str]` | Returns the last `role="user"` message text from payload messages, or `None`. |
+| `_get_effective_policy_meta(payload) → Dict` | Merges global config policy with per-session policy from `payload.meta_data`. |
+| `_extract_policy_from_meta(meta) → Tuple[List, List, List]` | Returns `(allowed_models, allowed_agent_modes, forbidden_agent_modes)` from policy dict. |
+| `_apply_agent_mode_policy(agent, forbidden_agent_modes)` | Disables forbidden modes on the agent instance. |
+| `_extract_model_profile_from_meta(meta) → Optional[str]` | Reads `model_profile` key from session meta. |
+| `_get_current_device_status(device_id, timeout=10.0) → str` | Live RPC to Backend `GET /devices/{id}/status`. Returns `"online"`, `"offline"`, `"unknown"`. Used in auto/cua mode routing. |
+| `_owner_task_alive(owner_session) → bool` | Checks if a session still has an active task in Redis. Used by `DeviceLockManager.Acquire()` to detect stale locks from crashed workers. |
+| `_set_user_reply_marker(session_id, timeout_seconds)` | Writes Redis key `hibernation:user_reply:session:{session_id}`. Backend uses this as an O(1) hint to route follow-ups via Socket.IO instead of publishing to RabbitMQ. |
+| `_clear_user_reply_marker(session_id)` | Deletes the marker. Called on task completion. |
+| `_capture_device_screen(device_id) → Optional[str]` | Fetches a screenshot via Backend for visual condition sentinel evaluation. Returns base64 PNG or `None`. |
+| `_evaluate_condition_with_cheap_llm(condition, screenshot_base64) → Dict` | Uses a cheap LLM (Gemini Flash or similar) to evaluate a visual condition string against a screenshot. Returns `{"met": bool, "confidence": float, "reason": str}`. |
+| `publish_wakeup_message(task, reason)` | Re-enqueues a hibernated task to RabbitMQ with wake metadata appended. |
+| `_schedule_sentinel_task(payload, config)` | Registers a `SentinelTask` in Redis with the hibernate config dict. Called by `HibernationController.Hibernate()`. |
+
+---
+
+### `async sentinel_loop(worker_id: str)`
+
+Polls Redis for `SentinelTask` entries every `SENTINEL_POLL_INTERVAL` seconds (default: 1 s). Uses a per-task Redis lock to prevent two sentinel workers from processing the same task simultaneously.
+
+For each task whose wake condition fires:
+- `TimerStrategy` — `sleep_seconds` elapsed → `publish_wakeup_message()`.
+- `VisualConditionStrategy` — calls `_capture_device_screen()` + `_evaluate_condition_with_cheap_llm()`.
+- `user_reply` / `mcp_connection_ready` / `cloud_pc_connected` — handled by the respective event handlers (`_handle_user_followup`, `_handle_mcp_connection_completed`, `_handle_cloud_pc_session_bound`) which call `HibernationController.Wake()` directly.
+
+---
+
+### `_parse_trigger_event` / `_build_trigger_prompt` / `_build_trigger_payload` / `_report_trigger_completion`
+
+Used exclusively by `_handle_trigger_event()` to process scheduled/webhook triggers:
+
+| Method | Purpose |
+|--------|---------|
+| `_parse_trigger_event(event_data) → str` | Extracts human-readable trigger description from raw event payload. |
+| `_build_trigger_prompt(trigger_type, trigger_data, session) → str` | Constructs the user-role prompt text injected into the agent's conversation. |
+| `_build_trigger_payload(session, user, trigger_prompt, agent_mode) → AgentProcessingPayload` | Creates a full `AgentProcessingPayload` from trigger event fields. |
+| `_report_trigger_completion(session_id, user_id, trigger_type, status)` | Emits `trigger_step` Socket.IO event to Backend with `status=completed/error`. |

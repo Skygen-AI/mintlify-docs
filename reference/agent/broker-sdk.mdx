@@ -1,0 +1,233 @@
+---
+title: "Broker SDK Reference"
+description: "Pydantic schemas for the agent↔broker message contract: AgentProcessingPayload, MessageFromAgentToChatSession, and supporting types."
+---
+
+# Broker SDK
+
+The `broker_sdk` package (`Agent/broker_sdk/`) defines the Pydantic message schemas that govern the inbound and outbound message contract between the Backend and `BrokerAgent`. These schemas are the source of truth for what the RabbitMQ consumer deserializes and what the agent emits back to the Backend.
+
+**Package path:** `Agent/broker_sdk/broker_sdk/`  
+**Schema file:** `user_send_msg_schema.py`
+
+---
+
+## Inbound: `AgentProcessingPayload`
+
+`AgentProcessingPayload` is the primary inbound schema. `BrokerAgent` deserializes each RabbitMQ message into this model before routing to a task handler.
+
+```python
+from broker_sdk.user_send_msg_schema import AgentProcessingPayload
+
+payload = AgentProcessingPayload.model_validate(raw_dict)
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `messages` | `list[MessageScheme]` | required | Full chat history for this session turn |
+| `session` | `SessionInfoScheme` | required | Session metadata |
+| `device` | `Optional[DeviceInfoScheme]` | `None` | Target device; omitted for chat-only sessions |
+| `user` | `UserInfoScheme` | required | User context |
+| `world_state` | `Optional[str]` | `None` | Screenshot reference URL |
+| `processing_timestamp` | `datetime` | `utcnow()` | When the message was enqueued |
+| `is_continuation` | `bool` | `False` | `True` when `len(messages) > 1` (follow-up turn) |
+| `message_count` | `int` | `0` | Total message count in the session |
+| `agent_mode` | `Optional[str]` | `"cua"` | Routing mode: `"auto"`, `"cua"`, `"llm"`, `"deep_research"`, `"swe"` |
+| `playbook_tasks` | `Optional[list[PlaybookStep]]` | `None` | Pre-built automation plan from a saved workflow |
+| `model_profile` | `Optional[str]` | `None` | Model profile override from the subscription plan |
+| `custom_system_prompt` | `Optional[str]` | `None` | System prompt override injected by the Backend |
+| `emplogent_id` | `Optional[str]` | `None` | Emplogent UUID for persona routing (F5 feature); `None` = Skygen Standard mode |
+| `emplogent_persona` | `Optional[str]` | `None` | Emplogent's `prompt` string for PlannerAgent persona bootstrap |
+| `gui_observation_mode` | `Optional[str]` | `None` | CUA observation mode: `"default"` or `"a11y_dom_screenshot"` |
+
+### `agent_mode` routing
+
+`BrokerAgent.process_task()` extracts `agent_mode` from the payload and routes accordingly:
+
+| `agent_mode` | Handler |
+|---|---|
+| `"auto"`, `"cua"`, `"swe"` | `_run_planner_task()` → `PlannerAgent` |
+| `"llm"` | `_run_llm_mode_task()` → lightweight LLM chat |
+| `"deep_research"` | `_run_datafetcher_task()` → `DataFetcherAgent` |
+
+---
+
+## `PlaybookStep`
+
+A single step in a pre-built automation workflow. Supports both new clients (which send `title`) and legacy clients (which send only `description`).
+
+```python
+class PlaybookStep(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+```
+
+A `model_validator` promotes `description` → `title` for backward compatibility. At least one of `title` or `description` must be present; the validator raises `ValueError` if both are absent.
+
+`PlannerAgent` receives `playbook_tasks` as a list of `PlaybookStep` objects and uses them to pre-populate the plan's step list via `PlanManager._normalize_item()`.
+
+---
+
+## `MessageScheme`
+
+Individual chat message in the session history.
+
+```python
+class MessageScheme(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+    created_at: datetime
+    meta_data: dict = {}
+    task_id: Optional[str] = None
+```
+
+---
+
+## `SessionInfoScheme`
+
+Session context passed to the agent.
+
+```python
+class SessionInfoScheme(BaseModel):
+    session_id: str
+    title: str
+    is_active: bool
+    meta_data: dict = {}
+    created_at: datetime
+    updated_at: datetime
+```
+
+---
+
+## `DeviceInfoScheme`
+
+Target device metadata. Optional — only present when a device (Cloud PC or local) is associated with the session.
+
+```python
+class DeviceInfoScheme(BaseModel):
+    device_id: str
+    device_name: str
+    platform: str                        # e.g. "windows", "linux", "darwin"
+    capabilities: dict = {}
+    connection_status: str               # e.g. "online", "offline"
+    last_seen: Optional[datetime] = None
+    device_type: Optional[str] = None   # "real_device" | "e2b_sandbox"
+```
+
+`device_type="e2b_sandbox"` indicates a Cloud PC (E2B-provisioned sandbox). `device_type="real_device"` indicates a physical or persistent VM.
+
+---
+
+## `UserInfoScheme`
+
+User context.
+
+```python
+class UserInfoScheme(BaseModel):
+    user_id: str
+    email: str
+    display_name: Optional[str] = None
+    preferences: dict = {}
+    is_admin: bool = False
+```
+
+---
+
+## Outbound: `MessageFromAgentToChatSession`
+
+Schema for messages the agent emits back to the chat session via Socket.IO.
+
+```python
+class MessageFromAgentToChatSession(BaseModel):
+    type: Literal["message"]
+    role: Literal["assistant"]
+    session_id: str
+    content: str
+    status: str
+    result: dict
+    meta_data: dict
+    task_id: str | None
+```
+
+| Field | Description |
+|---|---|
+| `type` | Always `"message"` |
+| `role` | Always `"assistant"` |
+| `session_id` | Session the message belongs to |
+| `content` | Text content of the message |
+| `status` | Message delivery status |
+| `result` | Structured result payload (tool outputs, file list, etc.) |
+| `meta_data` | Supplementary metadata (attachment info, plan state, etc.) |
+| `task_id` | Task UUID if the message is part of a tracked task |
+
+---
+
+## Outbound: `TaskToWebSocketFromAgent`
+
+Schema for task-level status updates emitted over Socket.IO.
+
+```python
+class TaskToWebSocketFromAgent(BaseModel):
+    type: Literal["task"]
+    task_id: str
+    status: str
+    result: dict
+    error: dict
+```
+
+---
+
+## RabbitMQ health check
+
+**File:** `Agent/broker_sdk/broker_sdk/rabbitmq_chec.py`
+
+Contains a utility function for verifying RabbitMQ connectivity at startup. Used by `BrokerAgent.start()` to fast-fail if the message queue is unavailable.
+
+---
+
+## Usage example
+
+```python
+from broker_sdk.user_send_msg_schema import AgentProcessingPayload, PlaybookStep
+
+# Minimal payload (auto mode, no device)
+payload = AgentProcessingPayload(
+    messages=[
+        MessageScheme(
+            role="user",
+            content="Research and summarize the top 5 AI papers from last week",
+            created_at=datetime.utcnow(),
+        )
+    ],
+    session=SessionInfoScheme(
+        session_id="abc123",
+        title="AI Research",
+        is_active=True,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    ),
+    user=UserInfoScheme(user_id="user-1", email="user@example.com"),
+    agent_mode="deep_research",
+)
+
+# CUA payload with playbook
+payload = AgentProcessingPayload(
+    ...,
+    agent_mode="cua",
+    device=DeviceInfoScheme(
+        device_id="dev-1",
+        device_name="Cloud PC",
+        platform="windows",
+        connection_status="online",
+        device_type="e2b_sandbox",
+    ),
+    playbook_tasks=[
+        PlaybookStep(title="Open browser", description="Navigate to gmail.com"),
+        PlaybookStep(title="Compose email", description="Fill subject and body"),
+        PlaybookStep(title="Send"),
+    ],
+    gui_observation_mode="a11y_dom_screenshot",
+)
+```

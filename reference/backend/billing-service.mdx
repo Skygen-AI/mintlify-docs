@@ -1,0 +1,517 @@
+---
+title: "BillingService"
+description: "Token balance management, subscription lifecycle, and overage billing for Skygen."
+---
+
+## Overview
+
+`BillingService` (`app/services/billing_service.py`) manages the complete billing lifecycle: free plan token grants, paid subscription activation, monthly renewals, per-minute Cloud PC billing, and admin adjustments. It delegates tier-specific access checks to the `TIER_STRATEGIES` registry (`billing/tier_strategies.py`) and writes every monetary event as an immutable `TokenTransaction` record.
+
+**Singleton:** `billing_service = BillingService()` — import from `app.services.billing_service`.
+
+**Constructor dependencies:** None (stateless service, uses `billing_repo` and `BillingRepository`).
+
+---
+
+## Module-level functions
+
+### get_plan_by_stripe_price_id()
+
+```python
+async def get_plan_by_stripe_price_id(
+    db: AsyncSession, stripe_price_id: str
+) -> Optional[SubscriptionPlan]
+```
+
+<ResponseField name="db" type="AsyncSession" required>
+  SQLAlchemy async session.
+</ResponseField>
+<ResponseField name="stripe_price_id" type="str" required>
+  Stripe Price ID to look up (e.g. `"price_1N..."`)
+</ResponseField>
+
+**Returns:** `SubscriptionPlan | None` — the first active plan with this Stripe Price ID, or `None` if not found.
+
+**Called by:** `StripeService._handle_*` webhook handlers, `BillingService.activate_subscription()`, `BillingService.renew_subscription()`.
+
+---
+
+### get_active_plans()
+
+```python
+async def get_active_plans(db: AsyncSession) -> list[SubscriptionPlan]
+```
+
+**Returns:** All active `SubscriptionPlan` rows ordered by `sort_order`, then `price_usd`.
+
+**Called by:** `routers/billing/billing_router.py` — GET `/billing/plans`.
+
+---
+
+### get_default_plan()
+
+```python
+async def get_default_plan(db: AsyncSession) -> Optional[SubscriptionPlan]
+```
+
+**Returns:** The first active plan by `sort_order`, or `None` if no plans are configured.
+
+**Called by:** `StripeService.create_setup_intent()`, `StripeService.confirm_payment_method_added()`.
+
+---
+
+### get_plan_by_id()
+
+```python
+async def get_plan_by_id(db: AsyncSession, plan_id: str) -> Optional[SubscriptionPlan]
+```
+
+**Returns:** The active plan with the given UUID, or `None`.
+
+---
+
+### get_user_active_plan()
+
+```python
+async def get_user_active_plan(
+    db: AsyncSession, user_id: str
+) -> Optional[SubscriptionPlan]
+```
+
+Resolves the user's active subscription then fetches its linked plan by `subscription_plan_id` or `stripe_price_id`.
+
+**Returns:** `SubscriptionPlan | None`.
+
+---
+
+## BillingService class
+
+### BillingService.can_user_access()
+
+```python
+async def can_user_access(
+    self, db: AsyncSession, user_id: str
+) -> Tuple[bool, str, Optional[Dict]]
+```
+
+Authoritative gate check before any agent execution. Performs lazy free-plan creation on first call.
+
+<ResponseField name="db" type="AsyncSession" required>Database session.</ResponseField>
+<ResponseField name="user_id" type="str" required>UUID string of the user.</ResponseField>
+
+**Returns:** `(can_access: bool, reason: str, extra: dict | None)`
+
+Reason codes:
+- `"ok"` — access granted
+- `"no_subscription"` — no plan found and no free plan configured
+- `"free_limit_reached"` — free tokens exhausted; `extra["next_renewal"]` is ISO timestamp
+- `"subscription_limit_reached"` — paid tokens exhausted; `extra["can_enable_overage"]` is `True`
+- `"payment_required"` — subscription is `INCOMPLETE`
+- `"payment_failed"` — subscription is `PAST_DUE`
+- `"subscription_expired"` — subscription is `CANCELED` or `EXPIRED`
+
+**Side effects:** May create a free `Subscription` + `TokenBalance` row for first-time users (lazy assignment). May call `stripe_service.renew_subscription_early()` for paid users who are low on tokens.
+
+**Called by:**
+- `routers/message/message_router.py` — before publishing to RabbitMQ
+- `services/scheduled_task_service.py:execute_scheduled_task()`
+- `services/cloud_pc/lifecycle.py:_ensure_cloud_pc_running()`
+- `routers/billing/billing_router.py` — GET `/billing/status`
+
+```python
+can_access, reason, extra = await billing_service.can_user_access(db, str(user.id))
+if not can_access:
+    raise HTTPException(status_code=402, detail=reason)
+```
+
+---
+
+### BillingService.get_user_status()
+
+```python
+async def get_user_status(self, db: AsyncSession, user_id: str) -> Dict[str, Any]
+```
+
+Returns comprehensive billing status for display in the frontend billing panel.
+
+<ResponseField name="db" type="AsyncSession" required>Database session.</ResponseField>
+<ResponseField name="user_id" type="str" required>User UUID string.</ResponseField>
+
+**Returns:** Dict with keys: `can_access`, `access_reason`, `access_message`, `access_action`, `has_payment_method`, `tier`, `status`, `balance`, `total_spent`, and optionally `plan_name`, `plan_price_usd`, `monthly_tokens_included`, `tokens_remaining`, `allow_overage`, `overage_tokens_used`, `cloud_pc_enabled`, `max_cloud_pcs`, `scheduled_tasks_enabled`, `max_concurrent_active_cpcs`, `next_limit_renewal`.
+
+**Called by:** `routers/billing/billing_router.py` — GET `/billing/status`.
+
+---
+
+### BillingService.enable_overage()
+
+```python
+async def enable_overage(
+    self, db: AsyncSession, user_id: str
+) -> Tuple[bool, str]
+```
+
+Opts the user into pay-as-you-go billing after their monthly token allotment is exhausted.
+
+**Returns:** `(success: bool, message: str)`. Fails if user is not on `STANDARD` tier.
+
+**Side effects:** Sets `subscription.allow_overage = True` and commits.
+
+**Called by:** `routers/billing/billing_router.py` — POST `/billing/overage/enable`.
+
+---
+
+### BillingService.disable_overage()
+
+```python
+async def disable_overage(
+    self, db: AsyncSession, user_id: str
+) -> Tuple[bool, str]
+```
+
+Disables pay-as-you-go overage for the user.
+
+**Returns:** `(success: bool, message: str)`.
+
+**Called by:** `routers/billing/billing_router.py` — POST `/billing/overage/disable`.
+
+---
+
+### BillingService.get_user_balance()
+
+```python
+async def get_user_balance(self, db: AsyncSession, user_id: str) -> int
+```
+
+**Returns:** Current integer token balance. Returns `0` if no balance record exists.
+
+---
+
+### BillingService.ensure_token_balance_exists()
+
+```python
+async def ensure_token_balance_exists(
+    self, db: AsyncSession, user_id: str
+) -> TokenBalance
+```
+
+Idempotent — creates the `TokenBalance` row if it doesn't exist yet.
+
+**Returns:** `TokenBalance` ORM object.
+
+---
+
+### BillingService.activate_subscription()
+
+```python
+async def activate_subscription(
+    self,
+    db: AsyncSession,
+    user_id: str,
+    stripe_subscription_id: str,
+    stripe_price_id: str,
+    current_period_start: datetime,
+    current_period_end: datetime,
+) -> Subscription
+```
+
+Activates or upgrades a paid subscription, credits the plan's monthly token allotment to the user's balance (additive, not a reset), and records a `SUBSCRIPTION_TOPUP` transaction.
+
+**Idempotent:** If called a second time with the same `stripe_subscription_id` and the subscription is already `STANDARD + ACTIVE`, returns early without double-crediting.
+
+<ResponseField name="stripe_subscription_id" type="str" required>Stripe Subscription ID.</ResponseField>
+<ResponseField name="stripe_price_id" type="str" required>Stripe Price ID used to look up the plan and token allotment.</ResponseField>
+<ResponseField name="current_period_start" type="datetime" required>Naive UTC datetime from Stripe.</ResponseField>
+<ResponseField name="current_period_end" type="datetime" required>Naive UTC datetime computed via `_period_end_from_plan()` (uses plan's `billing_period_days`, not raw Stripe value).</ResponseField>
+
+**Returns:** `Subscription` ORM object.
+
+**Side effects:** Updates `subscriptions` row, inserts `TokenTransaction(SUBSCRIPTION_TOPUP)`, commits.
+
+**Called by:** `StripeService._handle_subscription_created()`, `StripeService._handle_setup_intent_succeeded()`, `StripeService._handle_checkout_session_completed()`.
+
+---
+
+### BillingService.switch_plan()
+
+```python
+async def switch_plan(
+    self,
+    db: AsyncSession,
+    user_id: str,
+    stripe_subscription_id: str,
+    stripe_price_id: str,
+    current_period_start: datetime,
+    current_period_end: datetime,
+) -> Subscription
+```
+
+Handles a plan change. Unlike `activate_subscription` which **adds** to the balance, this **resets** it to the new plan's allocation to prevent token farming via rapid plan cycling.
+
+**Idempotent:** Skips if the subscription is already `ACTIVE` on the same `stripe_price_id`.
+
+**Side effects:** Resets `token_balances.balance` to `plan.monthly_tokens`, records `SUBSCRIPTION_TOPUP` transaction.
+
+**Called by:** `StripeService._handle_invoice_paid()` (billing_reason=`subscription_update`), `StripeService.change_plan()`.
+
+---
+
+### BillingService.renew_subscription()
+
+```python
+async def renew_subscription(
+    self,
+    db: AsyncSession,
+    stripe_subscription_id: str,
+    current_period_start: datetime,
+    current_period_end: datetime,
+) -> bool
+```
+
+Handles monthly renewal: resets balance to the plan's full monthly allotment (not additive) and records a `SUBSCRIPTION_TOPUP` transaction.
+
+**Returns:** `True` if the subscription was found and updated, `False` otherwise.
+
+**Called by:** `StripeService._handle_invoice_paid()` (billing_reason=`subscription_cycle`), `StripeService.renew_subscription_early()`.
+
+---
+
+### BillingService.cancel_subscription()
+
+```python
+async def cancel_subscription(
+    self,
+    db: AsyncSession,
+    subscription_id: str,
+    cancel_at_period_end: bool = True,
+) -> Optional[Subscription]
+```
+
+Marks a subscription for cancellation. When `cancel_at_period_end=True`, status stays `ACTIVE` until period ends; when `False`, status is set to `CANCELED` immediately.
+
+**Called by:** `StripeService.cancel_subscription()`.
+
+---
+
+### BillingService.calculate_token_cost()
+
+```python
+def calculate_token_cost(self, api_cost_usd: float) -> int
+```
+
+Converts a USD API cost to an integer token count, applying the margin multiplier from settings.
+
+Formula: `ceil(api_cost_usd * TOKEN_MARGIN_MULTIPLIER * TOKENS_PER_DOLLAR)`, minimum 1.
+
+**Returns:** Integer token count. Returns `0` if `api_cost_usd <= 0`.
+
+**Called by:** `BillingService.check_sufficient_balance()`.
+
+---
+
+### BillingService.deduct_tokens_for_api_call()
+
+```python
+async def deduct_tokens_for_api_call(
+    self,
+    db: AsyncSession,
+    user_id: str,
+    api_cost_usd: float,
+    reference_id: Optional[str] = None,
+    description: Optional[str] = None,
+) -> Tuple[bool, int, int, bool, Optional[str]]
+```
+
+Deducts tokens for an LLM API call. Uses fractional token accumulation — sub-token costs are accumulated in `balance.fractional_tokens` until they round up to at least 1 whole token, preventing per-call rounding losses.
+
+For free users: hard cap, never goes negative.
+For paid users: attempts early renewal via Stripe if balance is insufficient.
+
+<ResponseField name="api_cost_usd" type="float" required>Actual USD cost of the API call.</ResponseField>
+<ResponseField name="reference_id" type="str">Optional session or task ID for transaction record linkage.</ResponseField>
+
+**Returns:** `(success, tokens_deducted, remaining_balance, is_overage, error_message)`
+
+**Side effects:** Updates `token_balances`, inserts `TokenTransaction(API_USAGE)`, commits. May call `stripe_service.report_overage_usage()` for overage billing.
+
+**Called by:** `routers/message/message_router.py` — after agent completes, records actual cost; `Agent/Services/cost_tracker.py`.
+
+```python
+success, deducted, balance, is_overage, err = await billing_service.deduct_tokens_for_api_call(
+    db, user_id=str(user.id), api_cost_usd=0.0234, reference_id=str(session.id)
+)
+if not success:
+    logger.warning("Token deduction failed: %s", err)
+```
+
+---
+
+### BillingService.calculate_cloud_pc_token_cost()
+
+```python
+def calculate_cloud_pc_token_cost(self, minutes: int) -> int
+```
+
+Converts Cloud PC minutes to an integer token cost using per-hour rate from settings.
+
+Formula: `ceil((CLOUD_PC_COST_PER_HOUR_USD / 60) * minutes * CLOUD_PC_MARGIN_MULTIPLIER * TOKENS_PER_DOLLAR)`, minimum 1.
+
+---
+
+### BillingService.deduct_tokens_for_cloud_pc()
+
+```python
+async def deduct_tokens_for_cloud_pc(
+    self,
+    db: AsyncSession,
+    user_id: str,
+    minutes: int = 1,
+    cloud_pc_id: Optional[str] = None,
+) -> Tuple[bool, int, int, Optional[str]]
+```
+
+Deducts tokens for Cloud PC per-minute usage. Uses a `SELECT ... FOR UPDATE` row lock on `token_balances` to prevent lost-update races between concurrent billing calls.
+
+<ResponseField name="minutes" type="int">Number of minutes to bill. Default: 1.</ResponseField>
+<ResponseField name="cloud_pc_id" type="str">Cloud PC UUID for the transaction record.</ResponseField>
+
+**Returns:** `(success, tokens_deducted, remaining_balance, error_message)`
+
+**Raises:** Never raises — returns `(False, 0, balance, error_msg)` on failure.
+
+**Side effects:** Updates `token_balances`, inserts `TokenTransaction(CLOUD_PC_USAGE)`, commits.
+
+**Called by:** `services/cloud_pc/lifecycle.py:reconcile_billing()`, `routers/cloud_pc/cloud_pc_router.py`.
+
+---
+
+### BillingService.check_sufficient_balance()
+
+```python
+async def check_sufficient_balance(
+    self, db: AsyncSession, user_id: str, estimated_cost_usd: float = 0.01
+) -> Tuple[bool, str, Dict[str, Any]]
+```
+
+Pre-flight check: verifies access and estimates whether the user has enough tokens for an upcoming call.
+
+**Returns:** `(can_proceed, reason, info)`. `info` includes `"balance"` and `"tokens_needed"`.
+
+---
+
+### BillingService.grant_admin_tokens()
+
+```python
+async def grant_admin_tokens(
+    self, db: AsyncSession, user_id: str, amount: int, description: str = ""
+) -> Tuple[bool, int]
+```
+
+Admin endpoint: credits tokens to a user's balance without Stripe involvement.
+
+**Returns:** `(success, amount_granted)`. Fails if `amount <= 0`.
+
+**Side effects:** Updates `token_balances`, inserts `TokenTransaction(ADMIN_GRANT)`, commits.
+
+**Called by:** `routers/admin/billing.py` — POST `/admin/billing/users/{user_id}/tokens`.
+
+---
+
+### BillingService.deduct_admin_tokens()
+
+```python
+async def deduct_admin_tokens(
+    self, db: AsyncSession, user_id: str, amount: int, description: str = ""
+) -> Tuple[bool, int, int]
+```
+
+Admin endpoint: deducts tokens from a user's balance. Balance can go negative.
+
+**Returns:** `(success, amount_deducted, remaining_balance)`.
+
+**Side effects:** Updates `token_balances`, inserts `TokenTransaction(MANUAL_DEDUCTION)`, commits.
+
+---
+
+### BillingService.get_plan_config()
+
+```python
+async def get_plan_config(
+    self, db: AsyncSession, stripe_price_id: Optional[str] = None
+) -> Dict[str, Any]
+```
+
+Returns plan configuration as a dict. Falls back to settings defaults if no plan is found.
+
+**Returns:** Dict with `monthly_tokens`, `billing_period_days`, `billing_period_unit`, `price_usd`, `name`, `plan_id`.
+
+---
+
+### BillingService.get_default_free_plan()
+
+```python
+async def get_default_free_plan(self, db: AsyncSession) -> Optional[SubscriptionPlan]
+```
+
+Returns the first active plan with `plan_type="free"`, ordered by `sort_order`. Logs a warning if no free plan exists (new users will be blocked).
+
+---
+
+### BillingService.create_free_subscription()
+
+```python
+async def create_free_subscription(
+    self,
+    db: AsyncSession,
+    user_id: str,
+    free_plan: SubscriptionPlan,
+) -> Subscription
+```
+
+Creates a `Subscription(tier=FREE)` and initial `TokenBalance` for a new user. Token grant is computed from `plan.daily_usd_limit * plan.limit_renewal_period_days`.
+
+**Side effects:** Inserts `subscriptions`, `token_balances`, `TokenTransaction(FREE_GRANT)`, commits.
+
+---
+
+### BillingService.compute_token_grant() [static]
+
+```python
+@staticmethod
+def compute_token_grant(plan: SubscriptionPlan, tier: SubscriptionTier) -> int
+```
+
+Single source of truth for token grant amount. For FREE tier, derives from `daily_usd_limit * renewal_period`. For paid tiers, uses `plan.monthly_tokens`.
+
+**Called by:** Admin subscription management endpoints.
+
+---
+
+## Tier access strategies
+
+### FreeTierStrategy.check_access()
+
+Logic for `FREE` and `TRIAL` tiers. Checks balance >= 2 tokens. If low, attempts free token renewal (gated by `_can_renew_free_limit()`). Returns `free_limit_reached` with `next_renewal` timestamp if renewal is not yet due.
+
+### PaidTierStrategy.check_access()
+
+Logic for `STANDARD` tier. Checks subscription status, then balance. If low and `allow_overage=True`, grants access. Otherwise attempts `stripe_service.renew_subscription_early()`. Returns `subscription_limit_reached` with `can_enable_overage: True` if renewal fails.
+
+---
+
+## Webhook handler registry
+
+`billing/webhook_handlers.py` defines `WEBHOOK_HANDLERS: Dict[str, WebhookEventHandler]` mapping Stripe event types to handler instances:
+
+| Event type | Handler |
+|---|---|
+| `setup_intent.succeeded` | `SetupIntentSucceededHandler` |
+| `checkout.session.completed` | `CheckoutSessionCompletedHandler` |
+| `customer.subscription.created` | `SubscriptionCreatedHandler` |
+| `customer.subscription.updated` | `SubscriptionUpdatedHandler` |
+| `customer.subscription.deleted` | `SubscriptionDeletedHandler` |
+| `invoice.paid` | `InvoicePaidHandler` |
+| `invoice.payment_failed` | `InvoicePaymentFailedHandler` |
+| `payment_method.attached` | `PaymentMethodAttachedHandler` |
+
+Each handler delegates to `StripeService._handle_*()` methods documented in `stripe-service`.

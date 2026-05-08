@@ -1,0 +1,286 @@
+---
+title: "Agent Configuration Reference"
+description: "Complete reference for AgentConfig, AgentSettings, ActionConfig, model_profiles.yaml, and all environment variables."
+---
+
+# Agent Configuration
+
+`AgentConfig` (`Agent/config.py`) is a Pydantic `BaseModel` that acts as the single source of truth for all runtime settings. It is **not** a Pydantic `BaseSettings` subclass — environment variables are read explicitly inside the `AgentConfig.from_env()` class method, which merges env vars with values from `model_profiles.yaml`.
+
+## Loading Configuration
+
+```python
+config = AgentConfig.from_env()
+```
+
+`from_env()` performs four steps:
+
+1. Reads `MODEL_PROFILE` env var (default: `"default"`); looks up the named profile in `model_profiles.yaml`.
+2. Reads all other env vars listed in the table below.
+3. Extracts `models` and `specialist_agent_settings` from the selected profile.
+4. Optionally merges the `digital_worker` section from the profile (only present in the `default` profile).
+
+---
+
+## Environment Variables
+
+All env vars are optional — the defaults shown are used when the var is absent.
+
+### Connectivity
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `MODEL_PROFILE` | `model_profile` | `"default"` | Which profile to load from `model_profiles.yaml`. See [Model Profiles](#model-profiles) for valid values. |
+| `RABBITMQ_URL` | `rabbitmq_url` | `"amqp://guest:guest@localhost:5672/"` | RabbitMQ connection URL. Consumed by `BrokerAgent.start()`. |
+| `REDIS_URL` | `redis_url` | `"redis://localhost:6379"` | Redis connection URL. Used for hibernation, cancellation, and state persistence. |
+| `BACKEND_URL` | `backend_url` | `"http://localhost:8000"` | Base URL for Backend REST + Socket.IO. Used by `AgentSocketIOClient` and `SessionManager`. |
+| `AGENT_API_TOKEN` | `agent_auth_token` | `""` | Bearer token for Backend API calls. Set in production via `AGENT_API_TOKEN`. |
+| `DEVICE_NAME` | `device_name` | `"LocalDebugDevice"` | Human-readable name for this agent pod. Displayed in the Backend device list. |
+| `INPUT_QUEUE` | `input_queue` | `"content"` | RabbitMQ queue name for inbound tasks. |
+| `OUTPUT_QUEUE` | `output_queue` | `"answer_agent"` | RabbitMQ queue name for outbound results. |
+
+### Concurrency and Iteration Limits
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `MAX_WORKERS` | `max_workers` | `3` | Number of concurrent `worker_loop()` coroutines. Each worker handles one task at a time. |
+| `MAX_ITERATIONS_PER_TASK` | `max_iterations_per_task` | `100` | Global default for `BaseAgent.max_iter`. Overridden per specialist via `AgentSettings.max_iter` in the profile. |
+
+### Timeouts
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `DEVICE_ACTION_TIMEOUT` | `device_action_timeout` | `30` | Timeout (seconds) for individual device-level actions. |
+| `HTTP_REQUEST_TIMEOUT` | `http_request_timeout` | `60` | Timeout (seconds) for outbound HTTP calls (Backend REST, provider APIs). |
+
+### LLM Defaults
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `DEFAULT_TEMPERATURE` | `default_temperature` | `0.1` | Default sampling temperature sent to all LLM providers. |
+| `DEFAULT_MAX_TOKENS` | `default_max_tokens` | `12000` | Default `max_tokens` per LLM response. |
+| `MAX_CONTEXT_TOKENS` | `max_context_tokens` | `300000` | Maximum allowed context window tokens. Used by `ForcedSummarizationManager`, `TokenBudgetAlertRule`, and `MemoryManager`. |
+
+### Context Compression
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `COMPRESS_TOOL_OUTPUTS_OVER_TOKENS` | `compress_tool_outputs_over_tokens` | `150000` (= `max_context_tokens / 2`) | If any single tool output exceeds this many tokens, `MemoryManager` compresses older outputs, keeping only the most recent ones verbatim. |
+| `COMPRESS_TOOL_OUTPUTS_KEEP_LAST` | `compress_tool_outputs_keep_last` | `10` | Number of most-recent tool outputs kept verbatim after compression. |
+| `FORCED_SUMMARIZATION_PCT` | `forced_summarization_pct` | `0.90` | When `len(messages) / max_context_tokens` reaches this fraction, `ForcedSummarizationManager` replaces the full message history with an LLM-generated summary. |
+
+### Safety
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `SAFETY_ENABLED` | `safety_enabled` | `true` | Master switch for the safety pipeline. When `false`, the guardrails phase is skipped entirely. |
+| `SAFETY_CONTEXT_THRESHOLD` | `safety_context_threshold` | `25000` | If the system prompt exceeds this many tokens, the light classifier is skipped (too little context budget for a reliable check). |
+
+### Knowledge Base
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `KB_ENABLED` | `kb_enabled` | `true` | Enable ICL insight retrieval from the KnowledgeBase. |
+| `EVALUATION_ENABLED` | `evaluation_enabled` | `true` | Enable trajectory evaluation and insight persistence. |
+| `KB_USE_BACKEND` | `kb_use_backend` | `true` | When `true`, the KnowledgeBase talks to the Backend REST API. When `false`, uses a local file store at `KB_LOCAL_PATH`. |
+| `KB_LOCAL_PATH` | `kb_local_path` | `"./agent_knowledge"` | Path to the local knowledge base store. Only used when `KB_USE_BACKEND=false`. |
+
+### CUA / VLM
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `ENABLE_ACCESSIBILITY_TREE` | `enable_accessibility_tree` | `false` | Include the full accessibility tree in the CUA Orchestrator's LLM prompt. Improves precision at the cost of token usage. |
+| `GUI_ACTION_DELAY` | `gui_action_delay` | `0.3` | Seconds to wait between GUI input events (click, type, key press). |
+| `BUNDLE_ACTION_DELAY` | `bundle_action_delay` | `0.1` | Seconds to wait between tool executions in a bundle. |
+| `VLM_IMAGE_QUALITY` | `vlm_image_quality` | `65` | JPEG compression quality (1–100) for screenshots sent to the VLM. Lower = smaller payload. |
+| `VLM_IMAGE_MAX_SIZE` | `vlm_image_max_size` | `1600` | Maximum pixel dimension (width or height) for VLM screenshots. Images are resized to fit. |
+| `GEMINI_API_KEY` | `gemini_api_key` | `""` | Direct Gemini API key. Only needed when routing directly to Gemini, not via OpenRouter. |
+
+### Sandboxing and Toolkits
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| (set in code) | `sandbox_type` | `"docker"` | Sandbox type for `SoftwareEngineerAgent`: `"docker"`, `"local"`, or `"remote"`. |
+| (set in code) | `ckg_auto_update_on_query` | `true` | When `true`, the Contextual Knowledge Graph is automatically updated each time it is queried. Disable to reduce background write load. |
+
+### Debugging
+
+| Env Var | Field | Default | Description |
+|---|---|---|---|
+| `DEBUG_MODE` | `debug_mode` | `false` | Enable verbose debug logging. |
+| `SAVE_SCREENSHOTS` | `save_screenshots` | `true` | Save CUA screenshots to `screenshot_dir`. |
+| `SCREENSHOT_DIR` | `screenshot_dir` | OS temp dir (`/tmp/agent_screenshots`) | Directory path for saved screenshots. |
+
+---
+
+## Digital Worker Platform Settings
+
+These settings are merged from the `digital_worker` section of the active profile (currently only the `default` profile has this section). They can also be set as environment variables if needed.
+
+| Field | Default | Description |
+|---|---|---|
+| `boost_intellect_steps` | `3` | Number of consecutive steps that must exceed the overlap threshold before `boost_intellect_model` is activated. |
+| `boost_intellect_cooldown_steps` | `15` | Steps to wait after a boost before the system can boost again. |
+| `boost_intellect_model` | `"anthropic/claude-sonnet-4.6:nitro"` | High-capacity model used during intellect boost. Overrides the specialist's normal model. |
+| `token_budget_soft_pct` | `0.50` (base) / `0.70` (default profile) | Fraction of `max_context_tokens` at which `TokenBudgetAlertRule` fires its first warning. |
+| `token_budget_hard_pct` | `0.75` (base) / `0.90` (default profile) | Fraction at which the hard token budget alert fires. The agent is instructed to finalize immediately. |
+| `worker_model_low` | `"google/gemini-3.1-flash-lite-preview:nitro"` | Model used when a sub-agent is spawned with `intellect="low"`. Overrides `AgentSettings.model_low` if both are set. |
+| `reasoning_overlap_threshold` | `0.95` | Cosine similarity threshold for `ReasoningOverlapAlertRule`. Two consecutive steps with similarity above this trigger a `COGNITIVE LOOP DETECTED` alert. |
+| `reasoning_overlap_window` | `5` | Number of recent steps the overlap rule checks. |
+| `reasoning_overlap_embedding_model` | `"perplexity/pplx-embed-v1-0.6b"` (Python-level base) / `"google/gemini-embedding-001"` (default profile override) | Embedding model used to compute reasoning similarity vectors. The default profile's `digital_worker` section overrides the Python-level default. |
+| `scratchpad_alert_threshold_steps` | `5` | Steps without a scratchpad update before `ScratchpadUsageAlertRule` fires. |
+| `scratchpad_alert_reminder_interval_steps` | `5` | Steps between repeated scratchpad-idle alerts. |
+
+---
+
+## `AgentSettings` — Per-Specialist Settings
+
+`AgentSettings` is a Pydantic sub-model stored in `AgentConfig.specialist_agent_settings` as a dict keyed by class name (e.g., `"PlannerAgent"`, `"MCPToolsAgent"`).
+
+```python
+class AgentSettings(BaseModel):
+    max_iter: int
+    model: str
+    model_low: Optional[str] = None
+    # DataFetcherAgent-specific (other specialists ignore these):
+    fuser_model: Optional[str] = None
+    classifier_model: Optional[str] = None
+    draft_model: Optional[str] = None
+    draft_mode: Optional[bool] = None
+    embedding_model: Optional[Union[str, List[str]]] = None
+    bm25_prefilter_num: Optional[int] = None
+    web_search_backend: Optional[str] = None
+    web_research_mode: Optional[str] = None
+    brave_llm_context_params: Optional[Dict[str, Any]] = None
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `max_iter` | Yes | Maximum ReAct loop iterations for this specialist. Overrides `BaseAgent.max_iter` and `MAX_ITERATIONS_PER_TASK`. |
+| `model` | Yes | Primary model string for this specialist (e.g. `"anthropic/claude-sonnet-4.6:nitro"`). |
+| `model_low` | No | Cheaper model used when the Planner spawns this specialist with `intellect="low"`. |
+| `fuser_model` | No | DataFetcherAgent only. Model used for fusing multiple search results into a coherent answer. |
+| `classifier_model` | No | DataFetcherAgent only. Model used for query classification and intent detection. |
+| `draft_model` | No | DataFetcherAgent only. Model for generating answer drafts before fusing. |
+| `draft_mode` | No | DataFetcherAgent only. Enable two-step draft-then-fuse pipeline. |
+| `embedding_model` | No | DataFetcherAgent only. Model(s) used for semantic search. Accepts a string or list of strings. |
+| `bm25_prefilter_num` | No | DataFetcherAgent only. Number of BM25 candidate documents to pass to the semantic ranker. |
+| `web_search_backend` | No | DataFetcherAgent only. Search provider: `"brave"`, `"serpapi"`, etc. |
+| `web_research_mode` | No | DataFetcherAgent only. Research pipeline variant (e.g. `"brave_llm_context"`). |
+
+---
+
+## `ActionConfig` — Sandbox Settings
+
+`ActionConfig` configures the Docker sandbox used by `SoftwareEngineerAgent` for code execution.
+
+```python
+class ActionConfig(BaseModel):
+    use_sandbox: bool = False
+    image: str = "python:3.12-slim"
+    work_dir: str = "/home/user"
+    host_work_dir: str = "./workspace"
+    memory_limit: str = "512m"
+    cpu_limit: int = 4
+    timeout: int = 300
+    network_enabled: bool = True
+    use_temp_dir: bool = False
+    docker_command_mode: Literal["terminal", "isolated_exec"] = "terminal"
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `use_sandbox` | `false` | Enable Docker sandboxing for code execution. |
+| `image` | `"python:3.12-slim"` | Docker image for the sandbox container. |
+| `work_dir` | `"/home/user"` | Working directory inside the container. |
+| `host_work_dir` | `"./workspace"` | Host directory mounted into the container at `work_dir`. Empty string = no mount. |
+| `memory_limit` | `"512m"` | Docker memory limit (Docker format: `"512m"`, `"2g"`, etc.). |
+| `cpu_limit` | `4` | Number of CPU cores allocated to the container. |
+| `timeout` | `300` | Default command timeout in seconds. |
+| `network_enabled` | `true` | Allow outbound network access from the container. |
+| `use_temp_dir` | `false` | Mount a fresh OS temp dir instead of `host_work_dir`. Useful for isolated task runs. |
+| `docker_command_mode` | `"terminal"` | `"terminal"`: maintains a persistent TTY/bash session. `"isolated_exec"`: runs each command via `exec_run` (no stdin/TTY), which reduces the risk of hangs from blocking commands. |
+
+---
+
+## Model Profiles
+
+Profiles are defined in `Agent/model_profiles.yaml` and selected by `MODEL_PROFILE`. Each profile has two required sections (`models` and `specialist_agent_settings`) and one optional section (`digital_worker`).
+
+### Available Profiles
+
+| Profile | Primary use | PlannerAgent model | CUA model | SWE model |
+|---|---|---|---|---|
+| `fast` | Development / cost-sensitive | `gemini-3.1-flash-lite-preview` | `gemini-3-flash-preview` | `claude-sonnet-4.6` |
+| `default` | Production standard | `gemini-3-flash-preview` | `claude-haiku-4.5` | `claude-sonnet-4.6` |
+| `pro` | High-quality output | `claude-sonnet-4.6` | `claude-haiku-4.5` | `claude-sonnet-4.6` |
+| `best` | Max quality | `gemini-3-flash-preview` | `claude-haiku-4.5` | `claude-sonnet-4.6` |
+| `google` | All-Google stack | `claude-sonnet-4.6` | `gemini-2.5-flash` | `gemini-2.5-flash` |
+| `qwen` | Qwen direct API | `claude-sonnet-4.6` | `qwen3-235b` | `qwen3-235b` |
+| `OR_qwen` | Qwen via OpenRouter (VLM) | `claude-sonnet-4.6` | `qwen3-vl-235b` | `qwen3-vl-235b` |
+| `claude_haiku_45` | All-Haiku stack | `claude-haiku-4.5` | `claude-haiku-4.5` | `claude-haiku-4.5` |
+| `kimi_k25` | Kimi K2.5 stack | `kimi-k2.5` | `kimi-k2.5` | `kimi-k2.5` |
+
+### `models` Section Fields
+
+Each profile's `models` block must define exactly these eight fields:
+
+| Field | Purpose |
+|---|---|
+| `default_model` | Fallback model for agents without a specialist setting |
+| `cua_orchestrator_model` | Default model for `CUA_OrchestratorAgent` (overridden by `specialist_agent_settings.CUA_OrchestratorAgent.model`) |
+| `safety_light_classifier_model` | Model for fast safety classification (runs on every response) |
+| `safety_heavy_classifier_model` | Model for deep safety classification (runs only if light classifier flags the response) |
+| `evaluation_model` | Model used by `TrajectoryEvaluator` for ICL scoring |
+| `vlm_model` | Vision-language model for screen understanding in CUA |
+| `grounding_strategy` | Grounding strategy identifier passed to the VLM tool caller (e.g. `"qwen_computer_use"`) |
+| `data_siphon_model` | Model used for the data siphon pipeline (background knowledge extraction) |
+
+### `specialist_agent_settings` Keys
+
+Keys in this section must match the Python class name of the specialist:
+
+- `PlannerAgent`
+- `CUA_OrchestratorAgent`
+- `DataFetcherAgent`
+- `SoftwareEngineerAgent`
+- `MCPToolsAgent`
+
+### `digital_worker` Section
+
+Only the `default` profile currently has a `digital_worker` section. Values here are merged on top of the default Python-level field values in `AgentConfig`. See [Digital Worker Platform Settings](#digital-worker-platform-settings) above for all fields.
+
+### Adding a Custom Profile
+
+1. Add a new top-level key to `model_profiles.yaml` with `models` and `specialist_agent_settings` sections.
+2. Set `MODEL_PROFILE=<your_key>` in the environment.
+3. Optionally add a `digital_worker` section to override budget thresholds.
+
+```yaml
+my_profile:
+  models:
+    default_model: "my-provider/my-model"
+    cua_orchestrator_model: "my-provider/my-model"
+    safety_light_classifier_model: "my-provider/my-model"
+    safety_heavy_classifier_model: "my-provider/my-model"
+    evaluation_model: "my-provider/my-model"
+    vlm_model: "my-provider/my-vlm-model"
+    grounding_strategy: "qwen_computer_use"
+    data_siphon_model: "my-provider/my-model"
+  specialist_agent_settings:
+    PlannerAgent:
+      max_iter: 200
+      model: "my-provider/my-model"
+    CUA_OrchestratorAgent:
+      max_iter: 150
+      model: "my-provider/my-model"
+    DataFetcherAgent:
+      max_iter: 50
+      model: "my-provider/my-model"
+    SoftwareEngineerAgent:
+      max_iter: 200
+      model: "my-provider/my-model"
+    MCPToolsAgent:
+      max_iter: 100
+      model: "my-provider/my-model"
+```

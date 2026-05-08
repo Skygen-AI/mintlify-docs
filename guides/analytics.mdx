@@ -1,143 +1,209 @@
 ---
 title: "Analytics"
-description: "Event tracking — GA4, Yandex Metrica, Amplitude — with session stitching and DAU/MAU cohorts."
+description: "What Skygen tracks, how to send client-side events, and how to query usage data for your dashboard."
 ---
 
-Skygen tracks user events through a unified pipeline that dispatches to multiple analytics providers. Events are enriched with attribution metadata and session identifiers, then fanned out to GA4, Yandex Metrica, and Amplitude (whichever are configured).
+Skygen has a dual-layer analytics system: **server-side automatic tracking** for business-critical events (registrations, tasks, billing) and a **client-side event API** for app lifecycle events (installs, launches, crashes).
 
-## Providers
+Events are forwarded to your configured analytics destinations: Google Analytics 4, Yandex Metrica, and/or Amplitude.
 
-| Provider | Env vars | What it's for |
-|----------|----------|---------------|
-| GA4 | `GA4_MEASUREMENT_ID`, `GA4_API_SECRET`, `GA4_DEBUG_MODE` | Web analytics, conversions, retention |
-| Yandex Metrica | `YANDEX_COUNTER_ID` | Regional analytics (RU audience) |
-| Amplitude | `AMPLITUDE_API_KEY` | Product analytics, funnels |
-| Resend campaigns | `RESEND_*_AUDIENCE_ID` | Reach users by lifecycle segment |
+<Note>
+  Analytics requires `ANALYTICS_ENABLED=true` in the backend configuration. Individual destinations are configured with their respective API keys (`GA4_MEASUREMENT_ID`, `AMPLITUDE_API_KEY`, etc.).
+</Note>
 
-Master toggle: `ANALYTICS_ENABLED`. If off, `track()` becomes a no-op.
+## Automatically Tracked Events
 
-## Client-sent events
+These events are emitted by the backend automatically — you do not need to send them from your client:
 
-### `POST /analytics/events`
+| Event | Trigger |
+|-------|---------|
+| `registration_completed` | User registers (email/password or Google OAuth) |
+| `first_task_completed` | User's first agent task finishes |
+| `device_installed` | `POST /devices` called — includes platform and device type |
+| `daily_active_user` | First API activity after 20+ hours since last DAU event |
+| `monthly_active_user` | First API activity after 25+ days since last MAU event |
 
-Whitelisted events the client can emit directly. Body:
+## Client-Side Event API
 
-```json
+Send analytics events from your app client:
+
+```bash
+POST /analytics/events
+Authorization: Bearer $TOKEN
+Content-Type: application/json
+
 {
   "event_name": "app_launched",
-  "client_id": "GA1.2.123456789.1234567890",
-  "ga_session_id": "sess_abc",
-  "properties": {"version": "2.1.0"}
+  "client_id": "<ga4-client-id>",
+  "ga_session_id": "<ga4-session-id>",
+  "properties": {
+    "platform": "macos",
+    "app_version": "2.1.0"
+  }
 }
 ```
 
-Whitelist:
+**Allowed `event_name` values:**
 
-- `app_installed`, `app_launched`, `app_load_time`, `app_crash`, `app_uninstalled`
-- `session_started`, `session_ended`
-- `daily_active_user`, `monthly_active_user`
-- `device_installed`
+| Event | Description |
+|-------|-------------|
+| `app_installed` | User downloaded and installed the application |
+| `app_launched` | User launched the application |
+| `app_load_time` | App startup performance measurement |
+| `app_crash` | Application crash |
+| `app_uninstalled` | User uninstalled the application |
+| `session_started` | User started a new chat session |
+| `session_ended` | User ended a chat session |
+| `daily_active_user` | DAU (tracked once per 20-hour window) |
+| `monthly_active_user` | MAU (tracked once per 25-day window) |
+| `device_installed` | Device registered (also auto-tracked) |
 
-Backend-originated events (`registration_completed`, `subscription_started`, `purchase`) are not accepted here — they're emitted server-side to preserve integrity.
+Sending an unlisted event name returns HTTP 400.
 
-### `POST /analytics/crash`
-
-Dedicated endpoint for app crashes. Fields: `error_type`, `error_message` (truncated 500 chars), `stack_trace` (2000 chars), `app_version`, `platform`.
-
-### `POST /analytics/load-time`
-
-`load_time_ms`, `startup_type` (`cold` / `warm` / `hot`).
-
-### `POST /analytics/session/start` and `.../end`
-
-Session lifecycle events. Start: `session_id`, `device_id`. End: also `duration_seconds`, `messages_count`.
-
-### `POST /analytics/uninstall`
-
-Fires when the desktop app is uninstalled. Side effect: triggers a Resend re-engagement campaign via `resend_triggers.on_app_uninstalled()`.
-
-### `GET /analytics/status`
-
-Returns which providers are enabled:
-
+**Response:**
 ```json
 {
-  "enabled": true,
-  "providers": {
-    "ga4": true,
-    "yandex_metrica": false,
-    "amplitude": true
-  },
-  "resend_triggers": true
+  "success": true,
+  "message": "Event tracked successfully"
 }
 ```
 
-## Admin endpoints
+## Specialized Event Endpoints
 
-### Metrics dashboards
-
-```bash
-GET /analytics/admin/dau-mau?days=30
-# → { dau, wau, mau, total_users, new_users_last_n_days, dau_mau_ratio, wau_mau_ratio }
-
-GET /analytics/admin/retention
-# → { retention: { day_1: { cohort_size, retained, retention_rate }, day_7: ..., day_14: ..., day_30: ... } }
-
-GET /analytics/admin/config
-# Shows which providers are enabled and API keys present
-```
-
-### Re-engagement jobs (admin)
+### App Crash
 
 ```bash
-POST /analytics/admin/jobs/inactive-users?days_inactive=7&batch_size=100
-# Finds users inactive 7+ days, tracks analytics event, sends re-engagement email
+POST /analytics/app-crash
+Authorization: Bearer $TOKEN
+Content-Type: application/json
 
-POST /analytics/admin/jobs/retention-tracking?retention_days=1,7,14,30&batch_size=100
-# Tracks retention at each milestone
-
-GET /analytics/admin/inactive-users?days_inactive=3&limit=50
-# Paginated list of inactive users + timestamps
+{
+  "error_message": "Segmentation fault in renderer",
+  "error_type": "SIGSEGV",
+  "stack_trace": "...",
+  "app_version": "2.1.0",
+  "platform": "macos"
+}
 ```
 
-## Enrichment pipeline
+### App Load Time
 
-Every event passes through `analytics_tracker.track()`:
+```bash
+POST /analytics/app-load-time
+Authorization: Bearer $TOKEN
+Content-Type: application/json
 
-1. **Resolve user** from `user_id`
-2. **Attribute**: read `registration_meta` (`ga_client_id`, `utm_source`, `utm_campaign`, etc.) and attach to event
-3. **Session stitch**: for near-registration events (`registration_completed`, `card_added`), use `ga_client_id` + `ga_session_id` to stitch to the original browser session in GA4
-4. **Companion events**: `subscription_started` and `purchase` auto-emit a matching `all_purchases` event so multi-product funnels work
-5. **Strip reserved fields**: GA4 reserves `dclid`, `srsltid`, any field starting with `_`. The tracker strips these before dispatch
-6. **Fan out**: dispatch to every enabled provider
+{
+  "load_time_ms": 1240,
+  "startup_type": "cold"
+}
+```
 
-## DAU / MAU tracking
+`startup_type`: `cold` (full restart), `warm` (from sleep), or `hot` (from background).
 
-When any whitelisted event fires, the tracker updates the user's `last_active_at`. Every ~20 hours it also records a `daily_active_user` event, and every ~25 days a `monthly_active_user` event. This avoids spamming GA but ensures accurate DAU/MAU on the admin dashboard.
+### Session Events
 
-## Rate limits
+```bash
+POST /analytics/session-started
+Authorization: Bearer $TOKEN
+Content-Type: application/json
 
-None. Trust the UI not to spam.
+{
+  "session_id": "3fa85f64-...",
+  "device_id": "optional-device-uuid"
+}
+```
 
-## Gotchas
+```bash
+POST /analytics/session-ended
+Authorization: Bearer $TOKEN
+Content-Type: application/json
 
-<Warning>
-**Resend triggers can fail silently.** The `/analytics/uninstall` endpoint returns `success: true` even if the Resend email campaign failed. If email follow-up is critical, instrument it yourself.
-</Warning>
+{
+  "session_id": "3fa85f64-...",
+  "duration_seconds": 145,
+  "messages_count": 12
+}
+```
 
-<Note>
-**DAU/MAU windowing is fixed 24-hour buckets** keyed on `last_active_at`. Users who never re-authenticate won't count. In multi-platform setups, ensure the client emits `app_launched` on open.
-</Note>
+### App Uninstalled
 
-<Note>
-**Whitelist is hardcoded.** Adding a new event requires a backend release. Not runtime-configurable.
-</Note>
+```bash
+POST /analytics/app-uninstalled
+Authorization: Bearer $TOKEN
+Content-Type: application/json
 
-<Note>
-**Cohort calculation uses server-local UTC.** Users near midnight in their local timezone might land in unexpected cohorts.
-</Note>
+{
+  "reason": "Switching to a competitor"
+}
+```
 
-## See also
+`reason` is optional and forwarded as a property to your analytics backends.
 
-- [Admin overview](/admin/overview) — admin analytics endpoints
-- [Billing](/concepts/billing) — Resend audience targeting
+## Session Activity Tracking
+
+Every time an authenticated user calls the events endpoint, their `last_active_at` timestamp is updated. DAU and MAU events are de-duplicated automatically:
+
+- **DAU**: Tracked at most once per 20 hours per user.
+- **MAU**: Tracked at most once per 25 days per user.
+
+These events are used to generate Daily Active Users and Monthly Active Users metrics in your analytics dashboards.
+
+## GA4 Session Stitching
+
+If you use Google Analytics 4, pass the `client_id` (from the `_ga` cookie) and `ga_session_id` (from the `_ga_<measurement_id>` cookie) with your events. This stitches server-side events to the user's browser session in GA4, giving you accurate attribution across web and app surfaces.
+
+```javascript
+// Read GA4 identifiers from cookies
+function getGA4Ids() {
+  const gaCookie = document.cookie.split(";").find(c => c.trim().startsWith("_ga="));
+  if (!gaCookie) return {};
+  const clientId = gaCookie.split("=")[1].split(".").slice(2).join(".");
+  return { client_id: clientId };
+}
+
+await fetch("https://api.skygen.ai/analytics/events", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    event_name: "app_launched",
+    ...getGA4Ids(),
+    properties: { platform: "web" },
+  }),
+});
+```
+
+## Admin Analytics Endpoints
+
+These endpoints are restricted to admin users and provide platform-level aggregates:
+
+```bash
+# User statistics
+GET /users/stats?days=30
+Authorization: Bearer $ADMIN_TOKEN
+
+# Returns:
+{
+  "total_users": 1240,
+  "active_users": 987,
+  "verified_users": 1100,
+  "new_users_last_days": 43,
+  "days": 30
+}
+```
+
+## Configuration Reference
+
+| Environment variable | Description |
+|---------------------|-------------|
+| `ANALYTICS_ENABLED` | Master switch. Set to `false` to disable all tracking. |
+| `GA4_MEASUREMENT_ID` | Google Analytics 4 measurement ID (e.g. `G-XXXXXXXXXX`) |
+| `GA4_API_SECRET` | GA4 Measurement Protocol API secret |
+| `GA4_DEBUG_MODE` | Set to `true` to use GA4 debug endpoint and log all events |
+| `AMPLITUDE_API_KEY` | Amplitude project API key |
+| `YANDEX_COUNTER_ID` | Yandex Metrica counter ID |
+
+All keys are optional. Events are sent only to destinations with a configured key.

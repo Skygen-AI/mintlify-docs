@@ -1,168 +1,375 @@
 ---
 title: "Authentication"
-description: "JWT tokens, Google OAuth (web + mobile), email verification, invites, and admin auth."
+description: "How JWT authentication works in Skygen: getting tokens, using them in API calls, Google OAuth, and handling auth errors."
 ---
 
-Skygen has three kinds of credentials, each for a different surface:
+Skygen uses **JWT (JSON Web Tokens)** signed with HS256 for all API authentication. Tokens are valid for **30 days** by default and are delivered both in the JSON response body (for native clients) and via an `HttpOnly` session cookie (for browser clients).
 
-- **User JWT** — how your app calls the REST API.
-- **API key** — how agent/KB endpoints authenticate (via `AGENT_API_TOKEN`).
-- **Device KID** — a Key ID bound to a registered device, used in Socket.IO handshakes.
+## Getting a Token
 
-## Token lifecycle
+### Email / Password
 
-<Warning>
-**No refresh tokens.** Skygen issues long-lived 30-day access tokens and does not implement a separate refresh flow. Users log back in when the token expires, or after a password change (which invalidates all tokens issued before `password_changed_at`).
-</Warning>
+<CodeGroup>
+```bash curl
+curl -s -X POST https://api.skygen.ai/auth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=you@example.com&password=your-password"
+```
 
-- **Algorithm**: HS256
-- **Expiry**: 30 days (43,200 minutes) from `ACCESS_TOKEN_EXPIRE_MINUTES`
-- **Payload**: `{ sub: user_id, email, is_admin, exp, iat }`
-- **Secret**: `SECRET_KEY` env var, minimum 32 chars (enforced by settings validator)
+```python Python
+import httpx
 
-## Sign up
+resp = httpx.post("https://api.skygen.ai/auth/token", data={
+    "username": "you@example.com",
+    "password": "your-password",
+})
+resp.raise_for_status()
+token = resp.json()["access_token"]
+```
 
-```bash
-curl -X POST https://api.skygen.ai/auth/register \
+```javascript JavaScript
+const resp = await fetch("https://api.skygen.ai/auth/token", {
+  method: "POST",
+  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  body: new URLSearchParams({ username: "you@example.com", password: "your-password" }),
+});
+const { access_token } = await resp.json();
+```
+</CodeGroup>
+
+**Response:**
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+The response also sets a `skygen_session` `HttpOnly` cookie that browser clients use automatically on subsequent requests.
+
+### Registration
+
+New users register via `POST /auth/register`:
+
+<CodeGroup>
+```bash curl
+curl -s -X POST https://api.skygen.ai/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "you@example.com",
-    "password": "strong-password",
-    "invite_code": "optional-required-if-invite-mode"
+    "password": "your-password",
+    "display_name": "Your Name"
   }'
 ```
 
-- If `REGISTRATION_MODE=invite_only`, `invite_code` is required and validated (active, unused, not expired).
-- A 24-hour verification token is emailed on success.
-- Response: `UserRead` (201 Created).
+```python Python
+resp = httpx.post("https://api.skygen.ai/auth/register", json={
+    "email": "you@example.com",
+    "password": "your-password",
+    "display_name": "Your Name",
+})
+data = resp.json()
+token = data["access_token"]
+user_id = data["user"]["id"]
+```
+</CodeGroup>
 
-<Info>
-**Email verification is optional.** Users can log in immediately after signup; `is_email_verified` is a flag, not a gate.
-</Info>
-
-## Log in
-
-```bash
-curl -X POST https://api.skygen.ai/auth/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=you@example.com&password=strong-password"
-# → { "access_token": "eyJ...", "token_type": "bearer" }
+**Response** (HTTP 201):
+```json
+{
+  "user": { "id": "uuid", "email": "...", "display_name": "...", ... },
+  "access_token": "eyJ...",
+  "token_type": "bearer"
+}
 ```
 
-Rate-limited to 20 requests per 15 minutes per IP.
+After registration, a verification email is sent. The user can interact with the API immediately; some admin features may require email verification.
 
-## Password reset
+<Note>
+  If `REGISTRATION_MODE=invite_only` is configured on the server, you must pass an `invite_code` field in the registration body. Invalid or expired codes return HTTP 400.
+</Note>
+
+## Using Tokens in API Calls
+
+Pass the JWT as a Bearer token in the `Authorization` header:
 
 ```bash
-# Step 1 — request a reset link (always 202, never leaks whether the email exists)
-curl -X POST https://api.skygen.ai/auth/forgot-password \
-  -d '{"email": "you@example.com"}'
-
-# Step 2 — reset with the token from the email (15-minute TTL)
-curl -X POST https://api.skygen.ai/auth/reset-password \
-  -d '{"token": "eyJ...", "new_password": "new-strong-password"}'
+curl https://api.skygen.ai/users/me \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 ```
 
-Rate limits: forgot-password 3/hour, reset-password 5/hour, both per IP.
+Browser clients using the cookie-based flow do not need to set the header manually — the `skygen_session` `HttpOnly` cookie is sent automatically by the browser.
 
 ## Google OAuth
 
-### Web (redirect flow)
+### Web Flow
+
+Redirect the user to the authorization URL to initiate Google sign-in:
+
+```
+GET https://api.skygen.ai/auth/google
+```
+
+This redirects to Google's authorization page. After the user authenticates, Google redirects back to `/auth/google/callback`. On success, the backend:
+1. Sets a `skygen_session` cookie.
+2. Redirects to `https://skygen.ai/app/home`.
+
+No token appears in the URL — the JWT is only in the cookie.
+
+**Error handling:** On failure, the user is redirected to `/app/login?google_error=<code>`:
+
+| Error code | Cause |
+|-----------|-------|
+| `missing_params` | `code` or `state` missing from callback |
+| `invalid_state` | CSRF state token expired or tampered |
+| `token_exchange_failed` | Google rejected the authorization code |
+| `email_not_verified` | Google account email is not verified |
+| `missing_claims` | Google token missing `email` or `sub` claim |
+
+### Mobile (Android / iOS)
+
+For native apps, authenticate the user on-device with the Google SDK, then send the resulting ID token to:
+
+```bash
+POST https://api.skygen.ai/auth/google-mobile/token
+Content-Type: application/json
+
+{
+  "id_token": "<google-id-token>"
+}
+```
+
+Returns `{ "access_token": "...", "token_type": "bearer" }` — no redirect needed.
+
+## Token Lifecycle
+
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | HS256 |
+| Default expiry | 30 days (43,200 minutes) |
+| Cookie name | `skygen_session` |
+| Cookie `SameSite` | `lax` |
+| Cookie `Secure` | `true` in production |
+
+**Token invalidation:** If a user changes their password, all previously issued tokens are automatically invalidated. Any API call with a pre-change token returns HTTP 401.
+
+<Note>
+  There is currently no dedicated token refresh endpoint. Re-authenticate with `POST /auth/token` to get a new token before expiry, or implement proactive re-login in your client when you receive a 401.
+</Note>
+
+## Password Reset
 
 <Steps>
-  <Step title="Start">
-    `POST /auth/google` → redirect to Google consent with a 10-minute state token and `scope=openid email profile`.
+  <Step title="Request a reset link">
+    ```bash
+    curl -s -X POST https://api.skygen.ai/auth/forgot-password \
+      -H "Content-Type: application/json" \
+      -d '{ "email": "you@example.com" }'
+    ```
+    Always returns HTTP 202 to prevent email enumeration. The reset link expires in 15 minutes.
   </Step>
-  <Step title="Callback">
-    `GET /auth/google/callback?code=&state=` — backend exchanges the code for an ID token, verifies it against `GOOGLE_CLIENT_ID`, matches or creates the user, then redirects to `FRONTEND_URL/auth/google/callback?token={jwt}&is_new={bool}`.
-  </Step>
-  <Step title="Attach tracking (new users only)">
-    Your frontend calls `PATCH /auth/update-registration-meta` with GA/UTM data collected pre-redirect so analytics attribution is preserved.
+  <Step title="Submit the new password">
+    ```bash
+    curl -s -X POST https://api.skygen.ai/auth/reset-password \
+      -H "Content-Type: application/json" \
+      -d '{
+        "token": "<reset-token-from-email>",
+        "new_password": "new-secure-password"
+      }'
+    ```
   </Step>
 </Steps>
 
-### Mobile (ID token flow)
+## Logout
 
 ```bash
-curl -X POST https://api.skygen.ai/auth/google-mobile/token \
-  -d '{"id_token": "raw-google-id-token-from-sdk"}'
-# → { "access_token": "eyJ...", "token_type": "bearer" }
+curl -s -X POST https://api.skygen.ai/auth/logout
 ```
 
-The backend validates the ID token's `aud` against any of `GOOGLE_CLIENT_ID`, `GOOGLE_ANDROID_CLIENT_ID`, or `GOOGLE_IOS_CLIENT_ID`, so one endpoint serves both Android and iOS apps.
+Clears the `skygen_session` and `skygen_logged_in` cookies. No authentication required — a user with an expired or invalid cookie must still be able to fully log out.
 
-## Invite system
+## Auth Error Reference
 
-When `REGISTRATION_MODE=invite_only`, users must supply a valid `invite_code` at signup. Any authenticated user can issue invites for others.
+| HTTP Status | Detail | Cause |
+|------------|--------|-------|
+| 400 | `Email already registered` | Registration with an existing email |
+| 400 | `Invalid invite code` | Invite code not found |
+| 400 | `This invite code has expired` | Invite code past its expiry date |
+| 400 | `Invalid token` | Malformed or missing JWT sub claim |
+| 400 | `Invalid or expired token` | JWT signature invalid or expired |
+| 401 | `Incorrect email or password` | Login credentials wrong |
+| 401 | `Invalid token` | Token from before password change |
+| 401 | `Not authenticated` | No Bearer token or cookie provided |
+| 403 | `Inactive user` | User account has been deactivated |
+| 410 | `legacy upgrade disabled` | Session upgrade endpoint disabled |
+| 429 | Rate limit exceeded | Too many login or password reset attempts |
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/invites/my` | Create invite (`expires_at`, `note`) |
-| `GET` | `/invites/my` | List own invites. `?is_active`, `?used` filters. |
-| `GET` | `/invites/my/{code}` | Details (creator only) |
-| `POST` | `/invites/my/{code}/deactivate` | Revoke (creator only) |
+## Rate Limits
 
-## User endpoints
+The following auth endpoints are rate-limited to prevent abuse:
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/users/me` | Current user |
-| `PATCH` | `/users/me` | Update (privilege-escalation-safe: admin flags stripped) |
-| `DELETE` | `/users/me` | Soft-delete own account (sets `is_active=false`) |
+| Endpoint | Limit |
+|----------|-------|
+| `POST /auth/token` | Limited per IP per minute |
+| `POST /auth/forgot-password` | Limited per IP per minute |
+| `POST /auth/reset-password` | Limited per IP per minute |
 
-## Device KID
+Exceeding the limit returns HTTP 429.
 
-Devices authenticate Socket.IO sessions with a `device_token_kid` assigned by `POST /devices`. The KID is rotatable via `POST /devices/{id}/rotate` (rate-limited to once per 5 minutes). See [Devices](/concepts/devices) for the full model.
+## User Profile
 
-<Note>
-The device KID is not a standalone credential — Socket.IO connections still require a valid user JWT. The KID identifies the device session but does not authorize it.
-</Note>
-
-## API key (agent/KB)
-
-Agent-side services use a shared bearer token from `AGENT_API_TOKEN`:
+Once authenticated, fetch your profile:
 
 ```bash
-curl https://api.skygen.ai/knowledge/retrieve \
-  -H "Authorization: Bearer $AGENT_API_TOKEN"
+curl https://api.skygen.ai/users/me \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-Generated and managed out of band (env var / secret manager). See [Knowledge base](/guides/knowledge-base).
-
-## Admin auth
-
-Admins log in through a separate endpoint:
+Update display name or other soft fields:
 
 ```bash
-curl -X POST https://api.skygen.ai/admin/api/auth/login \
-  -d '{"login": "admin-email@skygen.ai", "password": "..."}'
+curl -X PATCH https://api.skygen.ai/users/me \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "display_name": "New Name" }'
 ```
 
-Two auth paths:
+<Warning>
+  `is_admin` and `is_active` fields in `PATCH /users/me` are ignored for security. Only admin endpoints can modify those values.
+</Warning>
 
-- **Superadmin** — static credentials from env (`SUPERADMIN_LOGIN` fixed to `"admin"`, `SUPERADMIN_PASSWORD` from `$DOCS_PASSWORD` or `$PROD_ADMIN_PASS`). Token flags `is_superadmin: true`. No DB user record.
-- **DB admin** — email + password, user must have `is_admin=true` or a non-null `admin_role_id`. Token includes `role` (e.g. `admin`, custom role name).
+---
 
-Admin tokens expire in **24 hours** (not 30 days).
+## Frontend Implementation
 
-## 2FA
+This section documents how the Skygen WebApp (`ui-shared-tauri`) implements the auth flow end-to-end.
 
-Endpoint stubs exist (`/auth/setup-2fa`, `/auth/verify-2fa`, `/auth/2fa-status`) for backward compatibility but are **disabled** — status always returns `is_enabled: false`. Preserved for future re-enablement.
+### Token Storage (Dual Delivery)
 
-## Rate limits summary
+The backend always delivers the JWT both as an `HttpOnly` cookie (`skygen_session`) **and** in the JSON response body. The frontend stores the body token in platform-specific storage:
 
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| `POST /auth/token` | 20 | 15 min / IP |
-| `POST /auth/google-mobile/token` | 20 | 15 min / IP |
-| `POST /auth/forgot-password` | 3 | 1 hour / IP |
-| `POST /auth/reset-password` | 5 | 1 hour / IP |
-| `POST /files/parse` | 30 | 1 min / user |
+- **Web**: `localStorage` via `platform.storage.set('token', value)`
+- **Desktop (macOS/Windows)**: Tauri secure storage via the `IPlatformAdapter`
 
-Limits are disabled in dev (`ENVIRONMENT` check in `rate_limit.py`).
+Browser requests go to the same origin and the cookie is sent automatically by the browser. The `Authorization: Bearer` header is set by the HTTP client from the stored token for native clients that cannot read the HttpOnly cookie.
 
-## See also
+### `authSlice.login()` Step Sequence
 
-- [Devices](/concepts/devices) — device KID
-- [Errors](/errors) — `401` and `403` responses
-- [Knowledge base](/guides/knowledge-base) — API key usage
+Source: `store/slices/authSlice.ts`
+
+```
+1. authApi.login(email, password)          → POST /auth/token (urlencoded, credentials: 'include')
+2. platform.storage.set('token', token)    → persist JWT for native clients
+3. GET /users/me                            → load User object
+4. State: isAuthenticated=true, user=User
+5. needsOTPSetup = !user.otp_secret        → see 2FA note below
+```
+
+### `authSlice.restoreSession()` Step Sequence
+
+Called on app start to hydrate auth state from a stored token.
+
+```
+1. platform.storage.get('token')           → check if token exists
+2. If yes: upgradeSession()                → POST /auth/upgrade-session (cookie migration)
+3. GET /users/me                           → verify token validity + load User
+4. If 401: clear token, remain logged-out
+5. If ok: isAuthenticated=true, user=User
+6. needsOTPSetup = !user.otp_secret
+```
+
+### `upgradeSession()` — Cookie Migration
+
+Source: `api/http/authApi.ts`
+
+Older desktop clients stored only a Bearer token without an `HttpOnly` cookie. `upgradeSession()` posts the stored token to `POST /auth/upgrade-session` which the backend uses to issue a proper cookie session. Called as a no-op when the cookie is already present.
+
+### `authSlice.signup()` Step Sequence
+
+```
+1. authApi.register(email, password, displayName, inviteCode?)
+   → POST /auth/register (JSON, credentials: 'include')
+2. platform.storage.set('token', token)
+3. user = response.user
+4. isAuthenticated=true, needsOTPSetup=true  ← hardcoded: new users always need 2FA setup
+```
+
+### 2FA (TOTP) Flow
+
+Triggered when `LoginPage` detects `user.otp_secret === true` from a second `GET /users/me` call made **after** `login()` succeeds.
+
+```
+LoginPage:
+1. login() → authSlice.login() (stores token, loads user)
+2. fetch /users/me directly → check user.otp_secret === true
+3. If true: show OTPDialog
+4. User enters 6-digit TOTP code
+5. POST /auth/verify-otp { code: "123456" }
+6. If valid (200): navigate to /
+7. If invalid (401): show error in OTPDialog, allow retry
+```
+
+<Warning>
+`authSlice` declares `otp_secret?: boolean` on the `User` type, but the backend `UserRead` schema does not expose this field. As a result `!user.otp_secret` evaluates to `true` for **every** user (since the field is `undefined`), meaning `needsOTPSetup` is always `true` in the store. This is a known bug. `LoginPage` works around it by making a separate `GET /users/me` call and checking `user.otp_secret === true` (strict equality), which correctly returns `false` when the field is absent.
+</Warning>
+
+### Google OAuth Flow (Frontend)
+
+```
+1. User clicks "Sign in with Google"
+2. Browser navigates to GET /auth/google (full-page redirect)
+3. User authenticates on Google
+4. Backend sets skygen_session cookie and redirects to /app/home (web)
+   OR appends ?token=...&is_new=... to the callback URL (native apps)
+5. GoogleCallbackPage reads ?token from URL
+6. platform.storage.set('token', token)
+7. restoreSession() → GET /users/me
+8. For new users (is_new=true): POST analytics/registration-meta
+9. Check billing → navigate to / or open PaywallModal
+```
+
+### Composio OAuth Flow (Frontend)
+
+Used for connecting integrations (Gmail, Slack, GitHub, etc.).
+
+```
+1. User clicks Connect in ConnectorsModal
+2. ConnectMcpModal shown with provider details
+3. User clicks Connect → backend returns OAuth authorization URL
+4. openOAuthWindow(url) → popup or full-page redirect (platform-specific)
+5. User authorizes on provider site
+6. Provider redirects to app.skygen.ai/app/oauth/callback?status=success&appName=...
+7. OAuthCallbackPage reads params, calls invalidateConnectorCaches()
+8. Auto-redirects to /home after 3-second countdown
+```
+
+### `authSlice.logout()` Step Sequence
+
+```
+1. POST /auth/logout (best-effort — ignores errors)
+2. platform.storage.remove('token')
+3. isAuthenticated=false, user=null
+4. Disconnect wsClient (Socket.IO)
+5. Navigate to /login
+```
+
+### Optimistic Auth Check
+
+At module load time (before React renders), `hasAuthToken()` reads `localStorage` synchronously. If no token is found, the app renders `/login` immediately without a loading flash. This check is used by `ProtectedRoute` as a synchronous guard while the async `restoreSession()` completes.
+
+### Auth State in Zustand
+
+Key fields in `authSlice`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `isAuthenticated` | `boolean` | Set to `true` after successful login/restore |
+| `isLoading` | `boolean` | `true` during `restoreSession()` / `login()` |
+| `user` | `User \| null` | Populated from `GET /users/me` |
+| `needsOTPSetup` | `boolean` | Whether 2FA enrollment is required (see bug note) |
+
+### Security Notes
+
+- The JWT `HttpOnly` cookie has `SameSite=lax; Secure` in production — not readable by JavaScript.
+- The `Authorization: Bearer` header set by the frontend HTTP client is the backup for native apps and API tool usage.
+- Changing a password invalidates all existing tokens server-side. Any request with a pre-change token receives HTTP 401, which triggers automatic logout in the frontend's `httpClient` interceptor.

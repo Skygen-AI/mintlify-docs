@@ -1,0 +1,408 @@
+---
+title: "Extending the Agent Framework"
+description: "Step-by-step guide to adding new specialist agents, custom tools, LLM providers, and hibernation strategies."
+---
+
+# Extending the Agent Framework
+
+This guide explains how to add new specialist agents, custom tools, LLM providers, and hibernation strategies to the Skygen Agent framework. Every extension point follows the same IoC pattern used by the existing specialists — no modifications to `BaseAgent` or `BrokerAgent` are required.
+
+---
+
+## Adding a New Specialist Agent
+
+A new specialist is a Python class that inherits from `BaseAgent` and overrides three things: the system prompt, the allowed sub-agent types, and optionally some factory methods.
+
+<Steps>
+  <Step title="Create the module">
+    Create `Agent/Agents/MySpecialistAgent/base.py`:
+
+    ```python
+    from Agents.BaseAgent.base import BaseAgent
+
+    class MySpecialistAgent(BaseAgent):
+        # 1. Persona / role
+        SYSTEM_PROMPT = """
+        You are a specialist in processing structured data pipelines.
+        You receive raw datasets and produce validated, transformed outputs.
+        """
+
+        # 2. Displayed in manage_subagent tool description for the Planner
+        DELEGATION_DESCRIPTION = (
+            "Processes structured datasets: validates schema, transforms records, "
+            "and returns a clean output file."
+        )
+
+        # 3. Can this agent spawn further children?
+        # Leave empty {} if this is a leaf-node specialist.
+        subagent_classes = {}
+
+        # 4. TerminateGuard — only enable for orchestrators that own a plan
+        TERMINATE_GUARD_ENABLED = False
+    ```
+  </Step>
+
+  <Step title="Register custom tools (optional)">
+    Override `_create_tool_manager()` to add domain-specific tools:
+
+    ```python
+    from Agents.BaseAgent.Components import ToolManager
+    from Utilities.Toolkits.my_domain import ValidateSchemaTool, TransformRecordsTool
+
+    class MySpecialistAgent(BaseAgent):
+        ...
+
+        def _create_tool_manager(self) -> ToolManager:
+            mgr = super()._create_tool_manager()
+            mgr.register_tool(ValidateSchemaTool())
+            mgr.register_tool(TransformRecordsTool())
+            return mgr
+    ```
+
+    The base `_create_tool_manager()` registers all standard tools (`communicate`, `manage_scratchpad`, `wait`, etc.). Override to add on top; call `super()` first to keep the standard tools.
+  </Step>
+
+  <Step title="Customize the system prompt (optional)">
+    Override individual `construct_*` methods in a custom `PromptBuilder` subclass and then override `_create_prompt_builder()`:
+
+    ```python
+    from Agents.BaseAgent.Components import PromptBuilder
+    from Utilities.Prompts.PromptBlock import PromptBlock
+
+    class MyPromptBuilder(PromptBuilder):
+        def construct_skills_block(self):
+            block = PromptBlock("PROTOCOLS.SKILLS", "Domain skills")
+            block.add("SCHEMA_VALIDATION: Always validate input schema before transformation.")
+            block.add("IDEMPOTENCY: All transformations must be idempotent.")
+            return block
+
+    class MySpecialistAgent(BaseAgent):
+        ...
+
+        def _create_prompt_builder(self):
+            return MyPromptBuilder(self)
+    ```
+  </Step>
+
+  <Step title="Register with PlannerAgent">
+    Add your agent to `PlannerAgent.subagent_classes`:
+
+    ```python
+    # Agent/Agents/PlannerAgent/base.py
+    from Agents.MySpecialistAgent.base import MySpecialistAgent
+
+    class PlannerAgent(BaseAgent):
+        subagent_classes = {
+            "mcp_tools_agent": MCPToolsAgent,
+            "cua_orchestrator": CUA_OrchestratorAgent,
+            "data_fetcher": DataFetcherAgent,
+            "software_engineer": SoftwareEngineerAgent,
+            "my_specialist": MySpecialistAgent,   # ← add here
+        }
+    ```
+
+    The Planner will now list `agent_type='my_specialist'` in the `manage_subagent` tool description automatically.
+  </Step>
+
+  <Step title="Add per-specialist settings in model_profiles.yaml">
+    ```yaml
+    default:
+      specialist_agent_settings:
+        my_specialist:
+          max_iter: 25
+          model: google/gemini-2.5-flash
+          model_low: google/gemini-2.5-flash-lite
+    ```
+
+    `max_iter` controls maximum loop iterations. `model` is the default model. `model_low` is used when the Planner spawns the specialist with `intellect="low"`.
+  </Step>
+</Steps>
+
+---
+
+## Writing a Custom Tool
+
+All tools inherit from `BaseTool` and implement `_execute()`.
+
+```python
+# Utilities/Toolkits/my_domain/validate_schema_tool.py
+from Utilities.Toolkits.actions.BaseTool import BaseTool, ToolResult
+from Utilities.Context.Primitives import AgentContext, ToolInput, ToolError
+
+class ValidateSchemaTool(BaseTool):
+    name = "validate_schema"
+    description = "Validate a JSON dataset against a JSON Schema definition."
+    required_args = {
+        "data_path": "Path to the JSON dataset file",
+        "schema_path": "Path to the JSON Schema file",
+    }
+
+    async def _execute(self, input: ToolInput, context: AgentContext) -> ToolResult:
+        data_path = input.args.get("data_path")
+        schema_path = input.args.get("schema_path")
+
+        if not data_path or not schema_path:
+            return ToolResult(error=ToolError(message="Both 'data_path' and 'schema_path' are required."))
+
+        try:
+            # ... actual validation logic ...
+            errors = self._validate(data_path, schema_path)
+            if errors:
+                return ToolResult(output=f"Validation failed with {len(errors)} error(s):\n" + "\n".join(errors))
+            return ToolResult(output="Validation passed. Schema is satisfied.")
+        except Exception as e:
+            return ToolResult(error=ToolError(message=f"Validation error: {e}"))
+
+    def get_prompt_execution_details(self) -> str:
+        return (
+            f"- `{self.name}`: {self.description}\n"
+            f"  - `args`: {self.required_args}"
+        )
+```
+
+### Returning State Updates
+
+`ToolResult.updates` carries a list of `StateUpdate` objects that are applied to `BaseAgentState` after the tool runs:
+
+```python
+from Utilities.Context.Primitives import AddMessages, UpdateProps, UpdateScratchpad
+
+# Append a system message to the agent's history
+ToolResult(
+    output="Done.",
+    updates=[AddMessages(messages=[{"role": "system", "content": "Schema validated."}])]
+)
+
+# Update arbitrary state properties
+ToolResult(
+    output="Mode switched.",
+    updates=[UpdateProps(props={"lifecycle_mode": "batch", "lifecycle_batch_size": 20})]
+)
+
+# Update the scratchpad
+ToolResult(
+    output="Note taken.",
+    updates=[UpdateScratchpad(action="append", texts=["Validated schema at 14:32"])]
+)
+```
+
+### Triggering Hibernation from a Tool
+
+Any tool can return a HIBERNATE signal by including `meta={"hibernate_config": …}` and `UpdateProps.terminal()` in the result:
+
+```python
+return ToolResult(
+    output="Waiting for external process to complete.",
+    updates=[UpdateProps(props={"status": "HIBERNATED"})],
+    meta={
+        "hibernate_config": {
+            "trigger_type": "timer",
+            "condition": "none",
+            "interval_seconds": 60,
+            "timeout_seconds": 3600,
+        }
+    },
+)
+```
+
+`BaseAgent._handle_termination()` detects `meta["hibernate_config"]` and routes to the hibernation path.
+
+---
+
+## Adding a Custom Alert Rule
+
+Alert rules inject system messages into the next LLM call to guide or warn the agent. Register them in `_create_budget_alert_manager()`.
+
+```python
+from Agents.BaseAgent.Components import BaseAlertRule, BudgetAlertManager
+from Utilities.Context.Primitives import AgentContext
+from Utilities.Context.State import BaseAgentState
+from typing import Optional
+
+class MaxChildrenAlertRule(BaseAlertRule):
+    """Alert when active children approach the hard cap."""
+
+    _THRESHOLD = 8  # warn at 8/10
+
+    def check(
+        self,
+        agent,
+        context: AgentContext,
+        state: BaseAgentState,
+        current_step: int,
+    ) -> Optional[str]:
+        active = sum(
+            1 for v in agent.active_children.values()
+            if not (v.get("task") and v["task"].done())
+        )
+        if active >= self._THRESHOLD:
+            return (
+                f"[SYSTEM ALERT: PARALLELISM LIMIT]\n"
+                f"You have {active}/10 active sub-agents. Do not spawn more until some finish."
+            )
+        return None
+```
+
+```python
+class MyOrchestrator(BaseAgent):
+    def _create_budget_alert_manager(self) -> BudgetAlertManager:
+        mgr = super()._create_budget_alert_manager()
+        mgr.register_rule(MaxChildrenAlertRule())
+        return mgr
+```
+
+---
+
+## Adding a New LLM Provider
+
+<Steps>
+  <Step title="Implement BaseProvider">
+    ```python
+    # Utilities/LLM_Providers/MyProvider.py
+    import httpx
+    from Utilities.LLM_Providers.Base import BaseProvider
+
+    class MyProvider(BaseProvider):
+        @property
+        def api_key_env_var(self) -> str:
+            return "MY_PROVIDER_API_KEY"
+
+        def _create_client(self) -> httpx.AsyncClient:
+            return httpx.AsyncClient(
+                base_url="https://api.myprovider.ai/v1",
+                headers={"Authorization": f"Bearer {self._get_api_key()}"},
+                timeout=60.0,
+            )
+
+        async def prepare_payload(self, payload: dict, model: str, **kwargs) -> dict:
+            # Transform canonical payload to provider format
+            return {
+                "model": model,
+                "messages": payload["messages"],
+                "max_tokens": payload.get("max_tokens", 4096),
+                "temperature": payload.get("temperature", 0.1),
+            }
+
+        async def execute_request(self, client: httpx.AsyncClient, payload: dict, **kwargs) -> dict:
+            response = await client.post("/chat/completions", json=payload)
+            response.raise_for_status()
+            return response.json()
+
+        def parse_response(self, response: dict) -> tuple[str, dict]:
+            choice = response["choices"][0]
+            text = choice["message"]["content"]
+            usage = response.get("usage", {})
+            meta = {
+                "model": response.get("model", ""),
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            }
+            return text, meta
+    ```
+  </Step>
+
+  <Step title="Register models in ModelCatalog">
+    ```python
+    # At the bottom of ModelRegistry.py, or in a startup hook:
+    from Utilities.LLM_Providers.ModelRegistry import ModelCatalog, ModelDescriptor
+
+    ModelCatalog.Register(ModelDescriptor(
+        name="myprovider/my-model-70b",
+        provider="myprovider",
+        max_context_tokens=128_000,
+        tier="balanced",
+        supports_vision=False,
+    ))
+    ```
+  </Step>
+
+  <Step title="Register the provider factory">
+    In `Utilities/LLM_Providers/ProviderFactory.py` (or equivalent), add a mapping from the provider key to your class:
+
+    ```python
+    from Utilities.LLM_Providers.MyProvider import MyProvider
+
+    _PROVIDER_MAP = {
+        "openrouter": OpenRouterProvider,
+        "gemini": GeminiProvider,
+        "groq": GroqProvider,
+        "cerebras": CerebrasProvider,
+        "myprovider": MyProvider,   # ← add here
+    }
+    ```
+  </Step>
+
+  <Step title="Add to model_profiles.yaml">
+    ```yaml
+    default:
+      models:
+        default_model: myprovider/my-model-70b
+      specialist_agent_settings:
+        my_specialist:
+          model: myprovider/my-model-70b
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Adding a Custom Hibernation Strategy
+
+Hibernation strategies control when an agent wakes from sleep. They are registered in the `HibernationRegistry`.
+
+```python
+# Utilities/Hibernation/strategies/my_strategy.py
+from Utilities.Hibernation.base import BaseHibernationStrategy, HibernationConfig
+
+class WebhookStrategy(BaseHibernationStrategy):
+    name = "webhook"
+
+    async def should_wake(self, config: HibernationConfig, redis_client) -> bool:
+        """Check if an external webhook has fired."""
+        key = f"webhook:received:{config.session_id}:{config.condition}"
+        return bool(await redis_client.exists(key))
+
+    def validate_config(self, config: dict) -> None:
+        if not config.get("condition"):
+            raise ValueError("'condition' is required for webhook strategy (webhook endpoint ID)")
+```
+
+Register in `Utilities/Hibernation/__init__.py`:
+
+```python
+from Utilities.Hibernation.strategies.my_strategy import WebhookStrategy
+
+def BuildDefaultRegistry():
+    registry = HibernationRegistry()
+    registry.Register(TimerStrategy())
+    registry.Register(VisualConditionStrategy())
+    registry.Register(WebhookStrategy())   # ← add here
+    return registry
+```
+
+The `HibernateTool` will automatically expose `trigger_type='webhook'` in its prompt once the strategy is registered.
+
+---
+
+## Override Reference
+
+Quick reference for the most common override points:
+
+| Goal | Override |
+|---|---|
+| Custom persona | `SYSTEM_PROMPT` class attribute |
+| Allow sub-agent spawning | `subagent_classes` dict |
+| Prevent premature termination | `TERMINATE_GUARD_ENABLED = True` |
+| Custom tools | `_create_tool_manager()` |
+| Custom prompt sections | `_create_prompt_builder()` + `PromptBuilder.construct_*()` |
+| Custom LLM model selection | `_create_llm_manager()` or pass `default_llm` |
+| Custom safety pipeline | `_create_safety_manager()` |
+| Custom alert rules | `_create_budget_alert_manager()` |
+| Post-spawn plan step tracking | `on_subagent_spawn()` |
+| Post-child cleanup | `on_subagent_finish()` |
+| Per-child constructor args | `prepare_subagent_kwargs()` |
+| Block specific tool invocations | `pre_action_guard()` |
+| Custom observation format | `_observe_phase()` |
+| Extended state dataclass | `state_class` class attribute pointing to a `BaseAgentState` subclass |

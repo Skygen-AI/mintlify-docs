@@ -1,129 +1,193 @@
 ---
-title: "Pricing (public endpoint)"
-description: "Display-safe subscription plans for landing pages and pricing tables."
+title: "Pricing & Plans"
+description: "Subscription tiers, token model, overage billing, and Cloud PC usage costs."
 ---
 
-The public pricing endpoint serves subscription plan details without requiring auth. Use it to render pricing pages, feature comparisons, and CTAs. Stripe price IDs are stripped from responses — they stay server-side.
+## Overview
 
-## Endpoint
+Skygen uses a token-based billing model. Tokens are consumed when the agent makes LLM API calls and when Cloud PC sessions are running. Each subscription plan includes a monthly token allocation. Free users receive a periodic renewable token grant. Paid users can enable overage billing to continue working after their included tokens run out.
 
-### `GET /pricing/plans`
+---
 
-All active, non-hidden plans.
+## Subscription tiers
 
-Response:
+| Tier | Description |
+|------|-------------|
+| `free` | Freemium plan. Token grant renews periodically. No card required. |
+| `standard` | Paid subscription with monthly token allocation and optional overage. |
+| `none` | No subscription. Access blocked. |
 
-```json
+The `trial` tier is legacy — all trial users were migrated to `free` as of migration `20260318_remove_trial`.
+
+---
+
+## Plan structure
+
+Plans are configured via the admin panel and stored in `subscription_plans`. Each plan has:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Display name (e.g. `Lite`, `Pro`, `Enterprise`) |
+| `price_usd` | Monthly price in USD |
+| `monthly_tokens` | Tokens included per billing period |
+| `billing_period_days` | Billing period length (default: 30 days) |
+| `allow_overage` | Whether the plan supports overage billing |
+| `model_profile` | Agent model profile: `fast`, `default`, or `pro` |
+| `allowed_agent_modes` | JSON array of allowed modes (e.g. `["auto", "cua", "llm"]`) |
+| `features_config` | JSON object with feature flags (e.g. `{"cloud_pc": true, "max_cloud_pcs": 3}`) |
+| `daily_usd_limit` | Free plan daily spending cap in USD |
+| `limit_renewal_period_days` | Free plan renewal period |
+
+---
+
+## Free tier mechanics
+
+Free users get a renewable token grant defined by the plan's `daily_usd_limit` and `limit_renewal_period_days`. The system:
+
+1. Checks the user's current token balance.
+2. If below the minimum threshold (2 tokens), looks up when the last `free_grant` transaction was created.
+3. If the renewal period has elapsed, grants a new batch of tokens (transaction type: `FREE_GRANT`).
+4. If the period has not elapsed, returns `free_limit_reached` with the next renewal timestamp.
+
+```python
+# AccessResult returned when free tier is exhausted
 {
-  "items": [
-    {
-      "id": "plan-uuid",
-      "name": "Standard",
-      "description": "For power users",
-      "price_usd": 14.99,
-      "old_price_usd": null,
-      "billing_period_days": 30,
-      "billing_period_unit": "DAYS",
-      "monthly_tokens": 2000,
-      "sort_order": 1,
-      "is_featured": true,
-      "badge_text": "Most Popular",
-      "button_text": "Get Started",
-      "credits_label": "tokens/month",
-      "per_month_text": "/mo",
-      "features": [
-        { "text": "2000 tokens/month", "tooltip": null, "muted": false },
-        { "text": "Cloud PC included", "tooltip": "2vCPU, 4GB RAM", "muted": false },
-        { "text": "Priority support", "tooltip": null, "muted": true }
-      ]
-    }
-  ],
-  "total": 1
+  "can_access": False,
+  "reason": "free_limit_reached",
+  "extra": {
+    "next_renewal": "2026-05-09T10:00:00Z",
+    "plan_name": "Free"
+  }
 }
 ```
 
-### `GET /pricing/plans/{plan_id}`
+---
 
-Single plan. 404 if not found or inactive.
+## Token consumption
 
-## Fields
+Tokens are deducted for two categories of usage:
 
-| Field | Purpose |
-|-------|---------|
-| `price_usd` | Current price |
-| `old_price_usd` | Strikethrough price for discounts (nullable) |
-| `billing_period_days` | Default 30 |
-| `billing_period_unit` | `DAYS` / `MONTHS` / `YEARS` |
-| `monthly_tokens` | Token quota |
-| `sort_order` | Rendering order |
-| `is_featured` | Highlight this plan |
-| `badge_text` | Free-form ("Most Popular", "Best Value") |
-| `button_text` | CTA label |
-| `credits_label` | "tokens/month" |
-| `per_month_text` | "/mo" |
-| `features` | Array of `{ text, tooltip?, muted? }` |
+### LLM API usage
 
-## Features format (legacy + new)
+Each LLM call from the agent costs tokens proportional to the API cost in USD. The exact conversion rate is set server-side. Transaction type: `API_USAGE`.
 
-The `features` JSON can be:
+### Cloud PC usage
 
-- **Legacy**: list of strings. `["2000 tokens/month", "Cloud PC"]`
-- **New**: list of objects. `[{"text": "...", "tooltip": "...", "muted": false}]`
+Cloud PC sessions consume tokens per minute while running. When a session starts, a recurring per-minute deduction is recorded. Transaction type: `CLOUD_PC_USAGE`.
 
-The endpoint normalizes both to the new shape in responses. Backend stores whichever was submitted by the admin.
+---
 
-## What's excluded from responses
+## Token balance
 
-The backend holds additional fields used by Stripe integration and admin workflows that are **deliberately stripped** from the public response:
+Every user has a single `TokenBalance` row with:
 
-- `stripe_price_id` — don't expose, clients use plan_id + backend initiates checkout
-- `features_config` JSON — internal feature flags (Cloud PC enabled, max_cloud_pcs, etc.)
-- `allowed_model_profiles` — plan-gated model routing
-- `created_at` / `updated_at`
+| Field | Description |
+|-------|-------------|
+| `balance` | Current integer token count |
+| `fractional_tokens` | Accumulated sub-token fractional amounts not yet deducted |
+| `total_earned` | Lifetime tokens credited |
+| `total_spent` | Lifetime tokens consumed |
 
-## Example: rendering a pricing table
+---
 
-```typescript
-const { items } = await fetch("/pricing/plans").then(r => r.json());
+## Token transactions
 
-return (
-  <div className="grid grid-cols-3 gap-4">
-    {items.map(plan => (
-      <PlanCard key={plan.id} plan={plan}>
-        {plan.badge_text && <Badge>{plan.badge_text}</Badge>}
-        <h3>{plan.name}</h3>
-        <p>${plan.price_usd}{plan.per_month_text}</p>
-        {plan.old_price_usd && <s>${plan.old_price_usd}</s>}
-        <ul>
-          {plan.features.map((f, i) => (
-            <li key={i} className={f.muted ? "opacity-60" : ""}>
-              {f.text}
-              {f.tooltip && <Tooltip>{f.tooltip}</Tooltip>}
-            </li>
-          ))}
-        </ul>
-        <button>{plan.button_text}</button>
-      </PlanCard>
-    ))}
-  </div>
-);
+All token movements are recorded in `TokenTransaction`:
+
+| Type | Direction | Description |
+|------|-----------|-------------|
+| `subscription_topup` | Credit | Monthly token grant on subscription renewal |
+| `admin_grant` | Credit | Manual grant by admin |
+| `promo_code` | Credit | Promotional tokens |
+| `refund` | Credit | Refunded tokens |
+| `free_grant` | Credit | Periodic free plan token grant |
+| `api_usage` | Debit | LLM API calls |
+| `cloud_pc_usage` | Debit | Cloud PC per-minute charge |
+| `manual_deduction` | Debit | Admin deduction |
+
+---
+
+## Overage billing
+
+Paid subscribers can opt into overage billing to continue using the service after their included tokens run out. Overage is billed as pay-as-you-go via Stripe metered billing:
+
+- `allow_overage = True` must be set on the subscription.
+- Overage tokens used are tracked in `overage_tokens_used`.
+- A Stripe metered billing item (`stripe_metered_item_id`) records usage and charges monthly.
+
+Users enable overage on the Pricing page. The `STANDARD` tier supports overage; the `FREE` tier does not.
+
+---
+
+## Subscription management
+
+### View current status
+
+```http
+GET /billing/status
+Authorization: Bearer {token}
 ```
 
-## Gotchas
+Returns the user's active subscription, token balance, and Stripe payment method status.
 
-<Note>
-**Features JSON parsed on every request.** No caching. If your pricing table renders 10 times per page load, that's 10 parses. CDN-cache the response if it becomes a bottleneck.
-</Note>
+### List available plans
 
-<Note>
-**`old_price_usd` is free-form.** Nothing validates it's greater than `price_usd`, or that a discount makes sense. Admin has to be careful.
-</Note>
+```http
+GET /billing/plans
+Authorization: Bearer {token}
+```
 
-<Note>
-**`badge_text` has no enum.** You can misspell "Most Populaar" and it ships. Consider an admin-side validator.
-</Note>
+### Subscribe to a plan
 
-## See also
+```http
+POST /billing/subscribe
+Authorization: Bearer {token}
 
-- [Billing](/concepts/billing) — subscription lifecycle + Stripe integration
-- [Admin overview](/admin/overview) — how plans are created
+{"plan_id": "plan-uuid"}
+```
+
+For paid plans, this creates a Stripe Checkout session. The user is redirected to Stripe to complete payment.
+
+### Cancel subscription
+
+```http
+POST /billing/cancel
+Authorization: Bearer {token}
+```
+
+Sets `cancel_at_period_end = True`. The subscription remains active until the period ends.
+
+### View token transaction history
+
+```http
+GET /billing/transactions
+Authorization: Bearer {token}
+```
+
+---
+
+## Model profiles
+
+Plans assign a `model_profile` that controls which LLM the agent uses:
+
+| Profile | Typical models | Use case |
+|---------|---------------|---------|
+| `fast` | Gemini Flash, Qwen Fast | Quick tasks, low cost |
+| `default` | Claude Sonnet, Gemini Pro | Balanced performance |
+| `pro` | Claude Opus, GPT-4o | Complex reasoning tasks |
+
+Users on plans with `allowed_model_profiles` set can choose their profile in the settings. The public display name (e.g., "Skygen Fast", "Skygen Pro") is configured via the admin panel's `ModelProfileConfig` table.
+
+---
+
+## Stripe integration
+
+Skygen uses Stripe for payment processing. Webhook events are received at `POST /billing/webhooks` and verified using `STRIPE_WEBHOOK_SECRET`. Supported events:
+
+| Stripe event | Action |
+|-------------|--------|
+| `checkout.session.completed` | Activate subscription |
+| `invoice.payment_succeeded` | Add monthly tokens, reset overage counter |
+| `invoice.payment_failed` | Mark subscription `past_due` |
+| `customer.subscription.deleted` | Cancel subscription |
+| `customer.subscription.updated` | Sync plan changes |

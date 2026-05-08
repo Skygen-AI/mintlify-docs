@@ -1,0 +1,197 @@
+---
+title: "Type Mismatches"
+description: "13 Frontend ↔ Backend type mismatches — 1 CRITICAL, 3 HIGH, 7 MEDIUM, 2 LOW. These cause silent bugs in production."
+---
+
+import { Warning, Note } from "mintlify/components";
+
+> Review date: 2026-05-08 · Scope: `WebApp/ui-shared-tauri/src/types/` vs `Backend/app/schemas/`
+
+Severity levels:
+- **CRITICAL** — confirmed live bug; observable wrong behavior in production
+- **HIGH** — field silently dropped or incorrectly typed; potential runtime errors
+- **MEDIUM** — field present on one side, absent on the other; no runtime error but incomplete data
+- **LOW** — cosmetic / intent mismatch; no behavioral impact
+
+---
+
+## CRITICAL
+
+### 1. `User.otp_secret` — `needsOTPSetup` always `true`
+
+| Side | Declaration |
+|------|-------------|
+| Frontend (`types/auth.ts`) | `otp_secret?: boolean` |
+| Backend (`schemas/security.py` `UserRead`) | **Field does not exist** |
+
+**Impact:** `authSlice` computes `needsOTPSetup = !user.otp_secret`. Since the backend never sends `otp_secret`, `user.otp_secret` is always `undefined` → `!undefined` = `true`. Therefore `needsOTPSetup` is always `true` for every user on every login.
+
+**Root cause:** `otp_secret` is intentionally omitted from `UserRead` because the OTP secret is never sent to the client for security. The backend uses `is_2fa_verified: bool = True` (always forced True since 2FA is disabled).
+
+**Fix needed:** Replace `needsOTPSetup = !user.otp_secret` with `needsOTPSetup = !user.is_2fa_verified` (or just hardcode `false` since 2FA is disabled). Remove `otp_secret` from the `User` type.
+
+---
+
+## HIGH
+
+### 2. `Message.timestamp` — required on frontend, absent from backend
+
+| Side | Declaration |
+|------|-------------|
+| Frontend (`types/messages.ts`) | `timestamp: string` — **required** |
+| Backend (`schemas/chat_message.py`) | Only sends `created_at: datetime` |
+
+**Impact:** Frontend code that accesses `message.timestamp` directly could read `undefined` for messages loaded from REST history. `sessionApi` normalizes this by fabricating `timestamp = created_at || new Date().toISOString()`, but any code path that bypasses `sessionApi` will get `undefined`.
+
+---
+
+### 3. `Device.device_token_kid` — backend-only field
+
+| Side | Declaration |
+|------|-------------|
+| Frontend (`types/devices.ts`) | Not declared |
+| Backend (`schemas/devices.py` `DeviceRead`) | `device_token_kid: str` — **required** |
+
+**Impact:** Silently dropped during JSON deserialization. Not currently used in frontend, but its absence hides an available signal for KID rotation checks.
+
+---
+
+### 4. `AnyUiMeta` missing `SwePayload`
+
+| Side | Declaration |
+|------|-------------|
+| `types/messages.ts` | `AnyUiMeta = DeepResearchUiMeta \| CuaUiMeta \| McpUiMeta \| AskHumanUiMeta` (4 members) |
+| `types/websocket.ts` | `UiMetaUpdatePayload = ... \| SwePayload` (5 members) |
+
+**Impact:** `SwePayload` events received over `ui_meta_update` WebSocket events are correctly typed via `wsClient.ts`, but if any component reads `message.meta_data.ui_meta` and types it as `AnyUiMeta`, the `swe` mode case is invisible to TypeScript.
+
+**Fix needed:** Add `SwePayload` (or alias `SweUiMeta`) to `AnyUiMeta` in `messages.ts`.
+
+---
+
+## MEDIUM
+
+### 5. `Session.message_count` — frontend-only field
+
+| Side | Declaration |
+|------|-------------|
+| Frontend (`types/sessions.ts`) | `message_count?: number` |
+| Backend | **Not present** |
+
+**Impact:** Always `undefined`. Any UI displaying or filtering by `message_count` silently shows nothing.
+
+---
+
+### 6. `Session.emplogent_id` — backend-only field
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | Not declared |
+| Backend (`schemas/chat_session.py`) | `emplogent_id?: str` |
+
+**Impact:** Field silently dropped. Frontend cannot display or filter by assigned AI persona.
+
+---
+
+### 7. `Session.updated_at` — optionality mismatch
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | `updated_at?: string` — optional |
+| Backend | `updated_at: datetime` — always present |
+
+**Impact:** Low risk — frontend marks it optional, requiring null-checks. Backend always provides it. Overly defensive but harmless.
+
+---
+
+### 8. `MessageAttachment.revision` — backend-only field
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | Not declared |
+| Backend | `revision: int = 1` |
+
+**Impact:** Attachment revision tracking not visible to frontend.
+
+---
+
+### 9. `Message.task_id` — backend-only field
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | Not declared |
+| Backend (`schemas/chat_message.py`) | `task_id: Optional[str]` |
+
+**Impact:** Task-to-message correlation impossible on frontend. Currently done via `session_id` only.
+
+---
+
+### 10. `BillingStatus` overage fields — uncertain path
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | `tokens_remaining?: number`, `allow_overage?: boolean`, `overage_tokens_used?: number` |
+| Backend | Not in base schema — likely sent via `extra?: Record<string, unknown>` |
+
+**Impact:** If these fields arrive inside `extra` rather than at top-level, TypeScript won't type-check them and they may be silently `undefined`.
+
+---
+
+### 11. Triple-definition of confirmation input type
+
+Three near-identical types with subtle differences:
+
+| Location | Type | `choices` | `required` |
+|----------|------|-----------|------------|
+| `types/confirmations.ts` | `ConfirmationInputRequest` | `choices?: ConfirmationInputChoice[]` | `required?: boolean` |
+| `types/websocket.ts` | `UiMetaInputRequest` | `choices?: UiMetaInputChoice[]` | `required?: boolean` |
+| `types/display.ts` | `AskHumanInput` | `choices: ChoiceOption[]` — **required** | `required: boolean` — **required** |
+
+**Impact:** `display.ts`'s `AskHumanInput` has a stricter contract. Mixing these types causes TypeScript errors or `as` casts hiding the drift.
+
+---
+
+## LOW
+
+### 12. `User` optional fields that backend always sends
+
+| Field | Frontend | Backend |
+|-------|----------|---------|
+| `is_active` | `?: boolean` | `bool` (non-optional) |
+| `is_admin` | `?: boolean` | `bool` (non-optional) |
+| `is_email_verified` | `?: boolean` | `bool` (non-optional) |
+| `is_2fa_verified` | `?: boolean` | `bool` — always `True` |
+| `created_at` | `?: string` | `datetime` (non-optional) |
+
+**Impact:** Frontend must null-check these even though they're always present. No runtime errors.
+
+---
+
+### 13. `BillingStatus.total_spent` — int vs number
+
+| Side | Declaration |
+|------|-------------|
+| Frontend | `total_spent: number` |
+| Backend | `total_spent: int` (token count integer) |
+
+**Impact:** JavaScript `number` can represent all Python `int` values in the safe integer range. No precision loss for typical token counts.
+
+---
+
+## Summary Table
+
+| # | Mismatch | Severity | Action |
+|---|----------|----------|--------|
+| 1 | `User.otp_secret` not in backend → `needsOTPSetup` always `true` | **CRITICAL** | Fix `authSlice` logic |
+| 2 | `Message.timestamp` required on FE, absent from BE | **HIGH** | Verify normalization coverage |
+| 3 | `Device.device_token_kid` in BE but not FE | **HIGH** | Document as intentional or add to type |
+| 4 | `AnyUiMeta` missing `SwePayload` | **HIGH** | Add or document intentional exclusion |
+| 5 | `Session.message_count` FE-only, never populated | MEDIUM | Remove or add to backend schema |
+| 6 | `Session.emplogent_id` BE-only, not in FE type | MEDIUM | Add to FE type if needed |
+| 7 | `Session.updated_at` optional FE vs always-present BE | MEDIUM | Make required on FE |
+| 8 | `MessageAttachment.revision` BE-only | MEDIUM | Add to FE type |
+| 9 | `Message.task_id` BE-only | MEDIUM | Add to FE type |
+| 10 | `BillingStatus` overage fields may come via `extra` | MEDIUM | Confirm backend field path |
+| 11 | Triple confirmation input type with drift | MEDIUM | Unify to single canonical type |
+| 12 | `User` optional fields always present on BE | LOW | Mark required on FE |
+| 13 | `BillingStatus.total_spent` int vs number | LOW | Document as token count integer |

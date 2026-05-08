@@ -1,0 +1,455 @@
+---
+title: "Frontend API Contract"
+description: "Every HTTP call and Socket.IO subscription the frontend makes. Derived directly from source — do not edit manually."
+---
+
+> Generated: 2026-05-08 · Source: `WebApp/ui-shared-tauri/src/` · Regenerate with `/doc-gen`
+
+---
+
+## Auth Storage Model
+
+### Token persistence
+
+| Location | Key | Purpose |
+|----------|-----|---------|
+| `platform.storage` (localStorage on web) | `auth_token` | Bearer header for HTTP + WS fallback |
+| `platform.storage` | `refresh_token` | Token refresh flow (not yet wired to auto-refresh) |
+| Cookie `skygen_session` | — | HttpOnly cookie set by backend on login/register |
+
+**Cookie migration (active):** `authApi.upgradeSession()` is called at the start of every `restoreSession()`. POSTs to `/auth/upgrade-session` with legacy Bearer token; backend re-emits as HttpOnly cookie. Allows transition from pure-Bearer to cookie-primary auth without forcing re-login.
+
+### Token refresh
+
+`wsClient.setTokenRefresher()` is called after every successful login/signup/session restore. The refresher reads `platform.storage.get('auth_token')` and is called by Socket.IO on every reconnect attempt. **No automatic HTTP token refresh is wired** — only the WS layer refreshes the token dynamically.
+
+---
+
+## HTTP API Calls
+
+### Authentication
+
+#### POST /auth/token
+**Called from:** `authApi.login()` — `api/http/authApi.ts:49`
+**Auth:** None
+**Request:** `application/x-www-form-urlencoded` — `username`, `password`
+**Response:** `TokenResponse { access_token, refresh_token?, token_type }`
+**Side effects:** Saves `auth_token` and `refresh_token` to platform.storage; backend sets `skygen_session` cookie
+**Used by:** `authSlice.login()`
+
+#### POST /auth/register
+**Called from:** `authApi.register()` — `api/http/authApi.ts:94`
+**Response:** `RegisterResponse { user: User, access_token, token_type }`
+**Side effects:** Saves `auth_token` to platform.storage
+**Used by:** `authSlice.signup()`
+
+#### GET /users/me
+**Called from:** `authApi.getCurrentUser()` — `api/http/authApi.ts:143`
+**Auth:** Bearer token OR `skygen_session` cookie
+**Response:** `User { id, email, is_active, is_admin, is_email_verified, is_2fa_verified, display_name, auth_provider, created_at }`
+**Used by:** `authSlice.restoreSession()`, `authSlice.refreshUser()`, `authSlice.login()`
+
+#### POST /auth/logout
+**Called from:** `authApi.logout()` — `api/http/authApi.ts:455`
+**Side effects:** Backend invalidates cookie; client removes `auth_token`, `refresh_token`, `user_data` from storage
+**Note:** Best-effort — failure is non-fatal; local state cleared regardless
+
+#### POST /auth/upgrade-session
+**Called from:** `authApi.upgradeSession()` — `api/http/authApi.ts:412`
+**Auth:** Bearer token (legacy localStorage token)
+**Side effects:** Backend converts to cookie session; 410 response clears local storage
+
+#### POST /auth/forgot-password
+**Request:** `{ email: string }`
+**Response:** `{ msg: string }`
+
+#### POST /auth/reset-password
+**Request:** `{ token: string, new_password: string }`
+**Response:** `{ msg: string }`
+
+---
+
+### Sessions
+
+#### GET /sessions
+**Called from:** `sessionApi.getSessions()` — `api/http/sessionApi.ts:142`
+**Response:** `Session[]` (handles array, `{items}`, or `{sessions}` formats)
+**Used by:** `sessionSlice.loadSessions()`
+
+#### POST /sessions
+**Called from:** `sessionApi.createSession(deviceId, title)` — `api/http/sessionApi.ts:113`
+**Request:** `{ title: string, device_id?: string }`
+**Response:** `Session`
+**Used by:** `sessionSlice.createSession()`
+
+#### GET /sessions/{id}
+**Response:** `Session & { messages: Message[] }`
+
+#### PATCH /sessions/{id}
+**Called from:** `sessionApi.updateSession(sessionId, updates)`
+**Request:** `{ title?: string }`
+**Response:** `Session`
+**Used by:** `sessionSlice.updateSession()` — optimistic update then persist
+
+#### DELETE /sessions/{id}
+**Used by:** `sessionSlice.deleteSession()` — removes from `sessions[]`, clears `activeSessionId` if active
+
+---
+
+### Messages
+
+#### GET /sessions/{id}/messages
+**Called from:** `sessionApi.getMessages(sessionId, limit?, offset?)` — `api/http/sessionApi.ts:380`
+**Note:** Uses `fetchWithTimeout` (30s) instead of `httpClient` for abort signal support
+**Response:** `Message[]` (handles array, `{items}`, or `{messages}` formats)
+**Used by:** `messageSlice.loadMessages()`
+
+#### POST /sessions/{id}/messages
+**Called from:** `sessionApi.sendMessage(...)` — `api/http/sessionApi.ts:205`
+**Request:**
+```json
+{
+  "payload": { "role": "user", "content": "...", "meta_data": {} },
+  "client_version": "1.0.0",
+  "otp_code": "",
+  "device_id": "...",
+  "execution_mode": "sandbox",
+  "agent_mode": "auto|cua|deep_research|mcp|swe"
+}
+```
+**Response variants:**
+- `200` — `Message` (the created user message)
+- `402` — `{ detail: { error, message, reason, extra } }` → `SendMessageResult { error: "payment_required" }`
+- `403` — Invalid OTP → `SendMessageResult { error: "invalid_otp" }`
+- `409` — Device busy → `SendMessageResult { error: "device_busy" | "device_unreachable" | "cloud_pc_conflict" }`
+- `426` — App update required → `SendMessageResult { error: "update_required" }`
+
+**Note:** Uses raw `fetch` (not `httpClient`) to preserve typed error discriminators.
+**Used by:** `messageSlice.sendMessage()`
+
+#### GET /sessions/{id}/plan
+**Called from:** `sessionApi.getPlan(sessionId)` — `api/http/sessionApi.ts:478`
+**Note:** Uses `fetchWithTimeout` (30s); 404 returns `{ plan: null }` (not an error)
+**Response:** `{ plan: PlanPayload | null }`
+**Used by:** `messageSlice.loadMessages()` after each history load
+
+---
+
+### Agent / Tasks
+
+#### GET /agent/task/{id}/status
+**Called from:** `sessionApi.getTaskStatus(sessionId)` — `api/http/sessionApi.ts:447`
+**Note:** Uses `fetchWithTimeout` (30s)
+**Response:** `{ is_active: boolean, is_cancelled: boolean, status: string }`
+**Used by:** `useChatWebSocket` safety watchdog (polls every 15s when task is active)
+
+#### POST /agent/task/cancel
+**Called from:** `sessionApi.cancelTask(sessionId, deviceId?, reason?)` — `api/http/sessionApi.ts:418`
+**Request:** `{ session_id, device_id?, reason? }`
+**Response:** `{ success, session_id, message, is_active, device_notified }`
+**Used by:** `messageSlice.cancelTask()` — triggers UI cleanup + optimistic cancel message
+
+---
+
+### Devices
+
+#### GET /devices
+**Called from:** `deviceApi.getDevices()`
+**Response:** `Device[]`
+**Used by:** `deviceSlice.loadDevices()`
+
+#### POST /devices
+**Request:** `{ device_name, platform, device_type, capabilities, device_id? }`
+**Response:** `Device`
+**Used by:** `deviceSlice.registerDevice()`
+
+#### DELETE /devices/{id}
+**Used by:** `deviceSlice.deleteDevice()`
+
+---
+
+### Billing
+
+#### GET /billing/status
+**Called from:** `billingApi.getStatus()`
+**Response:** `BillingStatus { can_access, access_reason, tier, status, balance, tokens_remaining, plan_name, cloud_pc_enabled, scheduled_tasks_enabled, allowed_model_profiles, ... }`
+**Used by:** `billingSlice.loadStatus()` — called after login, signup, and billing mutations
+
+#### GET /admin/api/plans/public/active
+**Called from:** `billingApi.getPlans()`
+**Response:** `PlansListResponse { items: Plan[], total }`
+**Used by:** `billingSlice.loadPlans()`
+
+#### POST /billing/setup-card
+**Response:** `SetupCardResponse { client_secret, setup_intent_id }`
+
+#### POST /billing/confirm-card
+**Response:** `BillingStatus`
+
+#### POST /billing/checkout
+**Response:** `CheckoutSessionResponse { checkout_url, session_id }`
+
+#### POST /billing/subscribe
+#### POST /billing/change-plan
+#### POST /billing/cancel
+
+---
+
+### Files
+
+#### POST /files/parse
+**Response:** `FileParseResponse { messages: ParsedMessage[], metadata: FileParseMetadata }`
+
+#### GET /files
+**Response:** `AttachmentListResponse { items: AttachmentRead[] }`
+
+---
+
+### Notifications
+
+#### GET /notifications
+**Response:** `NotificationsListResponse { items: NotificationItem[], total, unread_count }`
+
+#### POST /notifications/{id}/read
+#### POST /notifications/mark-all-read
+
+---
+
+### Scheduled Tasks
+
+#### GET /scheduled-tasks
+**Response:** `ScheduledTask[]`
+
+#### POST /scheduled-tasks
+**Request:** `ScheduledTaskCreate`
+
+#### PATCH /scheduled-tasks/{id}
+**Request:** `ScheduledTaskUpdate`
+
+#### DELETE /scheduled-tasks/{id}
+#### POST /scheduled-tasks/{id}/toggle
+
+---
+
+## Socket.IO Connection
+
+**Namespace:** `/user`
+**Transport:** WebSocket only (`transports: ['websocket']` — polling disabled)
+**Authentication:**
+- `auth.token` — JWT from platform.storage (may be null for cookie-only sessions)
+- `auth.user_id` — authenticated user ID
+- `withCredentials: true` — sends `skygen_session` cookie on cross-origin handshake
+
+**Connection lifecycle:**
+1. `authSlice.login()` / `signup()` / `restoreSession()` calls `wsClient.connect(userId, token)`
+2. `wsClient.setTokenRefresher()` — socket re-fetches token on every reconnect
+3. `authSlice.logout()` calls `wsClient.disconnect()`
+
+**Reconnection config:**
+- `reconnectionDelay: 1000ms` / `reconnectionDelayMax: 30000ms`
+- `reconnectionAttempts: Infinity`
+- `timeout: 20000ms`
+- Tab visibility handler: forces reconnect if `visibilityState === 'visible'` and socket is inactive
+
+**Deduplication:** `SocketIOClient` maintains a LRU set of 200 `notification_id` values. On reconnect, backend replays durable events; duplicate IDs are ACK'd and silently dropped.
+
+---
+
+## Socket.IO Events (Backend → Frontend)
+
+### `display_message` (unified, preferred)
+
+**Handler:** `useChatWebSocket.handleDisplayMessage()`
+**Payload:** `DisplayMessage { display_type, message_id, session_id, render_data, timestamp, is_terminal, agent_mode }`
+
+| `display_type` | Purpose |
+|----------------|---------|
+| `assistant_message` | Final agent response |
+| `user_message` | Confirmed user message echo |
+| `cancelled_message` | Task cancelled |
+| `paused_message` | Task paused |
+| `error_message` | Agent error |
+| `ask_human_message` | Agent asking user for input |
+| `status_update` | Transient task status (started/thinking/planning/executing/completed) |
+| `step_progress` | CUA action step |
+| `plan_update` | Plan structure update |
+| `mode_progress` | Deep research / MCP / SWE tool execution progress |
+| `attachment_ready` | File upload completed |
+| `billing_notice` | Billing limit reached |
+
+**Durability:** ACK'd (durable delivery)
+
+### `agent_response` (legacy path)
+
+**Handler:** `wsClient.handleAgentResponse()`
+**Payload:** `{ session_id, message_id, content, role, meta_data, status, timestamp, attachments? }`
+**Durability:** ACK'd
+
+### `ui_meta_update`
+
+**Handler:** `useChatWebSocket.handleUiMetaUpdate()`
+**Payload modes:** `deep_research | cua | mcp | swe | ask_human | plan`
+**Action:** Calls `liveStateSlice.addAgentStep()` + `setUiMeta()` or `setPlan()`
+
+### `task_progress`
+
+**Payload:** `{ session_id, status, progress?, current_step?, total_steps?, description? }`
+**Action:** `liveStateSlice.updateTaskProgress()`
+
+### `agent_typing`
+
+**Payload:** `{ session_id, is_typing }`
+**Action:** `liveStateSlice.setTyping()`
+
+### `device_status_update`
+
+**Action:** `deviceSlice.updateDeviceStatus()` — if device unknown, re-fetches device list
+
+### `agent_error`
+
+**Payload:** `{ session_id, content?, error? }`
+**Action:** Finalizes task, inserts system error message
+**Durability:** ACK'd
+
+### `confirmation_request`
+
+**Payload:** `{ notification_id?, confirmation: ConfirmationRequest }`
+**Action:** `uiSlice.addConfirmation()` — surfaces in confirmation modal
+**Durability:** ACK'd
+
+### `cloud_pc_status_changed`
+
+**Payload:** `{ status, timestamp, cloud_pc_id?, stream_url?, stream_auth_key?, sandbox_id?, reason? }`
+**Action:** Updates `cloudPcSlice` per-session state
+**Durability:** ACK'd
+
+### `cloud_pc_control_changed`
+
+**Action:** Updates `cloudPcSlice.controller`
+**Durability:** Fire-and-forget
+
+### `billing_status_updated`
+
+**Action:** Triggers `billingSlice.loadStatus()` — re-fetches billing state after Stripe webhooks
+
+### `session_created / session_updated / session_deleted / session_restored`
+
+**Action:** Cross-client sync — updates `sessionSlice.sessions[]` across multiple logged-in devices
+
+### `scheduled_task_created / scheduled_task_updated / scheduled_task_deleted`
+
+**Action:** Cross-client sync — updates `scheduledTasksSlice`
+
+### `mcp_connection_completed`
+
+**Durability:** ACK'd. Triggers MCP integration UI update.
+
+### `reconnected` (synthetic, internal)
+
+**Emitted by:** `wsClient` when `connect` fires after `hasConnectedBefore = true`
+**Action:** `useChatWebSocket.handleReconnected()` reloads messages for active session (debounced 5s)
+
+---
+
+## Socket.IO Events (Frontend → Backend)
+
+### `confirmation_response`
+
+**Emitted by:** `wsClient.sendSafetyConfirmationResponse()`
+**Payload:** `{ confirmation_id, approved: boolean, message? }`
+
+### `notification_ack`
+
+**Emitted by:** `wsClient.sendNotificationAck()`
+**Payload:** `{ notification_id, received_at: ISO string }`
+**Purpose:** Confirms durable delivery; allows backend to stop replaying the event on reconnect
+
+---
+
+## HTTP Client Architecture
+
+**Base client:** `httpClient` (`api/http/httpClient.ts`):
+- Auth header injection via `getPlatform().storage.get('auth_token')`
+- `credentials: 'include'` on all requests (cookie support)
+- `HttpClientError` thrown on non-2xx with `{ status, statusText, data }`
+- `extractErrorMessage()` handles string, array (Pydantic validation), nested object forms
+
+**Raw fetch usage:** `authApi`, `sessionApi.sendMessage`, and `sessionApi.getMessages/getTaskStatus/getPlan` bypass `httpClient` for:
+1. Non-JSON content type (form auth)
+2. Status-branching on 402/403/409/426 (sendMessage)
+3. Abort signal / timeout (fetchWithTimeout wrapper, 30s default)
+
+**Mock mode:** `USE_MOCKS = false` in `httpClient.ts`, `authApi.ts`, `billingApi.ts` — flip to `true` for offline development.
+
+---
+
+## Key TypeScript Types
+
+### `User` (`types/auth.ts`)
+```typescript
+interface User {
+  id: string;
+  email: string;
+  is_active?: boolean;
+  is_admin?: boolean;
+  is_email_verified?: boolean;
+  is_2fa_verified?: boolean;
+  display_name?: string;
+  auth_provider?: string;
+  created_at?: string;
+}
+```
+
+### `Session` (`types/sessions.ts`)
+```typescript
+interface Session {
+  id: string;
+  user_id: string;
+  device_id: string | null;
+  title: string;
+  created_at: string;
+  updated_at?: string;
+  is_active: boolean;
+  meta_data?: Record<string, unknown>;
+}
+```
+
+### `Message` (`types/messages.ts`)
+```typescript
+interface Message {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  meta_data?: MessageMetadata;
+  created_at?: string;
+  timestamp: string;
+  attachments?: MessageAttachment[];
+  display_type?: string;
+  render_data?: Record<string, unknown>;
+}
+```
+
+### Error Types
+| Type | HTTP status | `error` field |
+|------|-------------|---------------|
+| `DeviceBusyError` | 409 | `"device_busy"` |
+| `DeviceUnreachableError` | 409 | `"device_unreachable"` |
+| `CloudPcSessionConflictError` | 409 | `"cloud_pc_in_another_session"` |
+| `UpdateRequiredError` | 426 | `"update_required"` |
+| `PaymentRequiredError` | 402 | `"payment_required"` |
+
+Type guards: `isDeviceBusyError()`, `isDeviceUnreachableError()`, `isCloudPcSessionConflict()`, `isUpdateRequiredError()`
+
+### Platform Adapter (`types/platform.ts`)
+
+`IPlatformAdapter` — interface implemented by each platform wrapper:
+
+| Method/Property | Purpose |
+|----------------|---------|
+| `platform: 'macos' \| 'windows' \| 'web'` | Platform identifier |
+| `capabilities.hasDesktopAutomation` | Gates device WebSocket start |
+| `storage.get/set/remove` | Token persistence |
+| `desktop.startDeviceWebSocket / stopDeviceWebSocket` | Desktop-only |
+| `analytics.identify / track` | Pushes to `window.dataLayer` on web |
+| `openOAuthWindow(url)` | Redirects to OAuth URL on web |

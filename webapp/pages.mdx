@@ -1,200 +1,332 @@
 ---
-title: "Page catalog"
-description: "Every route in the WebApp — purpose, auth requirements, key state."
+title: "WebApp Pages"
+description: "Each page in the Skygen WebApp: route, purpose, components used, and state it reads from the Zustand store."
 ---
 
-Every page in Skygen is a React component under `ui-shared-tauri/src/pages/`. Routes are declared in `App.tsx`. Public pages (login, register, OAuth callback) render directly. Protected pages wrap in `<ProtectedRoute><MainLayout>…</MainLayout></ProtectedRoute>`.
+## Overview
 
-## Public routes
+The Skygen WebApp is a React 18 + TypeScript single-page application built on Vite. All pages live in `WebApp/ui-shared-tauri/src/pages/` and are shared between the web app and the macOS/Windows desktop app (Tauri). Routing is handled by React Router v6 and defined in `App.tsx`. Pages consume shared state from the Zustand store (`useStore`) and communicate with the backend via HTTP clients and Socket.IO.
 
-### `/login` — LoginPage
+The web app is served under the `/app` base path (`bootstrap({ basePath: '/app' })`). Routes listed below are relative to that base.
 
-**Component**: `src/pages/LoginPage.tsx`
+---
 
-- Email + password form
-- "Forgot password?" opens `ForgotPasswordModal`
-- Google OAuth button (redirect via `IPlatformAdapter.openOAuthWindow`)
-- OTP challenge if the user has 2FA enabled
+## HomeUpdated (Home Page)
 
-**Flow**: email + password → `useAuth().login()` → store token via platform adapter → fetch `/users/me` → connect Socket.IO → redirect to `/`.
+**Route:** `/` (unauthenticated → redirects to `/login`; authenticated → renders HomeUpdated) or `/home`  
+**File:** `HomeUpdated.tsx`
 
-### `/register` — RegisterPage
+The main landing page for authenticated users. Displays the task input, quick action chips, and integration connection CTAs.
 
-**Component**: `src/pages/RegisterPage.tsx`
+**Components used:**
+- `TaskInput` — main task entry field with file attachment support
+- `ChipButton` — quick action category selector (Productivity, Research, Health, More)
+- `SuggestionItem` — suggestion pills that pre-fill the task input
+- `ConnectorsModal` — integration management drawer
+- `ConnectMcpModal` — OAuth connection flow modal
+- `AddDeviceModal` / `ChooseDeviceModal` — device selection for CUA tasks
+- `DeviceAppModal` — app selector for device automation
+- `ConnectToolsCta` — prompt to connect integrations when none are connected
+- `DropOverlay` — full-page file drag-and-drop overlay
 
-Email, password, display name. Signup auto-logs in. Redirects to `/home` with `needsOTPSetup: true` to prompt 2FA configuration.
+**Store state read:**
+- `cloudPcStatus` via `useComputerUse()` — Cloud PC readiness state
+- `billingStatus` via `useBilling()` — plan access and token balance
+- `planAccess` via `usePlanAccess()` — feature access flags
+- `connectors` via `useConnectors()` context — connected MCP integrations
 
-### `/reset-password` — ResetPasswordPage
+**Key behavior:**
+- On mount, loads landing stats and prompt stats for suggestion generation
+- Quick action chips filter the suggestion pills by category
+- `useOAuthReturn()` hook strips OAuth callback params from URL and refreshes connector state
+- `useStripeCheckoutReturn()` hook handles Stripe redirect after subscription
 
-User enters email → backend emails reset link → user clicks link → lands here with `?token=…` → enters new password → `POST /auth/reset-password?token=…`.
+---
 
-### `/auth/google/callback` — GoogleCallbackPage
+## ChatPage
 
-Extracts `?code=…&state=…` from the URL, calls the backend, redirects to `/home`. On error stores `google_error` in the URL so `LoginPage` can surface it.
+**Route:** `/chat/:sessionId` — also `/chat` (no sessionId, renders empty chat) and `/app` (alias)  
+**File:** `ChatPage.tsx`
 
-## Protected routes
+The core agent interaction interface. Shows the message history, live progress indicators, and the ask-human composer.
 
-All wrapped in `MainLayout` (sidebar + header + notifications bell).
+**Components used:**
+- `MessageItem` — renders each chat message (user, assistant, system, ask_human cards)
+- `ChatLiveProgress` — real-time "agent is thinking" indicator with action steps
+- `InputPanel` — message composer with attachments, voice input, and ask-human mode
+- `ChatModals` — connector and device modals scoped to chat context
+- `DropOverlay` — file drag-and-drop
 
-### `/` or `/home` — HomeUpdated (Dashboard)
+**Hooks used:**
+- `useChat()` — session loading, message streaming, send/cancel
+- `useBilling()` — token balance gate
+- `useOAuthReturn()` — handle same-tab OAuth redirect
+- `useChatSend()` — message submission logic
+- `useChatScroll()` — auto-scroll to latest message
+- `useChatConnectors()` — connector state scoped to this session
+- `useChatDeviceState()` — device selection and status for this session
+- `useSessionFiles()` — emitted files and attachment preview
+- `useFullPageDrop()` / `useFullPagePaste()` — file input handlers
 
-**Component**: `src/pages/HomeUpdated.tsx` (900+ lines)
+**Store state read:**
+- `messages[sessionId]` — message list for the active session
+- `sessions[sessionId]` — session metadata including `meta_data.waiting_for_input`
+- `taskStatus` — agent running / paused / idle state
+- `isFileManagerOpen` — file panel toggle
 
-Session list + "new session" CTA + device picker (desktop only) + suggested prompts.
+**Key behavior:**
+- URL param `sessionId` drives the active session
+- When `waiting_for_input = true`, the `InputPanel` switches to ask-human mode
+- Socket.IO `session_updated` keeps `waiting_for_input` in sync across tabs
+- `taskStatus.isActive` is restored on reload from `waiting_for_input` flag
 
-Reads: `sessions`, `currentSessionId` from `useStore`. Loads sessions in `useEffect`.
+---
 
-### `/sessions/:id` — ChatPage (main interface)
+## LibraryPage
 
-**Component**: `src/pages/ChatPage.tsx` (2200+ lines)
+**Route:** `/library`  
+**File:** `LibraryPage.tsx`
 
-This is the hot path.
+Displays the use-case library with tabs for each category and cards for individual prompts.
 
-```typescript
-const { messages, taskStatus, agentSteps, plan } = useStore((s) => ({
-  messages: s.messagesBySession[sessionId],
-  taskStatus: s.taskStatusBySession[sessionId],
-  agentSteps: s.agentStepsBySession[sessionId],
-  plan: s.planBySession[sessionId],
-}));
-```
+**Components used:**
+- `TabGroup` / `Tab` — category tab selector
+- `UseCaseCard` — individual library card with title, badge, and launch button
 
-Real-time updates via Socket.IO:
+**State:**
+- Local state: `types`, `cards`, `activeType`, loading/error flags
+- `useBilling()` — used to check plan access before launching a card
 
-- `new_message` → append to `messagesBySession`
-- `task_progress` → update progress bar
-- `ui_meta_update` → show current action ("Running Python", "Creating file")
-- `agent_typing` → typing indicator
+**Key behavior:**
+- On mount, calls `libraryApi.getTypes()` to load categories
+- When `activeType` changes, calls `libraryApi.getCardsByType(slug)`
+- Clicking a card navigates to `/chat` with the prompt pre-filled
 
-UI components:
+---
 
-- **TaskInput** — textarea + send + file upload
-- **UserMessage** / **AgentMessage** — chat bubbles
-- **AgentStepsProgress** — live action list (accordion)
-- **PlanProgress** — todo list
-- **ChooseDeviceModal** / **AddDeviceModal** — device picker
-- **ConfirmationsModal** — agent asks for approval
-- **McpConnectPrompt** — "Connect your Slack to use this tool"
+## PricingPage
 
-Message sending:
+**Route:** `/subscriptions` (was documented as `/pricing` — **that route does not exist**)  
+**File:** `PricingPage.tsx`
 
-```typescript
-const { success, error } = await useChat().sendMessage(
-  sessionId, content, otpCode, deviceId, isSandbox, agentMode,
-);
-```
+Subscription management and plan selection. Shows available plans and the user's current subscription status.
 
-<Note>
-Messages are rendered as they arrive. The UI batches renders every 100ms to prevent jank during fast agent streams.
-</Note>
+**Components used:**
+- `PricingCard` — individual plan display with pricing, features, and subscribe button
+- `AddCardModal` — Stripe card input modal for first-time payment
+- `ConfirmUpgradeModal` — plan change confirmation dialog
 
-### `/pricing` — PricingPage
+**Hooks used:**
+- `useBilling()` — `plans`, `pricing`, `status`, `subscribe`, `changePlan`, `createCheckoutSession`
+- `useStripeCheckoutReturn()` — handle Stripe Checkout redirect back to app
+- `useWebSocket()` — subscribe to `subscription_updated` real-time events
 
-**Component**: `src/pages/PricingPage.tsx` (470 lines)
+**State:**
+- `isPricingLoading`, `isPlansLoading`, `isStatusLoading`
+- `showAddCardModal`, `showConfirmModal`, `selectedPlan`
+- `hasPaymentMethod` — drives which subscribe flow to use
+- `hasActiveSubscription` — shows current plan vs available plans
 
-Subscription plans grid. Clicking a plan calls `billingApi.createPaymentIntent(planId)` → loads Stripe Elements → user enters card → Stripe redirects back to success URL.
+**Key behavior:**
+- Deep-link: `?plan_id=...` in URL or sessionStorage auto-triggers the upgrade flow on load
+- Stripe Checkout creates a new browser session; after return, `useStripeCheckoutReturn` polls for subscription activation
 
-### `/notifications` — NotificationsPage
+---
 
-List of in-app notifications (from Socket.IO + `GET /notifications/all`). Mark-read and delete.
+## NotificationsPage
 
-### `/library` — LibraryPage
+**Route:** `/notifications`  
+**File:** `NotificationsPage.tsx`
 
-Browse curated task templates. Click a card → opens a new session pre-filled with the template's prompt.
+Shows all in-app notifications with category filtering (tabs).
 
-### `/helpdesk` — HelpdeskPage
+**Components used:**
+- `TabGroup` / `Tab` — filter tabs: All, Alerts, Updates, etc.
+- `NotificationCard` — individual notification with timestamp and read state
 
-**Component**: `src/pages/HelpdeskPage.tsx` (475 lines)
+**Store state read:**
+- `notifications` — full notification list
+- `isNotificationsLoading`
+- `loadAll(offset, limit)` — loads notifications on mount
+- `markAsReadOptimistic(id)` / `markAsRead(id)` — optimistic read marking
 
-Ticket list + create ticket + thread view. Real-time updates via `ticket_created` and `ticket_reply` Socket.IO events.
+**Key behavior:**
+- Loads up to 100 notifications on mount
+- Client-side filtering by `category` field when a tab is selected
+- Clicking a notification marks it read and may navigate to the relevant session
 
-### `/ui-kit` — UiKitPlayground
+---
 
-Component showcase (1600+ lines). Buttons, inputs, modals, badges, every variant in both themes. Use this as a reference when building new UI.
+## LoginPage
 
-### `/logout` — LogoutPage
+**Route:** `/login`  
+**File:** `LoginPage.tsx`
 
-Clears token, disconnects Socket.IO, resets Zustand, redirects to `/login`.
+Email + password authentication. Redirects authenticated users to `/` on load. Handles Google OAuth error codes via `?google_error=` query param.
 
-## MainLayout structure
+**Components used:**
+- `SignInForm` — email + password form
+- `OTPDialog` — shown post-login when 2FA is enabled
+- `ForgotPasswordModal` — password reset request flow
+- `HeroCard` — marketing hero panel (desktop viewport)
+- `Squares` — animated grid background
 
-```
-<div className="flex h-screen">
-  <Sidebar />                   {/* left rail */}
-  <div className="flex-1 flex flex-col">
-    <Header />                  {/* device picker, theme, bell, user menu */}
-    <main>{children}</main>     {/* page */}
-  </div>
-  <PaywallModal />              {/* conditional */}
-  <UpdateNotification />        {/* desktop auto-update */}
-</div>
-```
+**Hooks used:**
+- `useAuth()` — `login`, `isAuthenticated`, `isLoading`
+- `useVisualViewport()` — adjusts layout on mobile keyboard open
+- `useNavigate()`, `useLocation()`
 
-Sidebar items: Home, Sessions (recent), Pricing, Settings, Helpdesk, Logout.
+**Key behavior:**
+1. `login()` from `authSlice` calls `POST /auth/token` and stores token + sets cookie.
+2. After login, a second call to `GET /users/me` checks `user.otp_secret === true`.
+3. If 2FA is enabled → shows `OTPDialog`. Correct code → `POST /auth/verify-otp`.
+4. After successful auth, checks `billingApi.getStatus()`:
+   - `can_access=false` + paywall reason → opens PaywallModal
+   - Otherwise → navigates to `/` (or `?redirect=` path)
+5. URL query params are forwarded to the post-login destination (supports landing page deep-links like `?usecaseId=...&prompt=...`).
+6. Prompt stats are reported via `promptStatsApi` for GA attribution.
 
-## Notable UX patterns
+---
 
-### Device affinity
+## RegisterPage
 
-Sessions can bind to a device. If `session.device_id` is set but no device is selected, `ChooseDeviceModal` blocks chat until the user picks one:
+**Route:** `/register`  
+**File:** `RegisterPage.tsx`
 
-```typescript
-if (session.device_id && !selectedDeviceId) {
-  return <ChooseDeviceModal devices={devices} onSelect={setSelectedDevice} />;
-}
-```
+New account registration. Supports invite code entry when `REGISTRATION_MODE=invite_only`.
 
-### Confirmation UX
+**Components used:**
+- `SignInForm` — used in register mode (shows display name + invite code fields)
+- `HeroCard`, `Squares` — same as LoginPage
 
-The agent sends `confirmation_request` events:
+**Hooks used:**
+- `useAuth()` — `signup`, `isAuthenticated`, `isLoading`
+- `useVisualViewport()`
 
-```typescript
-wsClient.on("confirmation_request", (req) => {
-  useStore.getState().setConfirmationRequest(req);
-  // UI opens modal with "Yes" / "No" buttons
-});
-```
+**Key behavior:**
+1. Collects GA tracking IDs from `_ga` cookie via `getGAClientId()` and `getGASessionId()`.
+2. Passes UTM params + GA data as `meta` to `signup()` for analytics attribution.
+3. `signup()` calls `POST /auth/register` and stores token + sets cookie.
+4. After registration, checks billing and navigates to `/` (or opens PaywallModal).
+5. If already authenticated on mount, redirects to `/` immediately.
 
-User clicks → `POST /agent/confirmations/{id}/approve` → agent resumes.
+---
 
-### Paywall gating
+## ResetPasswordPage
 
-When a user hits their limit, `billingApi.getBillingInfo()` returns `can_access: false`. `BillingSlice.setPaywallTrigger("limit_reached")` signals `MainLayout` to render `PaywallModal`.
+**Route:** `/auth/reset-password` (was documented as `/reset-password` — **that route does not exist**)  
+**File:** `ResetPasswordPage.tsx`
 
-## Query parameters
+Two-step password reset: request email → enter new password with token.
 
-**ChatPage**:
+---
 
-```typescript
-const { id } = useParams<{ id: string }>();
-```
+## LogoutPage
 
-**HomeUpdated** extracts landing attribution:
+**Route:** `/logout`  
+**File:** `LogoutPage.tsx`
 
-```typescript
-const params = new URLSearchParams(location.search);
-const prompt = params.get("prompt");
-if (prompt) sessionStorage.setItem("pendingPrompt", JSON.stringify({ prompt }));
-```
+Clears auth state and redirects to `/login`.
 
-The next session created pre-fills its `TaskInput` from `pendingPrompt`.
+---
 
-## Gotchas
+## GoogleCallbackPage
 
-<Note>
-**Session switch doesn't navigate.** Clicking a session in the sidebar calls `setCurrentSessionId()`, not React Router `navigate()`. For full-page transitions use `<Link to={`/sessions/${id}`}>`. Otherwise UI state may leak between sessions.
-</Note>
+**Route:** `/auth/google/callback`  
+**File:** `GoogleCallbackPage.tsx`
 
-<Note>
-**Message pagination.** ChatPage loads the last 50 messages on mount. Scroll to top triggers `loadMessages(sessionId, offset)` with the next page.
-</Note>
+Handles the Google OAuth sign-in callback. The backend sets the `skygen_session` cookie and redirects to `/app/home` (web) or appends `?token=&is_new=` to the redirect URI for native clients.
 
-<Note>
-**Socket.IO reconnect replays but may miss.** If the user was offline during an event, Socket.IO reconnects and the backend replays from Redis (30s window per task). On long outages, messages are refetched from the API on reconnect.
-</Note>
+**Components used:**
+- `LoadingScreen` — shown while the callback is processing
 
-## See also
+**Hooks used:**
+- `useAuth()` — `restoreSession`
+- `useNavigate()`
 
-- [State management](/webapp/state-management) — which slice each page reads
-- [API client](/webapp/api-client) — Socket.IO events and HTTP modules
-- [Chat sessions](/concepts/chat-sessions) — backend-side mechanics
+**Key behavior:**
+1. Reads `token` and `is_new` from URL query params.
+2. Stores `token` in `platform.storage` (localStorage on web, secure Tauri storage on desktop).
+3. Calls `restoreSession()` to hydrate the auth state from the stored token.
+4. For new users (`is_new=true`): sends registration meta (UTM + GA IDs) and prompt stats for attribution.
+5. Checks billing status:
+   - `can_access=false` + paywall reason → opens PaywallModal then navigates home
+   - Otherwise → navigates to `/`
+6. On failure (no token in URL), navigates to `/login`.
+
+---
+
+## OAuthCallbackPage
+
+**Route:** `/oauth/callback` (was documented as `/mcp/oauth/callback` — **that route does not exist**)  
+**File:** `OAuthCallbackPage.tsx`
+
+Handles Composio OAuth redirects after connecting integrations (Gmail, Slack, GitHub, etc.). Reads the `status` and `appName` query params, updates the connector state, and navigates back to the `return_to` path embedded in the signed state token.
+
+---
+
+## HelpdeskPage
+
+**Routes:** `/helpdesk`, `/helpdesk/:ticketId`, `/helpdesk/kb`, `/helpdesk/kb/:slug`  
+**File:** `HelpdeskPage.tsx`
+
+Support ticket management. Users can create tickets, view their ticket history, and reply to existing tickets. The Knowledge Base tab is at `/helpdesk/kb` and individual KB articles at `/helpdesk/kb/:slug`. The active tab is derived from the URL path (not query params).
+
+---
+
+## WelcomePage
+
+**Route:** Not registered in `App.tsx` — **this page has no active route**. The file exists but is not wired into the router.  
+**File:** `WelcomePage.tsx`
+
+Post-registration onboarding flow page. Currently not accessible via any route; the onboarding flow instead surfaces through the `Onboarding` modal component mounted in `MainLayout`.
+
+---
+
+## UiKitPlayground
+
+**Route:** `/ui-kit` (development only)  
+**File:** `UiKitPlayground.tsx`
+
+Internal component showcase for development. Not accessible in production builds.
+
+---
+
+## DevicesPage (Placeholder)
+
+**Route:** `/devices`  
+**File:** `App.tsx` (inline `PlaceholderPage`)
+
+Placeholder page for a future Devices management screen. Currently renders "Devices — Coming soon..." and is only accessible to authenticated users.
+
+---
+
+## Route Summary
+
+| Route | Page / Component | Auth required |
+|---|---|---|
+| `/` | `RootPage` → `HomeUpdated` or redirect to `/login` | No (auto-redirect) |
+| `/home` | `HomeUpdated` | Yes |
+| `/login` | `LoginPage` | No |
+| `/register` | `RegisterPage` | No |
+| `/auth/reset-password` | `ResetPasswordPage` | No |
+| `/auth/google/callback` | `GoogleCallbackPage` | No |
+| `/oauth/callback` | `OAuthCallbackPage` | No |
+| `/app` | `ChatPage` (no session) | Yes |
+| `/chat` | `ChatPage` (no session) | Yes |
+| `/chat/:sessionId` | `ChatPage` | Yes |
+| `/subscriptions` | `PricingPage` | Yes |
+| `/notifications` | `NotificationsPage` | Yes |
+| `/library` | `LibraryPage` | Yes |
+| `/helpdesk` | `HelpdeskPage` (tickets tab) | Yes |
+| `/helpdesk/:ticketId` | `HelpdeskPage` (ticket detail) | Yes |
+| `/helpdesk/kb` | `HelpdeskPage` (KB tab) | Yes |
+| `/helpdesk/kb/:slug` | `HelpdeskPage` (KB article) | Yes |
+| `/devices` | Placeholder | Yes |
+| `/logout` | `LogoutPage` | Yes |
+| `/ui-kit` | `UiKitPlayground` | No |
+| `*` | Redirect to `/` | — |
+
+<Info>
+All routes are relative to the `/app` base path configured in `bootstrap({ basePath: '/app' })`. Full URLs are therefore `https://app.skygen.ai/app/chat/:sessionId`, etc.
+</Info>

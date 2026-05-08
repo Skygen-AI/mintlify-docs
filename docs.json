@@ -29,16 +29,16 @@
             "group": "Core Concepts",
             "pages": [
               "concepts/devices",
+              "concepts/cloud-pc",
               "concepts/chat-sessions",
+              "concepts/tasks",
               "concepts/agents",
               "concepts/agent-modes",
               "concepts/ask-human",
               "concepts/confirmations",
-              "concepts/cloud-pc",
-              "concepts/tasks",
+              "concepts/notifications",
               "concepts/billing",
-              "concepts/safety",
-              "concepts/notifications"
+              "concepts/safety"
             ]
           },
           {
@@ -51,7 +51,7 @@
             ]
           },
           {
-            "group": "Advanced",
+            "group": "Features",
             "pages": [
               "guides/llm-routing",
               "guides/knowledge-base",
@@ -62,9 +62,7 @@
               "guides/analytics",
               "guides/library",
               "guides/helpdesk",
-              "guides/pricing",
-              "guides/ask-human-migration",
-              "errors"
+              "guides/pricing"
             ]
           },
           {
@@ -77,30 +75,9 @@
             ]
           },
           {
-            "group": "WebApp Architecture",
+            "group": "Migration",
             "pages": [
-              "webapp/architecture",
-              "webapp/state-management",
-              "webapp/api-client",
-              "webapp/platform-adapter",
-              "webapp/pages"
-            ]
-          },
-          {
-            "group": "Deployment & Operations",
-            "pages": [
-              "deployment/overview",
-              "deployment/environment",
-              "deployment/monitoring",
-              "deployment/k8s",
-              "deployment/aws-inventory",
-              "deployment/cost-optimization"
-            ]
-          },
-          {
-            "group": "Admin",
-            "pages": [
-              "admin/overview"
+              "guides/ask-human-migration"
             ]
           },
           {
@@ -123,6 +100,187 @@
             "group": "Introduction",
             "pages": [
               "api-reference/introduction"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Backend Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "reference/backend/routers",
+              "reference/backend/services",
+              "reference/backend/repositories"
+            ]
+          },
+          {
+            "group": "Service Deep Dives",
+            "pages": [
+              "reference/backend/billing-service",
+              "reference/backend/stripe-service",
+              "reference/backend/cloud-pc-service",
+              "reference/backend/mcp-tools-service",
+              "reference/backend/mcp-integration",
+              "reference/backend/session-service",
+              "reference/backend/kb-service",
+              "reference/backend/scheduled-task-service"
+            ]
+          },
+          {
+            "group": "Data & Events",
+            "pages": [
+              "reference/backend/data-models",
+              "reference/backend/realtime-events",
+              "reference/backend/socketio"
+            ]
+          },
+          {
+            "group": "Quality",
+            "pages": [
+              "reference/backend/schema-inconsistencies"
+            ]
+          },
+          {
+            "group": "Errors",
+            "pages": [
+              "errors"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Agent Reference",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "reference/agent/architecture"
+            ]
+          },
+          {
+            "group": "Core",
+            "pages": [
+              "reference/agent/base-agent",
+              "reference/agent/agents",
+              "reference/agent/cua-agents",
+              "reference/agent/llm-routing"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "reference/agent/services",
+              "reference/agent/utilities",
+              "reference/agent/local-adapters",
+              "reference/agent/configuration"
+            ]
+          },
+          {
+            "group": "Developer Guide",
+            "pages": [
+              "reference/agent/extending",
+              "reference/agent/prompts",
+              "reference/agent/broker-sdk"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Frontend Reference",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "webapp/architecture",
+              "webapp/platform-adapter"
+            ]
+          },
+          {
+            "group": "State Management",
+            "pages": [
+              "webapp/state-management"
+            ]
+          },
+          {
+            "group": "API & Real-time",
+            "pages": [
+              "webapp/api-client"
+            ]
+          },
+          {
+            "group": "Component & Type Reference",
+            "pages": [
+              "reference/frontend/types",
+              "reference/frontend/store",
+              "reference/frontend/components",
+              "reference/frontend/hooks",
+              "reference/frontend/contexts"
+            ]
+          },
+          {
+            "group": "Pages",
+            "pages": [
+              "webapp/pages"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Contracts",
+        "groups": [
+          {
+            "group": "Backend",
+            "pages": [
+              "contracts/backend-api",
+              "contracts/data-models"
+            ]
+          },
+          {
+            "group": "Agent",
+            "pages": [
+              "contracts/agent-architecture",
+              "contracts/agent-events"
+            ]
+          },
+          {
+            "group": "Frontend",
+            "pages": [
+              "contracts/frontend-api",
+              "contracts/type-mismatches"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Deployment",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "deployment/overview",
+              "deployment/environment"
+            ]
+          },
+          {
+            "group": "Infrastructure",
+            "pages": [
+              "deployment/k8s",
+              "deployment/aws-inventory",
+              "deployment/cost-optimization"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "deployment/monitoring"
+            ]
+          },
+          {
+            "group": "Admin",
+            "pages": [
+              "admin/overview"
             ]
           }
         ]

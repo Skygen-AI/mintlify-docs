@@ -1,174 +1,270 @@
 ---
-title: "Handle Composio webhooks"
-description: "Verify HMAC signature, deduplicate, dispatch to agents — the full server-side receive flow."
+title: "Tutorial: Composio Webhooks"
+description: "Trigger Skygen agents automatically when external events occur via Composio webhook triggers."
 ---
 
-This tutorial explains how Skygen receives webhooks from Composio when an integration event fires (new email, new Slack message, etc.), verifies authenticity, deduplicates retries, and dispatches the work to an agent.
+## Overview
 
-You do **not** need to implement any of this to use triggers — it's already in Skygen. This tutorial is for operators who want to understand the internals, or anyone building a similar system.
+Composio webhooks let external services fire your Skygen agents automatically. When an event occurs in a connected app — a new Gmail message, a new GitHub issue, a Slack mention — Composio sends a signed webhook to Skygen's `POST /mcp/webhooks` endpoint, which dispatches the event to the agent.
 
-## 1. Configure the secret
+In this tutorial you will:
+1. Connect an integration (GitHub)
+2. Create a trigger that fires when a new issue is opened
+3. Configure the agent's automation prompt
+4. Verify end-to-end by opening a GitHub issue
 
-Composio signs every webhook with a shared secret. Set it on both sides:
+---
 
-```bash
-# Skygen backend
-COMPOSIO_WEBHOOK_SECRET=whsec_abcdef123...
-COMPOSIO_ENABLED=true
+## Prerequisites
+
+- Skygen account with Standard plan
+- GitHub connected in Skygen (follow [Connecting Integrations](/guides/connecting-integrations))
+- Python 3.9+ with `httpx`
+- A GitHub repository you own
+
+---
+
+## Step 1: Verify GitHub is connected
+
+```python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {"Authorization": f"Bearer {TOKEN}"}
+
+resp = httpx.get(f"{BASE_URL}/mcp/integrations/available", headers=headers)
+items = resp.json().get("items", [])
+
+github = next((i for i in items if i["toolkit"] == "github"), None)
+if github and github["is_connected"]:
+    print(f"GitHub connected — account: {github.get('account_label', 'default')}")
+else:
+    print("GitHub not connected. Connect at https://app.skygen.ai/settings")
 ```
 
-Matching secret lives in the Composio dashboard under "Webhooks" → "Signing secret".
+---
 
-## 2. The webhook Skygen receives
+## Step 2: List available GitHub triggers
 
-```http
-POST /mcp/webhooks/composio HTTP/1.1
-Host: api.skygen.ai
-Content-Type: application/json
-X-Composio-Signature: sha256=a3c1b5...
+Check what event types are available for GitHub:
 
+```python
+resp = httpx.get(f"{BASE_URL}/mcp/triggers", headers=headers)
+print("Current triggers:", resp.json().get("total", 0))
+
+# Common GitHub trigger names:
+# - github_issue_created (new issue opened)
+# - github_pull_request_created (new PR)
+# - github_push (code pushed to branch)
+# - github_issue_comment (comment on issue)
+```
+
+---
+
+## Step 3: Create the issue triage trigger
+
+```python
+TRIGGER_PAYLOAD = {
+    "toolkit": "github",
+    "trigger_name": "github_issue_created",
+    "config": {
+        "repo": "your-org/your-repo",
+    },
+    "action_prompt": """
+A new GitHub issue has been created. The event payload contains the issue details.
+
+Your task:
+1. Read the issue title and body from the event payload
+2. Classify the issue as one of: bug, feature_request, question, documentation, or other
+3. Based on the classification, add the appropriate label to the issue using the GitHub toolkit
+4. If it's a bug, add a comment: "Thank you for reporting this bug! We'll investigate and respond shortly."
+5. If it's a feature request, add a comment: "Thanks for the feature idea! We've logged it for review."
+6. If it's a question, search for related issues or docs and add a helpful comment pointing to relevant resources
+
+Use the GitHub toolkit to apply labels and post comments.
+"""
+}
+
+resp = httpx.post(
+    f"{BASE_URL}/mcp/triggers",
+    headers={**headers, "Content-Type": "application/json"},
+    json=TRIGGER_PAYLOAD,
+)
+
+if resp.status_code == 201:
+    trigger = resp.json()
+    TRIGGER_ID = trigger["trigger_id"]
+    print(f"Trigger created: {TRIGGER_ID}")
+    print(f"Status: {trigger['status']}")
+else:
+    print(f"Error: {resp.status_code} — {resp.text}")
+```
+
+---
+
+## Step 4: Understand the webhook flow
+
+When a new GitHub issue is created:
+
+1. GitHub sends an event to Composio.
+2. Composio forwards it to Skygen's webhook endpoint:
+   ```
+   POST https://api.skygen.ai/mcp/webhooks
+   X-Composio-Signature: sha256=<hmac>
+   ```
+3. Skygen verifies the HMAC signature using `COMPOSIO_WEBHOOK_SECRET`.
+4. The backend parses the event and dispatches it to the agent via Socket.IO.
+5. The agent runs your `action_prompt` with the event payload available as context.
+
+The event payload passed to the agent looks like:
+
+```json
 {
-  "id": "webhook-event-123",
-  "type": "trigger.fire",
-  "triggerId": "tr_xyz",
-  "triggerName": "GMAIL_NEW_EMAIL",
-  "entityId": "user_456",
-  "appName": "gmail",
-  "data": {
-    "subject": "Q2 roadmap discussion",
-    "from": "alice@company.com",
-    "body": "..."
+  "event_type": "github_issue_created",
+  "trigger_name": "github_issue_created",
+  "app_name": "github",
+  "payload": {
+    "issue": {
+      "number": 42,
+      "title": "Bug: API returns 500 on empty input",
+      "body": "Steps to reproduce...",
+      "labels": [],
+      "user": {"login": "reporter-username"}
+    },
+    "repository": {
+      "full_name": "your-org/your-repo"
+    }
   }
 }
 ```
 
-## 3. Signature verification (inside Skygen)
+---
+
+## Step 5: Test by opening a GitHub issue
+
+Open a real issue in your repository:
 
 ```python
-import hmac, hashlib
+# Or do it via the GitHub UI. The agent should auto-triage it.
+# You can verify by checking the trigger event history:
 
-def verify(payload: bytes, signature: str | None, secret: str) -> bool:
-    if not signature:
-        return False
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        payload,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature)
-```
+import time
+time.sleep(30)  # Wait for the webhook to arrive and be processed
 
-The verifier uses `hmac.compare_digest` (timing-safe) and compares the full prefix, not just the hex digest.
-
-In dev, if `COMPOSIO_WEBHOOK_SECRET` is empty, the verifier logs a warning and accepts anyway — do **not** ship that to prod.
-
-## 4. Entity ID prefix stripping
-
-Composio may prefix `entityId` with an environment name: `prod_user_456` or `dev_user_456`. The parser strips the prefix based on `ENVIRONMENT` env var so downstream code sees a clean user ID.
-
-```python
-env_prefix = f"{env}_"
-if user_id.startswith(env_prefix):
-    user_id = user_id[len(env_prefix):]
-```
-
-## 5. Deduplication
-
-Composio retries failed webhooks. Without dedup, the same trigger fires twice → two agent sessions → double cost.
-
-Redis SETNX with an hour TTL, keyed on the webhook ID:
-
-```python
-redis = await get_redis_client()
-accepted = await redis.set(
-    f"composio:webhook:{event_id}",
-    "1",
-    nx=True,   # only if not exists
-    ex=3600,   # 1 hour
+events_resp = httpx.get(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}/events",
+    headers=headers,
 )
-if not accepted:
-    return {"status": "ok", "duplicate": True}  # 200 to stop Composio retrying
+events = events_resp.json()
+
+print(f"Total events: {events['total']}")
+for event in events["events"][:3]:
+    print(f"  {event['created_at']}: {event['status']}")
+    if event.get("error_message"):
+        print(f"  Error: {event['error_message']}")
 ```
 
-Always return 200 for duplicates — Composio will retry on non-200 responses.
+---
 
-## 6. Dispatch to agent
+## Step 6: Customize the automation
 
-The verified, parsed event becomes a synthetic `AgentProcessingPayload` and gets published to RabbitMQ. The broker:
+### Multiple repository support
 
-1. Loads the `TriggerConfiguration` by `trigger_id` to find the user's `action_prompt`
-2. Creates a new chat session prefixed `trigger_`
-3. Saves a user message combining the action prompt + event data
-4. Publishes to the agent's queue
-5. Reports progress back via Socket.IO `trigger_step` events
-
-The agent picks up the session like any normal chat message and runs its usual loop.
-
-## 7. Execution logging
-
-Every event, successful or failed, writes a `TriggerEvent` row:
-
-```
-{
-  id: UUID,
-  trigger_id: "tr_xyz",
-  event_type: "gmail.new_email",
-  payload: {...},            # full event data
-  status: "received" | "dispatched" | "completed" | "failed",
-  error_message: str | null,
-  agent_reasoning: dict,      # LLM reasoning trace (filled post-run)
-  tools_used: list,
-  actions_taken: list,
-  created_at: datetime
-}
+```python
+# Create separate triggers for each repo
+for repo in ["your-org/backend", "your-org/frontend"]:
+    httpx.post(
+        f"{BASE_URL}/mcp/triggers",
+        headers={**headers, "Content-Type": "application/json"},
+        json={
+            "toolkit": "github",
+            "trigger_name": "github_issue_created",
+            "config": {"repo": repo},
+            "action_prompt": f"Triage new issues in {repo}. Label and comment as appropriate.",
+        }
+    )
 ```
 
-Users see this via `GET /mcp/triggers/{id}/runs` — the full audit trail.
+### Adding Slack notifications
 
-## 8. Example end-to-end
+Update the action prompt to also notify your team on Slack:
 
-```
-Gmail delivers email → Composio detects →
-    POST /mcp/webhooks/composio with signature
-        ↓ (Skygen)
-    verify signature
-    check Redis dedup key
-        ↓
-    parse WebhookEvent, strip entityId prefix
-        ↓
-    look up TriggerConfiguration by trigger_id
-        ↓
-    create chat session, save action_prompt + event data as user message
-        ↓
-    publish to RabbitMQ
-        ↓ (agent worker)
-    consume, plan, call Linear MCP toolkit, create issue
-        ↓
-    complete run, log to TriggerEvent
-        ↓
-    emit trigger_step event to /user Socket.IO (progress UI)
+```python
+httpx.patch(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}",
+    headers={**headers, "Content-Type": "application/json"},
+    json={
+        "action_prompt": """
+A new GitHub issue was created. Do the following:
+
+1. Classify and label the issue (bug/feature/question/docs/other)
+2. Post an automated comment on the issue based on its type
+3. Post a notification to #engineering-alerts on Slack:
+   "New [classification] issue in [repo]: [title] — [issue URL]"
+
+Use both GitHub and Slack toolkits.
+"""
+    }
+)
 ```
 
-## Common mistakes
+---
 
-<Warning>
-**Timing-safe compare matters.** Using `==` instead of `hmac.compare_digest` leaks signature prefixes to timing attackers. Don't shortcut.
-</Warning>
+## Step 7: Enable and disable triggers
 
-<Note>
-**Dev-mode accept-all is a footgun.** If you unset `COMPOSIO_WEBHOOK_SECRET` in prod by accident, the backend accepts every webhook. Guard your env.
-</Note>
+```python
+# Disable during maintenance
+httpx.patch(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}",
+    headers={**headers, "Content-Type": "application/json"},
+    json={"is_active": False},
+)
 
-<Note>
-**Composio 30-second timeout.** If Skygen takes > 30s to respond 200, Composio marks the webhook as failed and retries. Keep the handler fast — dispatch to RabbitMQ, then return immediately.
-</Note>
+# Re-enable
+httpx.patch(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}",
+    headers={**headers, "Content-Type": "application/json"},
+    json={"is_active": True},
+)
+```
 
-<Note>
-**No built-in idempotency on the agent side.** Dedup catches webhook-level duplicates but not logical ones. If your agent creates a Linear issue, use idempotency keys in the action prompt ("create or update the issue titled...") so retries don't duplicate.
-</Note>
+---
 
-## What to read next
+## Step 8: Monitor and debug
 
-- [Triggers](/guides/triggers) — user-facing trigger creation
-- [MCP integrations](/concepts/mcp-integrations) — toolkit catalog
-- [Agents](/concepts/agents) — RabbitMQ consumer details
+View recent events with their payloads:
+
+```python
+events_resp = httpx.get(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}/events?limit=10",
+    headers=headers,
+)
+for event in events_resp.json()["events"]:
+    print(f"\n--- Event {event['id']} ---")
+    print(f"Time: {event['created_at']}")
+    print(f"Status: {event['status']}")
+    payload_preview = str(event.get("payload", {}))[:200]
+    print(f"Payload: {payload_preview}")
+    if event["status"] == "failed":
+        print(f"Error: {event['error_message']}")
+```
+
+---
+
+## Troubleshooting
+
+**Trigger created but no events appear**  
+Composio may take a few minutes to activate new triggers. Also verify the `repo` config field matches your repository's full name (`org/repo` format).
+
+**Events showing status `failed`**  
+Check the `error_message` field. Common causes:
+- GitHub toolkit disconnected (reconnect in Settings)
+- Repository name typo in config
+- Agent hit token limit (reduce the action prompt complexity)
+
+**`COMPOSIO_WEBHOOK_SECRET` error**  
+In development, the webhook secret is optional (a warning is logged). In production, set `COMPOSIO_WEBHOOK_SECRET` in your backend ConfigMap to enable HMAC verification.
+
+**Duplicate events firing**  
+This can happen if Composio retries a failed webhook. The trigger service records each dispatch; check the event history to identify duplicates and add idempotency logic to your action prompt (e.g., "Check if the issue already has a label before applying one").

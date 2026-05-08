@@ -1,141 +1,275 @@
 ---
-title: "Build a Slack digest bot"
-description: "10-minute tutorial — connect Slack, schedule a daily agent run, receive a summary in your DMs."
+title: "Tutorial: Slack Digest Bot"
+description: "Build an agent that reads emails and news, then posts a daily digest to Slack using Skygen's MCP integrations."
 ---
 
-By the end of this tutorial you will have:
+## Overview
 
-- A connected Slack account in Skygen
-- A scheduled task that fires every weekday at 9 AM local time
-- An agent that reads yesterday's `#engineering` posts and DMs you a summary
+In this tutorial you will build a Skygen automation that:
+1. Reads your Gmail inbox for the past 24 hours
+2. Fetches a news summary from a news API
+3. Compiles a structured digest
+4. Posts it to a Slack channel
 
-<Info>
-**Prereqs.** An authenticated Skygen user, a Slack workspace you can install an app into, and `COMPOSIO_ENABLED=true` on your deployment.
-</Info>
+You will use Gmail and Slack MCP integrations via Composio, a scheduled trigger, and the Skygen REST API. Total setup time: approximately 20 minutes.
 
-## 1. Connect Slack
+---
 
-Get the OAuth redirect URL:
+## Prerequisites
 
-```bash
-curl https://api.skygen.ai/mcp/integrations/connect-url/slack \
-  -H "Authorization: Bearer $TOKEN"
-# → { "redirect_url": "https://composio.dev/authorize?...", "toolkit": "slack" }
+- A Skygen account with an active subscription (Standard tier or above)
+- Gmail connected in Skygen (see [Connecting Integrations](/guides/connecting-integrations))
+- Slack connected in Skygen
+- A Slack channel to post the digest to (e.g., `#daily-digest`)
+- Your Skygen API token
+
+---
+
+## Step 1: Verify integrations are connected
+
+Before creating the automation, confirm both Gmail and Slack are connected:
+
+```python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {"Authorization": f"Bearer {TOKEN}"}
+
+resp = httpx.get(f"{BASE_URL}/mcp/integrations/available", headers=headers)
+integrations = resp.json()
+
+for integration in integrations["items"]:
+    if integration["toolkit"] in ("gmail", "slack"):
+        status = "connected" if integration["is_connected"] else "NOT connected"
+        print(f"{integration['toolkit']}: {status}")
 ```
 
-Open `redirect_url` in a browser. Approve the Slack install. Composio posts a signed webhook to `/mcp/webhooks/composio`, and Skygen creates a `ComposioConnection` with `status="connected"`.
+If either shows "NOT connected", follow the [Connecting Integrations](/guides/connecting-integrations) guide first.
 
-Verify:
+---
 
-```bash
-curl https://api.skygen.ai/mcp/integrations/available \
-  -H "Authorization: Bearer $TOKEN"
-# → { "composio": [ { "slug": "slack", "connected_accounts": [{ "account_id": "...", ... }] } ] }
+## Step 2: Test the digest manually
+
+First, create a chat session and send the digest prompt manually to verify it works:
+
+```python
+import httpx
+import json
+
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+# Create a new chat session
+session_resp = httpx.post(
+    f"{BASE_URL}/chat/sessions",
+    headers=headers,
+    json={"title": "Daily Digest Test"},
+)
+session = session_resp.json()
+session_id = session["id"]
+print(f"Session created: {session_id}")
+
+# Send the digest prompt
+DIGEST_PROMPT = """
+Read my Gmail inbox for emails received in the last 24 hours. 
+Focus on:
+- Important emails requiring action
+- Key updates from colleagues
+- Any newsletters with relevant news
+
+Then post a structured digest to the #daily-digest Slack channel in this format:
+
+**Daily Digest - {today's date}**
+
+**Action Required:**
+- [bullet list of emails needing response]
+
+**Key Updates:**
+- [bullet list of important updates]
+
+**News:**
+- [2-3 key news items if any newsletters were found]
+
+Keep it concise — max 5 bullets per section.
+"""
+
+msg_resp = httpx.post(
+    f"{BASE_URL}/chat/sessions/{session_id}/messages",
+    headers=headers,
+    json={"content": DIGEST_PROMPT},
+)
+print(f"Message sent: {msg_resp.status_code}")
+print(f"Track progress at: https://app.skygen.ai/chat/{session_id}")
 ```
 
-## 2. Give the account a friendly label
+Open the link in your browser to watch the agent run. Confirm the digest appears in your Slack channel before proceeding.
 
-```bash
-curl -X PATCH https://api.skygen.ai/mcp/integrations/connections/$ACCOUNT_ID/label \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"label": "Work Slack"}'
-```
+---
 
-## 3. Pick a device
+## Step 3: Create a daily trigger
 
-Daily runs need a device. For Slack-only automations, a chat-only session works (no device required), but most users bind to a real device or a Cloud PC so the agent has tools:
+Now automate this by creating a trigger that runs the digest every morning:
 
-```bash
-curl https://api.skygen.ai/devices \
-  -H "Authorization: Bearer $TOKEN"
-# → [ { "id": "dev_abc", ... } ]
-```
+```python
+import httpx
 
-## 4. Create the scheduled task
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-```bash
-curl -X POST https://api.skygen.ai/scheduled-tasks \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Daily Slack digest",
-    "frequency": "daily",
-    "time_of_day": "09:00",
-    "timezone": "America/New_York",
-    "prompt": "Read messages in #engineering from the last 24 hours. Summarize the top decisions, open questions, and blockers. DM me the summary on Slack.",
-    "device_id": "dev_abc",
-    "is_enabled": true
-  }'
-```
+trigger_payload = {
+    "toolkit": "gmail",
+    "trigger_name": "new_email",
+    "config": {
+        "interval_minutes": 1440,  # Check once per day
+    },
+    "action_prompt": """
+Read my Gmail inbox for emails received in the last 24 hours.
+Compile a structured daily digest and post it to the #daily-digest Slack channel.
 
-Response:
+Format the digest as:
 
-```json
-{
-  "id": "task-uuid",
-  "next_run_at": "2026-04-21T13:00:00Z",
-  "run_count": 0,
-  "is_enabled": true
+**Daily Digest - {today's date}**
+
+**Action Required (emails needing response):**
+- List each email with sender and brief subject
+
+**Key Updates:**
+- Important updates from colleagues or systems
+
+**News & Newsletters:**
+- 2-3 key items from newsletter subscriptions
+
+Keep each section to 5 bullets maximum. If a section is empty, omit it.
+Post to Slack only once — do not send duplicate messages.
+"""
 }
+
+resp = httpx.post(
+    f"{BASE_URL}/mcp/triggers",
+    headers=headers,
+    json=trigger_payload,
+)
+trigger = resp.json()
+print(f"Trigger created: {trigger['trigger_id']}")
+print(f"Status: {trigger['status']}")
 ```
 
-(`next_run_at` is UTC; 9 AM ET on 2026-04-21 is 13:00 UTC.)
+---
 
-## 5. Run it once right now (optional)
+## Step 4: Verify the trigger
 
-To verify without waiting until tomorrow:
+List your triggers to confirm it was created:
 
-```bash
-curl -X POST https://api.skygen.ai/scheduled-tasks/$TASK_ID/run \
-  -H "Authorization: Bearer $TOKEN"
+```python
+resp = httpx.get(f"{BASE_URL}/mcp/triggers", headers=headers)
+triggers = resp.json()
+
+for t in triggers["triggers"]:
+    print(f"- {t['trigger_id']}: {t['trigger_name']} ({t['app']}) — {t['status']}")
 ```
 
-Skygen creates a chat session, sends the prompt as a user message, and the agent starts working. Subscribe to `/user` Socket.IO to watch progress, or poll `GET /sessions/{id}/messages`.
+---
 
-## 6. Inspect runs
+## Step 5: Customize the digest format
 
-```bash
-curl https://api.skygen.ai/scheduled-tasks/$TASK_ID/runs \
-  -H "Authorization: Bearer $TOKEN"
-# → { "items": [ { "id": "run-uuid", "status": "completed", "scheduled_for": "...", "completed_at": "..." } ] }
+You can update the `action_prompt` at any time without recreating the trigger:
+
+```python
+TRIGGER_ID = "your-trigger-id"
+
+httpx.patch(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}",
+    headers=headers,
+    json={
+        "action_prompt": """
+Read emails from the last 24 hours. Post to #daily-digest on Slack.
+
+Format:
+**Morning Digest {date}**
+
+Top 3 things I need to act on today:
+1. ...
+
+What happened yesterday I should know about:
+- ...
+
+Skip the digest entirely if there are fewer than 3 unread emails.
+"""
+    }
+)
 ```
 
-Each execution creates a new session; drill into `session_id` to see the transcript.
+---
 
-## 7. Pause or edit
+## Step 6: Add a news source
 
-```bash
-# Pause without deleting
-curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID/toggle \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"is_enabled": false}'
+Extend the digest with a news source by updating the prompt to include a web search:
 
-# Change schedule
-curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"time_of_day": "08:30", "frequency": "weekly", "day_of_week": 1}'
+```python
+EXTENDED_PROMPT = """
+Do two things:
+
+1. Read my Gmail inbox for the last 24 hours. Identify emails requiring action and key updates.
+
+2. Search the web for today's top 3 technology news headlines (use a web search or news site).
+
+Then post this digest to #daily-digest on Slack:
+
+**Daily Digest - {date}**
+
+**My Inbox — Action Required:**
+[email bullets]
+
+**Tech News Today:**
+[3 headline bullets with sources]
+
+Be concise. Total message should fit in a single Slack message block.
+"""
 ```
 
-## Common mistakes
+---
 
-<Warning>
-**Webhook never arrives.** If connecting Slack seems to hang, check `COMPOSIO_WEBHOOK_SECRET` on both Composio dashboard and Skygen backend — mismatched secrets mean signature verification fails silently and connections never finalize.
-</Warning>
+## Step 7: Monitor execution
 
-<Note>
-**Task fires but agent does nothing.** The agent needs an explicit instruction to call Slack — "read messages" in natural language is usually enough, but ambiguous prompts ("catch up on Slack") sometimes don't trigger the toolkit. Be specific: name the channel and the time window.
-</Note>
+View the trigger event history to confirm the digest is running:
 
-<Note>
-**Timezone off by hours.** If your digest arrives at the wrong time, verify `timezone` matches your IANA tz (`America/New_York`, `Europe/Berlin`). `EST` / `GMT+2` are not valid.
-</Note>
+```python
+resp = httpx.get(
+    f"{BASE_URL}/mcp/triggers/{TRIGGER_ID}/events",
+    headers=headers,
+)
+events = resp.json()
 
-<Note>
-**Late runs don't backfill.** If Skygen was down at 9 AM and it's now 11, the scheduler skips the 9 AM run (> 1 hour late) and advances to tomorrow. The run shows up with `status=skipped` in history. See [Scheduled tasks](/guides/scheduled-tasks).
-</Note>
+for event in events["events"][:5]:
+    print(f"{event['created_at']} — status: {event['status']}")
+    if event.get("error_message"):
+        print(f"  Error: {event['error_message']}")
+```
 
-## What to read next
+---
 
-- [Triggers](/guides/triggers) — fire on a Slack event instead of a schedule
-- [MCP integrations](/concepts/mcp-integrations) — full toolkit catalog
-- [Connecting integrations](/guides/connecting-integrations) — OAuth details
+## Troubleshooting
+
+**Digest not appearing in Slack**  
+Check the trigger event history for errors. The most common cause is the Slack connection being inactive. Open the Connectors panel in Skygen and verify Slack shows as connected.
+
+**Agent asks me to connect Gmail/Slack**  
+The connection may have been revoked. Disconnect and reconnect in Settings > Integrations.
+
+**Digest sent multiple times**  
+The action prompt includes "do not send duplicate messages" to prevent this, but you can also add an explicit instruction: "Before posting, check if a digest was already posted today by searching for a message starting with 'Daily Digest' in #daily-digest."
+
+**Trigger showing as inactive**  
+A Composio event refreshed and the connection was flagged as expired. Reconnect and then re-enable the trigger with `PATCH /mcp/triggers/{id}` with `{"is_active": true}`.
+
+---
+
+## Next steps
+
+- Add more sources: Google Calendar events for the day, Linear issues assigned to you
+- Post to multiple Slack channels (split by topic)
+- Use the `choice` ask_human prompt to let the agent ask you each morning which topics to focus on
+- Schedule a weekly summary trigger instead of daily for lower-volume users

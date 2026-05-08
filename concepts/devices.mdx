@@ -1,189 +1,422 @@
 ---
 title: "Devices"
-description: "Physical machines, Cloud PCs, and E2B sandboxes that agents run on — one unified API."
+description: "Real machines, Cloud PC sandboxes, and session sandboxes — registration, authentication, and routing."
 ---
 
-A **device** is anything an agent can drive. Real laptops and desktops running the Skygen client, Cloud PCs managed by Skygen, and short-lived E2B sandboxes all share one API. Every chat session binds to exactly one device.
+A **device** is the execution target where AI agent actions land. Every device has a persistent DB record that the backend and agent use to route Socket.IO commands, verify tokens, and track connectivity. Skygen supports three device types, each with distinct registration paths and action-routing semantics.
 
 ## Device types
 
-```python
-class DeviceType(str, Enum):
-    REAL_DEVICE = "real_device"   # Physical hardware with OSWorld client
-    E2B_SANDBOX = "e2b_sandbox"   # Cloud PCs + ephemeral E2B environments
+`DeviceType` enum (source: `Backend/app/models/devices.py`):
+
+| Type | Value | What it represents | Routing |
+|------|-------|-------------------|---------|
+| `REAL_DEVICE` | `real_device` | macOS or Windows app installed on a physical machine | Socket.IO `/device` namespace |
+| `E2B_SANDBOX` | `e2b_sandbox` | Virtual device record linked to a Cloud PC | E2B SDK (direct) |
+| `SESSION_SANDBOX` | `session_sandbox` | Disposable per-session Compute V2 sandbox | E2B SDK (direct) |
+
+**Routing rule:** The agent checks `device.device_type` — not `connection_status` — to decide how to execute an action. Real devices require `connection_status == "online"`; E2B-backed devices are always routable when the sandbox is live.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    MacApp["macOS / Windows App\n(REAL_DEVICE)"] -- "register → device_token" --> API
+    CloudPC["Cloud PC\n(E2B_SANDBOX)"] -- "POST /cloud-pc/link-device" --> API
+    SessionSandbox["Session Sandbox\n(SESSION_SANDBOX)"] -- "auto-created by backend" --> API
+
+    API["Backend"] -- "stores" --> DB["devices table"]
+    DB -- "device_id" --> Sessions["chat_sessions\n(device_id / task_sandbox_device_id)"]
+
+    Agent["AI Agent"] -- "routes actions" --> Dispatcher{"device_type?"}
+    Dispatcher -- "real_device" --> SocketIO["/device namespace"]
+    Dispatcher -- "e2b_sandbox\nsession_sandbox" --> E2B["E2B SDK"]
+
+    SocketIO -- "JSON-RPC 2.0" --> MacApp
+    E2B -- "API calls" --> Sandbox["E2B Sandbox"]
 ```
 
-Real devices connect over Socket.IO to the `/device` namespace. E2B-typed devices are controlled via the E2B SDK and are always considered "online" by the device status layer.
+## Data model
 
-## Device record
+Source: `Backend/app/models/devices.py`
 
-Every device has these fields. The bold ones you will touch most often.
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `String(36)` UUID | Primary key |
+| `device_name` | `String` | Display name (e.g. "MacBook Pro", "Cloud PC · My Desktop") |
+| `platform` | `String` | One of `macos`, `windows`, `linux`, `desktop` |
+| `capabilities` | `JSON` | Freeform dict reported by the client app at registration |
+| `device_type` | `DeviceType` | `real_device` / `e2b_sandbox` / `session_sandbox` |
+| `device_token_kid` | `String` | Key ID for the device JWT (unique, indexed) |
+| `machine_id` | `String` | Hardware UUID (e.g. `IOPlatformUUID` on macOS); used for deduplication |
+| `connection_status` | `String` | `"online"` \| `"offline"` \| `"deleted"` |
+| `last_seen` | `DateTime` | Last heartbeat from the device |
+| `last_kid_rotation` | `DateTime` | Timestamp of last token-key rotation (rate-limited to 1 per 5 minutes) |
+| `sandbox_config` | `JSON` | E2B-specific config: `{template_id, sandbox_id, stream_url, …}` |
+| `deleted_at` | `DateTime` | Soft-delete timestamp |
+| `user_id` | FK → `users` | Owner |
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `id` | UUID | Primary key |
-| `user_id` | FK → users | Owner, enforces privacy isolation |
-| **`device_name`** | string | Human-friendly name you pick |
-| **`platform`** | `macos` \| `linux` \| `windows` \| `desktop` | OS type, used for filtering and analytics |
-| **`device_type`** | enum | Real or sandbox |
-| **`machine_id`** | string, indexed | Hardware fingerprint for dedup |
-| **`device_token_kid`** | string, unique | Rotatable Key ID |
-| `capabilities` | JSON | Free-form feature flags the client reports |
-| **`connection_status`** | `online` \| `offline` \| `deleted` | Live state |
-| `last_seen` | datetime | Last heartbeat |
-| `deleted_at` | datetime \| null | Soft-delete marker |
-| `last_kid_rotation` | datetime | Rate-limit checkpoint for KID rotation |
-| `sandbox_config` | JSON | E2B template/sandbox metadata |
+## API reference
 
-## Identity: `machine_id` + `device_token_kid`
+### Register a device
 
-Two distinct fields, two distinct jobs.
+<ParamField path="POST /devices/register" type="endpoint">
+Register a new device or upsert an existing one. The backend resolves deduplication in this order:
 
-**`machine_id`** is a hardware UUID produced by the client at install time. The Skygen client reads it from:
+1. **By `machine_id`** — if a non-deleted device with the same `machine_id` and `user_id` exists, update it and return its existing token.
+2. **By `device_token_kid`** — if a device with the same KID exists, update it.
+3. **New device** — insert a new row, generate a `device_token_kid`, and issue a JWT.
 
-- **macOS** — `IOPlatformUUID` from `ioreg`
-- **Linux** — `/etc/machine-id` or `dbus-uuidgen`
-- **Windows** — `ComputerSystemProduct.UUID` from WMI
+**Request body:**
 
-Skygen uses `(machine_id, user_id)` as the dedup key. Re-registering the same hardware returns the existing record.
+<ParamField body="device_name" type="string" required>
+  Human-readable name for the device.
+</ParamField>
 
-**`device_token_kid`** is a rotatable Key ID generated by the backend (or supplied by the client on first register). It identifies the device's Socket.IO session and is reserved for frame signing. The client stores it and presents it on every reconnect.
+<ParamField body="platform" type="string" required>
+  One of `macos`, `windows`, `linux`, `desktop`.
+</ParamField>
+
+<ParamField body="capabilities" type="object">
+  Freeform dict of device capabilities reported by the client (e.g. `{ "screen_recording": true }`).
+</ParamField>
+
+<ParamField body="device_type" type="string" default="real_device">
+  `real_device` or `e2b_sandbox`. `session_sandbox` devices are created internally by the backend.
+</ParamField>
+
+<ParamField body="device_id" type="string">
+  Hardware UUID sent by the client app (stored as `machine_id`). Used for deduplication — the same physical machine re-registers to the same device record.
+</ParamField>
+
+<ParamField body="device_token_kid" type="string">
+  Optional. If provided and matches an existing KID, the device is updated rather than created.
+</ParamField>
+
+**Response `200`:**
+```json
+{
+  "id": "device-uuid",
+  "user_id": "user-uuid",
+  "device_name": "MacBook Pro",
+  "platform": "macos",
+  "capabilities": { "screen_recording": true },
+  "device_type": "real_device",
+  "device_token_kid": "kid_01J...",
+  "connection_status": "offline",
+  "created_at": "2026-01-15T12:00:00",
+  "last_seen": null,
+  "machine_id": "A1B2C3D4-...",
+  "device_id": "A1B2C3D4-..."
+}
+```
+
+`device_id` in the response mirrors `machine_id` for Rust client compatibility.
+</ParamField>
+
+### List devices
+
+<ParamField path="GET /devices" type="endpoint">
+Returns all non-deleted devices for the current user, including any Cloud PCs converted to device shape.
+
+When the query parameter `include_cloud_pc=true` is passed, each active Cloud PC owned by the user is converted to a device-shaped object via `_cloud_pc_to_device_dict()` and appended to the list. This lets Cloud PCs appear in the same device picker as real devices without requiring a separate API call.
+
+**Response `200`:**
+```json
+[
+  {
+    "id": "device-uuid",
+    "device_name": "MacBook Pro",
+    "platform": "macos",
+    "device_type": "real_device",
+    "connection_status": "online",
+    "last_seen": "2026-05-08T09:00:00"
+  }
+]
+```
+</ParamField>
+
+### Get a device
+
+<ParamField path="GET /devices/{device_id}" type="endpoint">
+Return a single device by ID. Returns `404` if the device is soft-deleted or owned by a different user.
+</ParamField>
+
+### Update a device
+
+<ParamField path="PUT /devices/{device_id}" type="endpoint">
+Update device metadata (name, platform, capabilities, `connection_status`, `last_seen`).
+
+**Request body** (`DeviceUpdate` schema):
+
+<ParamField body="device_name" type="string">Name update.</ParamField>
+<ParamField body="platform" type="string">Platform update.</ParamField>
+<ParamField body="capabilities" type="object">Capabilities update.</ParamField>
+<ParamField body="connection_status" type="string" default="offline">One of `online`, `offline`, `deleted`.</ParamField>
+<ParamField body="last_seen" type="datetime">Timezone-aware datetimes are stripped to naive UTC before storage.</ParamField>
+</ParamField>
+
+### Delete a device
+
+<ParamField path="DELETE /devices/{device_id}" type="endpoint">
+Soft-delete a device. Sets `connection_status = "deleted"` and `deleted_at = now()`. The device record is retained for historical FK references.
+</ParamField>
+
+### Token key rotation
+
+<ParamField path="POST /devices/{device_id}/rotate-kid" type="endpoint">
+Rotate the `device_token_kid` and issue a new JWT. Rate-limited: only one rotation per **5-minute window** per device (enforced via `last_kid_rotation`).
+
+**Response `200`:**
+```json
+{
+  "device_token_kid": "kid_02K...",
+  "access_token": "eyJ..."
+}
+```
+
+Returns `429` if the last rotation was less than 5 minutes ago.
+</ParamField>
+
+## Authentication flow
+
+Devices authenticate with a **device token** (JWT signed with the platform secret). The `device_token_kid` field in the device row acts as the key ID claim; the backend validates it on every authenticated request from the device.
+
+```mermaid
+sequenceDiagram
+    participant App as Device App
+    participant API as Backend
+    participant DB
+
+    App->>API: POST /devices/register (machine_id, platform, ...)
+    API->>DB: upsert by machine_id OR kid
+    DB-->>API: device row
+    API-->>App: { device_token_kid, access_token }
+
+    App->>API: Authenticated requests (Authorization: Bearer <token>)
+    API->>DB: verify kid → user_id
+    DB-->>API: valid
+```
+
+## Chat session bindings
+
+A `ChatSession` row has three device FK columns that reflect different usage scenarios:
+
+| Column | DeviceType | Purpose |
+|--------|------------|---------|
+| `device_id` | Any | The primary active device for this session |
+| `task_sandbox_device_id` | `SESSION_SANDBOX` | Compute V2 per-session sandbox running alongside the primary device |
+| `paused_device_id` | `E2B_SANDBOX` | Memo written when a Cloud PC auto-pauses; cleared on resume |
+
+When a Cloud PC is connected, `device_id` is set to the Cloud PC's `linked_device_id`. On auto-pause, the backend moves `device_id → paused_device_id` (so the session is no longer actively bound) and can restore it later.
+
+## Platform capabilities
+
+The `capabilities` JSON field is open-ended and reported by the client at registration. Common keys:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `screen_recording` | bool | App has screen-recording permission |
+| `accessibility` | bool | Accessibility API enabled (required for CUA on macOS) |
+| `resolution` | `[w, h]` | Screen resolution |
+| `os_version` | string | Operating system version string |
+
+Agents can read this dict to decide whether a given action is feasible on the target device before submitting it.
+
+## Connection status
+
+Real devices update `connection_status` and `last_seen` via Socket.IO heartbeats on the `/device` namespace. When the Socket.IO connection drops, the server sets status to `"offline"`.
+
+| Status | Meaning |
+|--------|---------|
+| `online` | Socket.IO connection is active |
+| `offline` | Disconnected; last_seen is the last known contact time |
+| `deleted` | Soft-deleted; excluded from normal list queries |
 
 <Warning>
-KID rotation is rate-limited to **once every 5 minutes per device**. `POST /devices/{id}/rotate` returns `429 Too Many Requests` with the seconds remaining if you try sooner.
+**E2B-backed devices ignore `connection_status`.** The agent router does NOT check `connection_status` for `e2b_sandbox` or `session_sandbox` devices — it routes directly to the E2B SDK. Only `real_device` types must be `online` for actions to succeed.
 </Warning>
 
-## Register flow (idempotent)
+## E2B sandbox device creation
 
+Cloud PC devices are not created via `POST /devices/register`. They are created by `POST /cloud-pc/link-device`, which calls `_cloud_pc_to_device_dict()` internally. The device `platform` is set to `"desktop"`, `device_type` is `"e2b_sandbox"`, and `sandbox_config` stores the E2B-specific fields:
+
+```json
+{
+  "sandbox_id": "snd_01J...",
+  "stream_url": "wss://...",
+  "template_id": "desktop"
+}
 ```
-POST /devices   body: { device_name, platform, device_type, machine_id, capabilities }
-      │
-      ▼
-find device where machine_id = :m AND user_id = :u
-      │
-      ├── found, connection_status="deleted" ──► restore → 200 OK
-      ├── found, alive ──────────────────────── ► backfill missing machine_id → 200 OK
-      └── not found ──► try KID lookup
-                             │
-                             ├── KID owned by another user ──► 409 Conflict
-                             ├── KID owned by same user ────► 200 OK (existing device)
-                             └── KID not found ─────────────► create new → 201 Created
-```
-
-Re-installing the Skygen client is a no-op: same `machine_id`, same device record, possibly a new KID if the client chose to rotate. Soft-deleted devices are restored automatically when they re-register.
-
-## Status lifecycle
-
-```
-(register)
-     │
-     ▼
-  offline ◄──────────────┐
-     │                   │
-  socket connect         │ socket disconnect
-     │                   │
-     ▼                   │
-  online ────────────────┘
-     │
-  DELETE /devices/{id}
-     ▼
-  deleted  (soft-delete; deleted_at set)
-     │
-  POST /devices/{id}/restore
-     ▼
-  offline
-```
-
-List endpoints exclude `deleted` records by default. Re-registering a `deleted` device restores it to `offline`.
 
 ## Socket.IO `/device` namespace
 
-The Skygen client connects with the user JWT plus `device_id`. On handshake the backend:
+Real devices maintain a long-lived Socket.IO connection on the `/device` namespace.
 
-1. Decodes the JWT
-2. Looks up the device
-3. Rejects if `device.user_id` does not match the token user
-4. Rejects if `device_type == E2B_SANDBOX` (E2B uses the SDK, not Socket.IO)
-5. Joins room `device:{device_id}`
-6. Registers in Redis for distributed tracking
-7. Sets `connection_status = "online"`
+**Events the device sends:**
 
-**Events from the device:**
-
-| Event | Payload | Purpose |
-|-------|---------|---------|
-| `heartbeat` | `{ status, system_info }` | Keep-alive, updates `last_seen` |
-| `task_result` | `{ task_id, status, result, error, action_id }` | Report action completion |
-| `device_status` | `{ device_id, status, timestamp }` | Explicit status push |
-| `get_presigned_upload_url` | `{ session_id, task_id, step_number }` | Request S3 URL for screenshot upload |
-
-**Events to the device:**
-
-| Event | Payload |
+| Event | Purpose |
 |-------|---------|
-| `execute_task` | High-level task envelope |
-| `desktop_env_execute` | Low-level action (`click`, `type`, `screenshot`, ...) |
-| `task_cancelled` | Abort in-flight work |
+| `register` | Announce presence with `device_token_kid` |
+| `heartbeat` | Keep-alive; updates `last_seen` and `connection_status = online` |
+| `action_result` | Return the result of an agent-dispatched action |
+| `task_completed` | Notify the backend that a task has finished |
 
-## Endpoints
+**Events the device receives:**
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/devices` | Register or upsert a device. Returns `201` for new, `200` for existing. |
-| `GET` | `/devices` | List devices for the current user. Supports `skip`, `limit`, `device_type`, `connection_status`, `sort_by`, `sort_desc`. Admins can filter by `user_id`. |
-| `GET` | `/devices/{id}` | Fetch a single device. |
-| `PATCH` | `/devices/{id}` | Update `device_name`, `platform`, `capabilities`, `connection_status`, `sandbox_config`. Protected fields (`device_token_kid`, `device_type`, `user_id`) are stripped for non-admins. |
-| `DELETE` | `/devices/{id}` | Soft-delete. |
-| `POST` | `/devices/{id}/restore` | Restore a soft-deleted device to `offline`. |
-| `POST` | `/devices/{id}/rotate` | Rotate the KID. Rate-limited to 1 per 5 minutes. |
-| `POST` | `/devices/{id}/force-release` | Clear stuck Redis locks (troubleshooting). |
+| Event | Purpose |
+|-------|---------|
+| `execute_action` | Agent dispatches an action for the device to run |
+| `cancel_task` | Backend requests task cancellation |
+| `device_config` | Backend pushes updated config (e.g. new token after KID rotation) |
 
-## Multi-user isolation
+## Gotchas
 
-- Every endpoint checks `device.user_id == current_user.id` (admins can cross-access).
-- List queries always filter by `user_id` for non-admins.
-- `machine_id` dedup is scoped by user: the same hardware can appear under two different user accounts as two different devices.
-- `device_token_kid` is **globally unique**; a KID that belongs to user A cannot be claimed by user B and returns `409`.
+<Note>
+**`device_id` alias.** The client sends the hardware UUID as `device_id` in the registration body; the backend stores it as `machine_id`. The response mirrors `machine_id → device_id` so the Rust client dedup logic works. Do not confuse the body alias with the primary key `id`.
+</Note>
 
-## End to end
+<Warning>
+**KID rotation rate limit.** Only one token rotation per 5-minute window is allowed. Attempting a second rotation within the window returns `429 Too Many Requests`. Build your client refresh logic with this constraint in mind — do not retry aggressively.
+</Warning>
 
-```bash
-# Register
-curl -X POST https://api.skygen.ai/devices \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "device_name": "MacBook Pro M3",
-    "platform": "macos",
-    "device_type": "real_device",
-    "machine_id": "550e8400-e29b-41d4-a716-446655440000",
-    "capabilities": {"mouse": true, "keyboard": true, "camera": true}
-  }'
-# → 201 { "id": "...", "device_token_kid": "...", "connection_status": "offline" }
+<Note>
+**Soft delete preserves FK integrity.** Deleting a device sets `deleted_at` and `connection_status = "deleted"` but keeps the row. Chat sessions with `device_id` pointing to soft-deleted devices are unaffected; the FK on `chat_sessions` is `ON DELETE SET NULL`.
+</Note>
 
-# Re-register (idempotent)
-# Same body, same response — but now 200 OK instead of 201
+## Device token lifecycle
 
-# List
-curl https://api.skygen.ai/devices \
-  -H "Authorization: Bearer $TOKEN"
+When a new device registers or an existing device's KID is rotated, the backend issues a **device JWT**. This token is distinct from the user's access token.
 
-# Rotate KID
-curl -X POST https://api.skygen.ai/devices/$DEVICE_ID/rotate \
-  -H "Authorization: Bearer $TOKEN"
-# Try again within 5 min → 429
+```mermaid
+sequenceDiagram
+    participant App as Device App
+    participant API as Backend
+    participant DB
 
-# Soft-delete
-curl -X DELETE https://api.skygen.ai/devices/$DEVICE_ID \
-  -H "Authorization: Bearer $TOKEN"
+    App->>API: POST /devices/register
+    API->>DB: upsert (machine_id or KID dedup)
+    API-->>App: { device_token_kid, access_token }
 
-# Restore
-curl -X POST https://api.skygen.ai/devices/$DEVICE_ID/restore \
-  -H "Authorization: Bearer $TOKEN"
+    Note over App: token stored locally
+
+    App->>API: POST /devices/{id}/rotate-kid
+    API->>DB: check last_kid_rotation
+    alt < 5 min since last rotation
+        API-->>App: 429 Too Many Requests
+    else OK
+        API->>DB: UPDATE device_token_kid, last_kid_rotation
+        API-->>App: { device_token_kid, access_token }
+    end
 ```
+
+Clients should proactively rotate the KID on a schedule (e.g., every 24 hours) rather than waiting for a `401`. KID rotation invalidates the old JWT immediately.
+
+## Session sandbox (Compute V2)
+
+`SESSION_SANDBOX` devices are created automatically by the backend when Compute V2 is enabled for a session. Unlike `E2B_SANDBOX` (Cloud PC) devices which persist across sessions, a session sandbox is:
+
+- Provisioned at the start of the session.
+- Bound to `chat_sessions.task_sandbox_device_id` (not `device_id`).
+- Destroyed at the end of the session.
+- Never registered via `POST /devices/register` — created internally.
+
+This allows a session to use a **primary device** (Cloud PC or real machine) for user-visible automation while running isolated sub-tasks in a disposable sandbox.
+
+## Capability negotiation
+
+When a device registers, it reports its `capabilities` dict. The agent reads this before submitting an action to determine feasibility:
+
+```python
+# Pseudo-code in CUA_OrchestratorAgent
+if not device.capabilities.get("screen_recording"):
+    raise ValueError("Screen recording not available on this device")
+
+if not device.capabilities.get("accessibility"):
+    raise ValueError("Accessibility API required for click automation on macOS")
+```
+
+This prevents the agent from attempting actions that will fail silently. The capability dict is freeform and client-defined — there is no schema enforcement at the API layer.
+
+## Multi-platform support
+
+The `platform` field identifies the OS. Action implementations vary by platform:
+
+| Platform | CUA implementation | Notes |
+|----------|-------------------|-------|
+| `macos` | Accessibility API + CoreGraphics | Requires accessibility permission in System Settings |
+| `windows` | Win32 API + UIAutomation | Requires elevated permissions for some operations |
+| `linux` | X11 / xdotool | Typically inside a containerised E2B sandbox |
+| `desktop` | E2B sandbox (always Linux) | Used for Cloud PC and session sandbox devices |
+
+The agent's `TargetEnv.from_platform(platform)` call maps the platform string to the correct action toolkit.
+
+## Indexes
+
+```sql
+-- All active devices for a user (used in device picker)
+CREATE INDEX ON devices (user_id, deleted_at);
+
+-- Device lookup by machine_id (deduplication on register)
+CREATE INDEX ON devices (machine_id);
+
+-- Device lookup by KID (authentication on every request)
+CREATE UNIQUE INDEX ON devices (device_token_kid);
+```
+
+## Device registration walkthrough
+
+<Steps>
+  <Step title="App launches">
+    On first launch, the macOS/Windows app reads the hardware UUID (e.g., `IOPlatformUUID` on macOS via `ioreg -rd1 -c IOPlatformExpertDevice`).
+  </Step>
+  <Step title="Register the device">
+    ```bash
+    curl -X POST https://api.skygen.ai/devices/register \
+      -H "Authorization: Bearer <user_token>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "device_name": "MacBook Pro",
+        "platform": "macos",
+        "device_id": "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+        "capabilities": {
+          "screen_recording": true,
+          "accessibility": true,
+          "resolution": [2560, 1600]
+        }
+      }'
+    ```
+    Returns `{ "id": "device-uuid", "device_token_kid": "kid_...", "access_token": "eyJ..." }`.
+  </Step>
+  <Step title="Store the token">
+    Store `device_token_kid` and `access_token` in the app's secure storage. Use the `access_token` as `Authorization: Bearer <token>` on all subsequent API calls.
+  </Step>
+  <Step title="Connect to Socket.IO">
+    Connect to `wss://api.skygen.ai/device` with the device token. Send a `register` event immediately after connecting to announce presence.
+  </Step>
+  <Step title="Maintain heartbeat">
+    Send `heartbeat` events every 30 seconds to keep `connection_status = "online"`. On disconnect (network drop, app close), the server sets `connection_status = "offline"` when the Socket.IO connection times out.
+  </Step>
+</Steps>
+
+## Deduplication priority
+
+The register endpoint resolves conflicts in a strict priority order:
+
+```mermaid
+flowchart TD
+    Req["POST /devices/register\n{ machine_id, device_token_kid, ... }"] --> M{"Match by\nmachine_id + user_id?"}
+    M -- "Yes (non-deleted row)" --> UpdateMID["UPDATE row\n→ return existing device + new token"]
+    M -- "No" --> K{"Match by\ndevice_token_kid?"}
+    K -- "Yes" --> UpdateKID["UPDATE row\n→ return existing device + new token"]
+    K -- "No" --> Insert["INSERT new row\n→ return new device + token"]
+```
+
+This ensures re-installing the app on the same machine does not create a duplicate device record, while allowing the same user to have multiple devices.
 
 ## See also
 
-- [Chat sessions](/concepts/chat-sessions) — session-device binding
-- [Cloud PC](/concepts/cloud-pc) — the E2B-backed device subtype
-- [Agents](/concepts/agents) — how actions get routed to devices
+- [Cloud PC](/concepts/cloud-pc) — how Cloud PCs create and link `E2B_SANDBOX` devices
+- [Agents](/concepts/agents) — how agent action routing uses `device_type`
+- [Chat sessions](/concepts/chat-sessions) — the three device FK slots on a session
+- [Agent modes](/concepts/agent-modes) — how `auto` mode checks device liveness before dispatching

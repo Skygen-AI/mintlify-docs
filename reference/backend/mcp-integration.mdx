@@ -1,0 +1,470 @@
+---
+title: "MCP Integration Layer"
+description: "First-party OAuth providers, custom HTTP connectors, and code generation for Skygen's Model Context Protocol integration subsystem."
+---
+
+## Architecture Overview
+
+The MCP integration subsystem lives in `app/integrations/mcp/`. All external code imports exclusively from `MCPFacade`; internal modules must never be imported directly from outside this package.
+
+**Two distinct paths** coexist in the system:
+
+| Path | Entry Point | Covers |
+|---|---|---|
+| First-party providers | `MCPFacade` → `MCPToolsService` → `BaseMCPProvider` subclass | Gmail, Calendar, Drive, Docs, Sheets, YouTube, Contacts, GitHub, Slack, Outlook |
+| Custom HTTP connectors | `MCPFacade` → `MCPToolsService` → `_execute_custom_connector_tool` | User-defined REST endpoints registered in `CustomConnector` model |
+| Composio (third-party) | `ComposioService` → `ComposioAdapter.get_mcp_config()` | 500+ toolkits via Composio's own MCP server — agent connects directly, bypasses this package |
+
+OAuth flows for first-party providers are handled by `MCPOAuthService`. Token storage is in `MCPTokenStore`. Code scaffolding for new providers uses `IntegrationCodeGenerator`.
+
+---
+
+## MCPFacade
+
+**File:** `app/integrations/mcp/facade.py`
+
+Single entry point for all MCP operations outside the package. Wraps `MCPToolsService` and `MCPOAuthService` behind a stable interface. When MCP is extracted to a microservice, only this facade needs to change.
+
+**Singleton:** `get_mcp_facade()` — module-level `_facade_instance`, thread-safe lazy init.
+
+**Lazy loading:** Both `MCPToolsService` and `MCPOAuthService` are imported on first use to prevent circular imports at module load time. `MCPOAuthService` is instantiated fresh per DB session via `_get_oauth_service(db)`.
+
+### Data classes
+
+```python
+@dataclass
+class ToolResult:
+    success: bool
+    data: str          # JSON string
+    error: Optional[str] = None
+
+@dataclass
+class ToolInfo:
+    name: str
+    description: str
+    input_schema: Dict[str, Any]
+
+@dataclass
+class IntegrationStatus:
+    provider: str
+    connected: bool
+    scopes: Optional[List[str]] = None
+```
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `execute_tool` | `async (user_id, tool_name, parameters, custom_connectors=None) → ToolResult` | Execute a named tool; returns `ToolResult(success=False)` on any exception instead of raising |
+| `list_tools` | `(user_id=None, custom_connectors=None) → tuple[List[ToolInfo], List[str]]` | List all available tools; second element is list of provider names not yet connected |
+| `get_oauth_url` | `async (user_id, provider, db, redirect_uri=None) → str` | Start OAuth flow; returns the authorization URL |
+| `handle_oauth_callback` | `async (user_id, provider, code, state, db) → bool` | Complete OAuth flow after redirect; returns `True` on success |
+| `get_integrations_status` | `async (user_id) → List[IntegrationStatus]` | Poll `is_authenticated()` on every registered provider for this user |
+
+**Routing note:** `get_integrations_status` iterates `self.tools_service._providers` (the global provider registry). Each entry creates a per-user provider instance via `get_provider_for_user` to check authentication state.
+
+---
+
+## MCPToolsService
+
+**File:** `app/integrations/mcp/mcp_tools_service.py`
+
+Central provider registry. Coordinates tool execution across all registered providers and custom HTTP connectors.
+
+**Global singleton:** `mcp_tools_service` — created at import time via `_create_global_service()` which calls `mcp_providers_registry.create_default_providers()`. Override for tests with `initialize_mcp_tools_service(providers)`.
+
+**Constants:**
+- `CUSTOM_TOOL_PREFIX = "custom__"` — prefix for custom connector tool names
+- `_MAX_PROVIDER_CACHE_SIZE = 1000` — per-user provider cache ceiling
+
+### Constructor
+
+```python
+MCPToolsService(providers: List[BaseMCPProvider])
+```
+
+Builds two internal dicts:
+- `_providers: Dict[str, BaseMCPProvider]` — global provider instances keyed by `provider_name`
+- `_provider_classes: Dict[str, type[BaseMCPProvider]]` — provider classes for per-user instantiation
+- `_user_providers_cache: OrderedDict` — LRU cache of `(user_id, provider_name) → provider_instance`; evicts oldest entry when size reaches `_MAX_PROVIDER_CACHE_SIZE`
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `get_provider_for_user` | `(provider_name, user_id) → Optional[BaseMCPProvider]` | Return or create a per-user provider instance; caches result; returns `None` on construction failure |
+| `get_all_tools` | `(user_id=None, custom_connectors=None) → tuple[List[dict], List[str]]` | Collect tools from all authenticated providers + custom connectors; second element is unauthenticated provider names |
+| `execute_tool` | `async (tool_name, user_id=None, custom_connectors=None, **kwargs) → str` | Route to custom connector or provider; return JSON string result |
+| `_resolve_provider_name_from_tool` | `(tool_name) → Optional[str]` | Longest-prefix-wins scan: `"google_chat_send"` → `"google_chat"`, not `"google"` |
+| `_get_custom_connector_tools` | `(custom_connectors) → List[dict]` | Build tool schemas from `CustomConnector` objects with `status=connected` |
+| `_slugify_tool_name` | `(value) → str` | `"Send Email"` → `"send_email"` — normalize to `[a-z0-9_]` |
+| `_build_custom_tool_name` | `(connector_id, slug) → str` | Produces `custom__<connector_id>__<slug>` |
+| `_execute_custom_connector_tool` | `async (tool_name, custom_connectors, **kwargs) → str` | Decrypt connector config, build URL, issue aiohttp request; GET → query params, POST → JSON body |
+
+### Custom connector tool name format
+
+```
+custom__<connector_id>__<tool_slug>
+```
+
+Two double-underscore separators. `connector_id` is the UUID from the `CustomConnector` DB row. `tool_slug` is `_slugify_tool_name(tool.name)` or `_slugify_tool_name(connector.slug)` if `connector.tools` is empty.
+
+### Provider resolution
+
+```
+execute_tool("gmail_send_email", ...)
+  → not custom__ prefix
+  → _resolve_provider_name_from_tool("gmail_send_email")
+  → scans _providers.keys(): ["gmail", "calendar", "google_chat", ...]
+  → "gmail" matches "gmail_send_email" (len=5)
+  → "google_chat" does not match (no "google_chat_" prefix)
+  → returns "gmail"
+  → get_provider_for_user("gmail", user_id) or _providers["gmail"]
+  → provider.execute_tool("gmail_send_email", **kwargs)
+```
+
+---
+
+## BaseMCPProvider
+
+**File:** `app/integrations/mcp/base_provider.py`
+
+Abstract base for all first-party MCP providers. Implements tool dispatch via a name-based registry built at construction time.
+
+### Auto-mapping convention
+
+Tool names follow `{provider_name}_{method_name}`:
+- `gmail_send_email` → provider `gmail`, method `send_email`
+- `calendar_list_events` → provider `calendar`, method `list_events`
+- `google_chat_send_message` → provider `google_chat`, method `send_message`
+
+`__init__` calls `_build_tool_registry()` which iterates `get_tools()` and, for each tool, strips the `provider_name + "_"` prefix to find the service method name. Entries where the method does not exist on `self.service` are skipped with a warning.
+
+### Registry entry structure
+
+```python
+_tool_registry[tool_name] = {
+    "service_method": str,    # name of method on self.service
+    "defaults": dict,         # parameter defaults from JSON schema
+    "required": list[str],    # required parameter names
+}
+```
+
+### Abstract interface
+
+| Property/Method | Type | Description |
+|---|---|---|
+| `provider_name` | `@property @abstractmethod str` | Provider identifier used in tool names (e.g. `"gmail"`) |
+| `get_tools` | `@abstractmethod () → List[dict]` | Return list of `{name, description, input_schema}` dicts — single source of truth for tool schemas |
+| `is_authenticated` | `@abstractmethod () → bool` | Return `True` if this provider has valid credentials for its user |
+
+### Concrete methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `execute_tool` | `async (tool_name, **kwargs) → str` | Registry lookup → merge defaults → validate required params → call service method (sync or async) → return JSON string |
+| `_build_tool_registry` | `() → None` | Populates `_tool_registry` from `get_tools()`; called in `__init__` |
+| `_tool_name_to_method` | `(tool_name) → Optional[str]` | Strip `provider_name + "_"` prefix; return `None` if not matching |
+
+**Parameter filtering:** `execute_tool` inspects `inspect.signature(method)`. If the method does not declare `**kwargs`, only known parameters are passed — extra kwargs (e.g. an LLM passing `max_results` when the method expects `limit`) are silently dropped. If the method has `**kwargs`, all parameters are forwarded.
+
+---
+
+## MCPOAuthService
+
+**File:** `app/integrations/mcp/mcp_oauth_service.py`
+
+Handles the complete OAuth lifecycle for first-party providers. Instantiated fresh per request with a DB session — not a singleton.
+
+**Factory:** `get_mcp_oauth_service(db: AsyncSession) → MCPOAuthService`
+
+**Supported providers:** `gmail`, `calendar`, `drive`, `docs`, `sheets`, `youtube`, `github`, `slack`, `outlook`, `contacts`
+
+**Google providers constant:** `_GOOGLE_PROVIDERS = {"gmail", "calendar", "drive", "docs", "sheets", "contacts", "youtube"}` — used to decide whether to call Google's token revocation endpoint.
+
+### Constructor
+
+```python
+MCPOAuthService(db: AsyncSession)
+```
+
+Builds `_adapter_factories: Dict[str, Callable]` — maps provider name to a lambda `user_id → OAuthAdapter`. Each lambda creates the provider-specific config object and corresponding adapter.
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `get_oauth_adapter` | `(provider, user_id) → OAuthAdapter` | Instantiate adapter from factory; raises `ValueError` for unknown provider |
+| `initiate_oauth` | `async (user_id, provider, redirect_uri=None) → Dict` | Create/update `UserMCPIntegration(status=pending)`, generate auth URL, encode timestamp into state as `"{state}:{int(time.time())}"`, store in `extra_data["oauth_state"]`; returns `{auth_url, state, provider}` |
+| `handle_oauth_callback` | `async (user_id, provider, code, state) → Dict` | Validate CSRF state, exchange code via `oauth_server.exchange_code(code)`, save credentials via `mcp_token_store.asave_credentials()`, set `status=connected`, store GitHub username in `account_label` if present; returns `{success, provider, message, redirect_uri}` |
+| `refresh_token` | `async (user_id, provider) → bool` | Trigger `adapter.get_stored_credentials()` which auto-refreshes; returns `True` if valid credentials result |
+| `revoke_integration` | `async (user_id, provider) → bool` | For Google providers: call `revoke_google_token()` first; then `adelete_credentials`; set `status=revoked` in DB |
+
+### Standalone helper
+
+```python
+async def revoke_google_token(user_id: str, provider: str) -> None
+```
+
+Reads stored credentials, prefers `refresh_token` for the revocation POST to `https://oauth2.googleapis.com/revoke`. Accepts `200` and `400` as success (Google returns 400 for already-revoked tokens).
+
+### CSRF state encoding
+
+```python
+state = f"{oauth_server.state}:{int(time.time())}"
+```
+
+The timestamp suffix allows server-side TTL validation without a separate Redis key. The state is injected into the authorization URL's `state` query parameter (replacing any existing one) and stored in `extra_data["oauth_state"]`.
+
+---
+
+## OAuthMCPService
+
+**File:** `app/integrations/mcp/common/base_oauth_service.py`
+
+Base class for Google OAuth-backed MCP services. Extends `BaseMCPService`. All 7 Google provider services (Gmail, Calendar, Drive, Docs, Sheets, YouTube, Contacts) extend this class.
+
+### Constructor
+
+```python
+OAuthMCPService(
+    provider_name: str,   # e.g. "gmail"
+    config: Any,          # GmailConfig, CalendarConfig, etc.
+    user_id: str | None = None,
+)
+```
+
+Creates `GoogleOAuthAdapter`, initializes a `threading.Lock` for the lazy client, and auto-registers tools by calling `get_tool_mappings()` and `register_tool()` for each entry.
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `is_authenticated` | `() → bool` | Delegates to `oauth_adapter.is_authenticated()`; catches all exceptions, returns `False` |
+| `client` (property) | `→ Any` | Lazy API client with double-checked locking — authenticates on first access via `oauth_adapter.authenticate()` then `create_client(credentials)` |
+| `create_client` | `@abstractmethod (credentials) → Any` | Subclass creates the provider-specific API client from Google credentials |
+| `get_tool_mappings` | `() → Dict[str, Callable]` | Override to declare tool name → bound method mappings; default returns `{}` for backward compat |
+| `_tool` | `async (func, *args, error_code=None, **kwargs) → str` | Unified execution wrapper — handles `PermissionError` (returns `{success:False, error_code:...}`) and all other exceptions (returns `{success:False, error:...}`) |
+
+**Double-checked locking pattern:**
+
+```python
+if self._client is None:
+    with self._client_lock:
+        if self._client is None:          # re-check under lock
+            credentials = self.oauth_adapter.authenticate()
+            self._client = self.create_client(credentials)
+```
+
+---
+
+## GoogleOAuthServer
+
+**File:** `app/integrations/mcp/common/google_oauth.py`
+
+Concrete `BaseOAuthServer` for all Google providers. Handles the two-leg OAuth exchange.
+
+### Constructor
+
+```python
+GoogleOAuthServer(
+    client_id, client_secret, port, scopes, redirect_uri,
+    provider_name="google",
+    include_granted_scopes=True,  # False for contacts
+)
+```
+
+Generates `self.state: Optional[str]` on `get_auth_url()`, not at construction.
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `get_auth_url` | `() → str` | Generate `self.state` via `secrets.token_urlsafe(32)`; build Google OAuth URL with `access_type=offline`, `prompt=consent`, `include_granted_scopes` |
+| `exchange_code` | `(code: str) → bool` | POST to `https://oauth2.googleapis.com/token`; build `google.oauth2.credentials.Credentials`; store in `self.credentials`; return `True` on success |
+| `get_main_page` | `() → str` | HTML page for local OAuth server; parameterized by `_GOOGLE_PROVIDER_META[provider_name]` |
+
+---
+
+## GoogleOAuthAdapter
+
+**File:** `app/integrations/mcp/common/google_oauth.py`
+
+Unified Google OAuth adapter replacing 7 near-identical per-provider adapters. Extends `BaseOAuthAdapter`.
+
+### Constructor
+
+```python
+GoogleOAuthAdapter(
+    provider_name: str,        # e.g. "gmail"
+    config,                    # must have: client_id, client_secret, token_file,
+                               #   redirect_uri, oauth_port, scopes
+    user_id: str | None = None,
+)
+```
+
+Sets `_include_granted_scopes = provider_name != "contacts"` (contacts uses `False` to avoid scope conflicts).
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `create_oauth_server` | `() → GoogleOAuthServer` | Build `GoogleOAuthServer` with `include_granted_scopes` flag |
+| `authenticate` | `() → Credentials` | Try `get_stored_credentials()` first; fall back to `authenticate_via_web()`; save to DB (if `user_id`) or file |
+| `get_stored_credentials` | `() → Optional[Credentials]` | DB lookup first (if `user_id`); auto-refresh expired tokens and save back; fall back to `token_file`; same auto-refresh for file-based creds |
+| `validate_credentials` | `(credentials) → bool` | Return `credentials is not None and credentials.valid` |
+
+**Storage preference:** When `user_id` is set, all credential reads and writes go to DB via `mcp_token_store`. File-based storage is only used for serverless/local scenarios without a user context.
+
+**Auto-refresh:** Both DB and file paths call `google.auth.transport.requests.Request()` for expired-but-refreshable tokens and persist the new token immediately.
+
+---
+
+## IntegrationCodeGenerator
+
+**File:** `app/services/mcp_integration_builder/generator.py`
+
+Jinja2-based code scaffolding for new MCP provider integrations. Reads templates from `mcp_integration_builder/templates/`.
+
+### Constructor
+
+```python
+IntegrationCodeGenerator()
+```
+
+Loads Jinja2 `Environment` from the `templates/` subdirectory. Registers two custom filters:
+- `python_type` — maps JSON Schema types to Python type hints (`"string"` → `"str"`, `"integer"` → `"int"`, `"array"` → `"list"`, `"object"` → `"dict"`, fallback `"Any"`)
+- `title` — `str.title`
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `generate_provider` | `(metadata: IntegrationMetadata) → str` | Render `simple_provider.py.j2` for `SIMPLE` type, `provider.py.j2` for others |
+| `generate_service` | `(metadata) → str` | Render `service.py.j2` with provider name, tools, auth type |
+| `generate_config` | `(metadata) → str` | Render `config.py.j2` with OAuth scopes and API base URL |
+| `generate_client` | `(metadata) → str` | Render `client.py.j2` — stub for the provider's HTTP client |
+| `generate_all` | `(metadata) → Dict[str, str]` | `SIMPLE` → only `{provider.py}`; `OAuth/API_KEY` → `{provider.py, config.py, services/__init__.py, services/{name}_service.py, adapters/__init__.py, adapters/{name}_client.py}` |
+| `write_to_disk` | `(provider_name, files, base_dir=None) → str` | Write files under `app/integrations/mcp/<provider_name>/`; auto-create `__init__.py` exporting `<Name>Provider`; return output directory path |
+
+### Output structure for OAuth/API_KEY integrations
+
+```
+app/integrations/mcp/<provider_name>/
+├── __init__.py              # from .provider import <Name>Provider
+├── provider.py
+├── config.py
+├── services/
+│   ├── __init__.py
+│   └── <provider_name>_service.py
+└── adapters/
+    ├── __init__.py
+    └── <provider_name>_client.py
+```
+
+---
+
+## ComposioToolkitAdapter
+
+**File:** `app/services/composio_adapter.py`
+
+Handles toolkit discovery and the managed-toolkit slug registry. Composed into `ComposioAdapter`.
+
+Inherits shared infrastructure from `_ComposioBase` (API key, environment prefix, lazy Composio SDK client).
+
+**Redis cache keys:**
+- `composio:toolkits:all` — full toolkit list, TTL 1 hour
+- `composio:managed_toolkit_slugs:v1` — set of connectable slugs, TTL 1 hour
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `get_toolkits` | `async (query=None, category=None) → List[ToolkitInfo]` | Fetch all toolkits from Redis cache or SDK; apply query/category filters in-memory; enrich with `is_auth_managed` flag |
+| `get_managed_toolkit_slugs` | `async () → Set[str]` | Return lowercased set of connectable slugs; union of mechanism (1) — `composio_managed_auth_schemes` non-empty and mechanism (2) — explicit `auth_configs` registered in the Composio project |
+
+**Two-mechanism managed-toolkit detection:**
+
+Mechanism (1): Composio provides default OAuth credentials — `composio_managed_auth_schemes` is non-empty (~121 toolkits: Gmail, Slack, GitHub, Notion, HubSpot, Salesforce, Discord, etc.).
+
+Mechanism (2): Skygen registered its own OAuth app via the Composio Dashboard — toolkit appears in `client.auth_configs.list()` (e.g. Telegram, ClickHouse, Perplexity, Reply.io, Cursor).
+
+Both lists are paginated; pagination is capped at 20 pages (~10k toolkit ceiling). Union of both sets is returned. On Redis error, falls through to a live SDK call without writing back.
+
+**Fail-open on `get_toolkits`:** If `get_managed_toolkit_slugs` raises `ComposioUnavailableError`, every toolkit is marked `is_auth_managed=True` to preserve pre-rollout behavior.
+
+---
+
+## ComposioConnectionAdapter
+
+**File:** `app/services/composio_adapter.py`
+
+Manages connected accounts, MCP server config generation, and semantic tool search. Composed into `ComposioAdapter`.
+
+**User ID prefixing:** All Composio API calls use `prefixed_user_id(user_id)` = `"{environment}_{user_id}"` to isolate dev/staging/prod data within a single Composio account.
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `get_user_connections` | `async (user_id) → List[ConnectionInfo]` | List all connected accounts for user; runs `_extract_account_identity` on each |
+| `initiate_auth` | `async (user_id, toolkit, redirect_url=None, allow_multiple=False, connection_data=None) → AuthResult` | Paginate `auth_configs.list()` for toolkit match; if `connection_data` + `auth_config_id`: use V3 `/connected_accounts/link`; otherwise `session.authorize()` (Composio default credentials) |
+| `disconnect` | `async (user_id, toolkit, account_id=None) → bool` | Resolve `account_id` from first matching connection if omitted; call `connected_accounts.delete()` |
+| `get_mcp_config` | `async (user_id, toolkits=None, disabled_toolkits=None) → MCPConfig` | Create Composio session with `entity_id=prefixed_user_id`; return `MCPConfig(url, headers, entity_id, disabled_toolkits)` for direct agent → Composio MCP connection |
+| `get_tools_for_task` | `async (user_id, task_description, max_tools=20) → List[ToolInfo]` | Composio semantic search for relevant tools |
+
+**Account identity extraction:** `_extract_account_identity` uses a 6-tier fallback chain to extract email/display_name from Composio's inconsistent connection objects:
+1. `data` dict fields
+2. `state.val` extras
+3. Deprecated `labels`
+4. Top-level object attributes
+5. Nested `member` object
+6. `__pydantic_extra__` dict
+
+For providers with masked API tokens (Gmail, Slack), `_resolve_email_via_action` calls a lightweight profile action (e.g. `GMAIL_GET_PROFILE`, `SLACK_AUTH_TEST`) to retrieve the actual email address.
+
+---
+
+## ComposioTriggerAdapter
+
+**File:** `app/services/composio_adapter.py`
+
+Trigger CRUD operations. Composed into `ComposioAdapter`.
+
+**Redis cache:** `composio:trigger_types:all` — available trigger type schemas, TTL 30 minutes.
+
+### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `list_triggers` | `async (user_id) → List[TriggerInfo]` | Get user's connected account IDs first, then `triggers.list_active(connected_account_ids=...)` |
+| `create_trigger` | `async (user_id, toolkit, trigger_name, config, account_id=None) → TriggerCreateResult` | Auto-resolve `account_id` if omitted; call `triggers.create()` |
+| `delete_trigger` | `async (user_id, trigger_id) → bool` | Verify ownership via `triggers.list_active(trigger_ids=[trigger_id])` before calling `triggers.disable()` |
+| `list_trigger_types` | `async (toolkit=None) → List[TriggerTypeInfo]` | Return available trigger types filtered by toolkit |
+| `list_trigger_app_counts` | `async () → List[Dict]` | Fast path — counts per app without config schemas; used for sidebar badges |
+
+---
+
+## ComposioAdapter (Facade)
+
+**File:** `app/services/composio_adapter.py`
+
+Backward-compatible facade composing all three sub-adapters: `ComposioToolkitAdapter`, `ComposioConnectionAdapter`, `ComposioTriggerAdapter`.
+
+All public methods delegate to the appropriate sub-adapter. Imported by `ComposioService` as the concrete implementation of the `ComposioPort` protocol.
+
+**Import compatibility:** `ComposioUnavailableError` is re-exported from this module so existing `from app.services.composio_adapter import ComposioUnavailableError` imports continue to work.
+
+---
+
+## _ComposioBase
+
+**File:** `app/services/composio_adapter.py`
+
+Shared infrastructure for all Composio sub-adapters. Not exported.
+
+| Method | Description |
+|---|---|
+| `get_client()` | Lazy `Composio(api_key=...)` initialization; raises `ComposioUnavailableError` if SDK missing or init fails |
+| `prefixed_user_id(user_id)` | Returns `f"{environment}_{user_id}"` for multi-env data isolation |
+| `parse_toolkit_meta(tk)` | Static method; extracts `description`, `logo`, `categories` from a toolkit object's `.meta` attribute, handling both dict and object forms |

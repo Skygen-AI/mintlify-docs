@@ -1,0 +1,536 @@
+---
+title: "CUA Agents Reference"
+description: "Complete reference for the Computer Use Agent (CUA) system: CUA_OrchestratorAgent, GUI tools, grounding strategies, perception module, Playwright integration, and configuration."
+---
+
+# Computer Use Agents (CUA)
+
+The CUA system performs GUI automation against a Cloud PC or local desktop. It captures screenshots, interprets the screen with a vision language model (VLM), resolves element coordinates, and dispatches remote input events.
+
+The entire CUA surface is a **single agent class** — `CUA_OrchestratorAgent` — backed by a set of pluggable components. There is no multi-tier Orchestrator → Supervisor → Performer hierarchy; the `CUA_OrchestratorAgent` directly inherits from `BaseAgent` and drives the full perception–action–observe loop itself.
+
+---
+
+## Architecture overview
+
+```
+PlannerAgent
+    └─ spawns ─▶ CUA_OrchestratorAgent
+                    │
+                    ├─ RemotePerceptionModule  ← captures screenshots + optional a11y tree
+                    ├─ GroundingModule         ← VLM coordinate resolution (4 strategies)
+                    ├─ CUAActionExecutor       ← handles screenshot refresh between bundle steps
+                    ├─ CUAPromptBuilder        ← injects system prompt + visual context
+                    ├─ CUALLMManager          ← injects screenshot as image_url content block
+                    │
+                    ├─ PerformGUIActionTool    ← wrapper exposed to the LLM
+                    │       └─ dispatches to one of 12 BaseGUITool subclasses
+                    ├─ ExecuteCommandTool      ← terminal/shell commands
+                    ├─ BrowserActionTool       ← Playwright CDP browser (optional)
+                    └─ RunPythonTool           ← inherited from BaseAgent
+```
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/base.py`
+
+---
+
+## When to use CUA
+
+`CUA_OrchestratorAgent` includes a `DELEGATION_DESCRIPTION` that `PlannerAgent` uses to decide when to spawn it:
+
+> Use this agent when the task requires:
+> - Browser or web automation (prefer `browser_action` / Playwright when DOM selectors work; use `perform_gui_action` for desktop, native UI, or when Playwright fails)
+> - Interacting with the user's remote device GUI (clicking, visual automation)
+> - Controlling desktop applications visually (not via API)
+> - Tasks that CANNOT be done via integrations/APIs
+
+**Do not use CUA for:**
+- Web research or factual lookup — use `DataFetcherAgent` instead
+- Integration work (Gmail, Slack, GitHub) — use `MCPToolsAgent` instead
+- Code execution or file manipulation in a sandbox — use `SoftwareEngineerAgent` instead
+
+The CUA system prompts the orchestrator to always check whether `DataFetcherAgent` or the Planner can retrieve data faster before initiating GUI automation.
+
+---
+
+## How Computer Use works end-to-end
+
+Each CUA iteration follows the BaseAgent ReAct loop with CUA-specific additions:
+
+### 1. Think phase
+
+`CUALLMManager` builds the LLM payload. Before each think step, it:
+
+1. Calls `_perceive_and_update_state()` to capture a fresh screenshot via `RemotePerceptionModule`
+2. Calls `_format_visual_context_message()` to build the user message content block
+3. Injects the screenshot as a base64-encoded `image_url` block alongside the previous screenshot if available
+
+The LLM sees a **before/after screenshot pair** (or just the current screenshot on the first step) along with a UI summary. The prompt enforces structured JSON reasoning with mandatory fields: `efficiency_and_sanity_check`, `expectation`, `observation`, `comparison`, `conclusion`, `next_step`.
+
+### 2. Act phase
+
+`CUAActionExecutor` processes the LLM's action bundle. For each `perform_gui_action` call:
+
+1. **Screenshot capture**: Takes a fresh screenshot before the action (between bundle steps)
+2. **VLM grounding** (if `vlm_required=True` for the tool): Calls `GroundingModule.find_coordinates()` with the `interaction_description` to resolve pixel coordinates
+3. **Action dispatch**: Sends the action to the Cloud PC via WebSocket
+4. Waits `GUI_ACTION_DELAY` seconds (default 0.3s) between actions
+
+LLM output is a flat JSON list of actions (a "bundle"). Bundles up to 5 actions are supported. All actions in a bundle run sequentially — no parallel execution.
+
+### 3. Observe phase
+
+`CUAActionExecutor` captures another screenshot after each action for the next iteration. `CUA_OrchestratorAgent._observe_phase()` overrides the base class to additionally:
+
+- Scan `run_python` and `execute_command` tool outputs for file write events
+- Extract file paths from Python AST analysis (`_extract_written_files_python()`) and shell pattern matching (`_extract_written_files_shell()`)
+- Populate `_pending_emitted_files` so created files are automatically forwarded to the user via `emitted_files`
+
+---
+
+## `CUA_OrchestratorAgent`
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/base.py`
+
+Direct subclass of `BaseAgent`. Owns the VLM pipeline and all GUI tooling.
+
+### Constructor
+
+```python
+CUA_OrchestratorAgent(
+    ws_client,
+    device_id: str,
+    step_callback=None,
+    config=None,
+    playwright_client=None,
+    *args,
+    **kwargs,
+)
+```
+
+| Parameter | Purpose |
+|---|---|
+| `ws_client` | WebSocket client for sending actions to the Cloud PC |
+| `device_id` | Target device identifier |
+| `step_callback` | Optional callback invoked after each step (used by `PlannerAgent` for progress tracking) |
+| `config` | `AgentConfig` with CUA-specific fields |
+| `playwright_client` | Optional `PlaywrightBrowserClient` instance; if omitted and Playwright is enabled, one is created |
+
+### Constructor kwargs (popped before BaseAgent)
+
+| kwarg | Type | Default | Description |
+|---|---|---|---|
+| `rich_response_mode` | `bool` | `False` | Enhanced perception data (more detail in world model) |
+| `gui_observation_mode` | `str` | `"default"` | Perception mode: `"default"` or `"a11y_dom_screenshot"` |
+| `internal_testing_mode` | `bool` | `False` | Disables certain production checks for test environments |
+
+### State class
+
+`CUA_OrchestratorAgent` uses `CUAState` (defined in `Agent/Utilities/Context/State.py`):
+
+```python
+@dataclass
+class CUAState(BaseAgentState):
+    screenshot_path: Optional[str] = None
+    world_model_summary: Optional[str] = None
+```
+
+The screenshot path and world model summary are updated at each perception step and forwarded to `CUALLMManager` for injection into the LLM payload.
+
+### Class-level constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `TERMINATE_GUARD_ENABLED` | `False` | CUA is a leaf agent; no plan guard needed |
+| `subagent_classes` | `{}` | Cannot spawn further agents |
+| `allow_parallel` | `False` (forced) | Bundle actions are sequential |
+| `SKILLS_USAGE_HINT` | `""` | Skills lookup is done by Planner before delegation |
+
+---
+
+## GUI tools
+
+The LLM uses a single `perform_gui_action` tool whose `tool_to_use` argument selects one of 12 backend `BaseGUITool` subclasses.
+
+### `PerformGUIActionTool`
+
+The tool exposed to the LLM. It:
+
+1. Validates that `tool_to_use` names a registered `BaseGUITool`
+2. Runs the VLM grounding pipeline if `tool.vlm_required=True`
+3. Resolves `interaction_description` → pixel coordinates via `GroundingModule`
+4. Calls the underlying `BaseGUITool.execute()`
+
+```python
+# LLM-facing call structure
+{
+  "name": "perform_gui_action",
+  "args": {
+    "tool_to_use": "click",
+    "interaction_description": "The blue 'Submit' button at the bottom of the form"
+  }
+}
+```
+
+For the `drag` tool, a `target_description` is also required — the VLM resolves two coordinate pairs.
+
+### Registered GUI tools
+
+| Tool name (`tool_to_use`) | `vlm_required` | Action timeout | Purpose |
+|---|---|---|---|
+| `click` | Yes | 5s | Single left-click at grounded coordinates |
+| `type` | No | — | Type text into the focused element |
+| `press_keys` | No | — | Send key combinations (e.g. `["ctrl", "c"]`) |
+| `scroll` | Yes | — | Scroll the element at grounded coordinates |
+| `drag` | Yes | 15s | Drag from source to target coordinates |
+| `hover` | Yes | — | Move mouse to coordinates without clicking |
+| `hold_click` | Yes | — | Press and hold the mouse button |
+| `release_click` | No | — | Release a held mouse button |
+| `open_app` | No | 45s | Launch an application by name or path |
+| `activate_window` | No | — | Bring a named window to the foreground |
+| `close_window` | No | — | Close a named window |
+| `wait` | No | — | Pause execution for N seconds |
+
+`ACTION_TIMEOUTS` in `BaseGUITool`:
+
+```python
+ACTION_TIMEOUTS = {
+    "CLICK": 5,
+    "DRAG": 15,
+    "OPEN_FILE_OR_APP": 45,
+    "SCREENSHOT": 90,
+    "RUN_PYTHON": 120,
+}
+```
+
+### `activate_window` recovery
+
+`CUAActionExecutor` has special recovery logic for `activate_window` failures. If the action fails or the frontmost app does not match the expected window title, the executor:
+
+1. Waits `CUA_ACTIVATE_WINDOW_RECOVERY_WAIT_SECONDS` (default 1.5s)
+2. Checks the frontmost application using an OS-appropriate command (AppleScript on macOS, PowerShell on Windows, xdotool/xprop on Linux)
+3. Retries up to `CUA_ACTIVATE_WINDOW_RECOVERY_RETRIES` times (default 2)
+4. Returns a hard error with a full recovery summary if all retries fail
+
+### Additional tools
+
+Beyond `perform_gui_action`, `CUA_OrchestratorAgent` registers:
+
+- **`execute_command`**: Runs basic terminal/shell commands. Uses `RemoteExecuteCommandTool`. For file operations, the agent is instructed to prefer `run_python` instead.
+- **`run_python`**: Inherited from `BaseAgent`. Runs Python code in the Cloud PC E2B sandbox. The agent prefers this for file operations, data processing, and waits.
+- **`browser_action`** (when Playwright is enabled): Playwright CDP browser control. Supports `navigate`, `click`, `type`, `scroll`, `screenshot`, `get_html` actions. Always used for URL navigation in preference to shell-based openers.
+
+---
+
+## Perception module
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/remote_perception_module.py`
+
+`RemotePerceptionModule` fetches the current screen state from the Cloud PC over WebSocket. It returns a `world_state` dict containing:
+
+| Field | Description |
+|---|---|
+| `screenshot_path` | Local path to the saved screenshot file |
+| `world_model_summary` | Text description of current screen state |
+| `screen_size` | Dict with `physical_width`, `physical_height`, `logical_width`, `logical_height` |
+| `active_page_dom` | DOM dict (only in `a11y_dom_screenshot` mode) |
+| `accessibility_tree_raw_xml` | Raw a11y tree XML (only in `a11y_dom_screenshot` mode) |
+| `accessibility_elements` | Parsed a11y element list (only in `a11y_dom_screenshot` mode) |
+
+### Observation modes
+
+`gui_observation_mode` controls what the perception module fetches:
+
+| Mode | What is captured | Use case |
+|---|---|---|
+| `"default"` | Screenshot + world model summary | Standard GUI automation |
+| `"a11y_dom_screenshot"` | Screenshot + accessibility tree + active page DOM | When precise element targeting via a11y IDs is needed |
+
+In `a11y_dom_screenshot` mode, the LLM context includes the full accessibility tree XML and active page DOM (truncated to 40K characters). This enables element-ID-based interactions instead of relying on pixel coordinates.
+
+---
+
+## Grounding module
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/grounding_module.py`  
+**Factory:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/grounding_strategies/factory.py`
+
+`GroundingModule` resolves an `interaction_description` (natural language) to pixel coordinates using a VLM. The strategy is selected at construction time from `config.grounding_strategy`.
+
+### `find_coordinates()`
+
+```python
+async def find_coordinates(
+    screenshot_path: str,
+    description: str,
+    context: AgentContext,
+    step: int,
+) -> dict  # {"coordinates": {"x": int, "y": int}}
+```
+
+The method accounts for physical vs. logical screen resolution scaling. Physical coordinates are divided by the scale factor before being sent as input events (required on HiDPI displays).
+
+### Grounding strategies
+
+`GroundingPipelineFactory.create(strategy_name)` returns a grounding pipeline. Supported strategy names:
+
+| Strategy name | Description |
+|---|---|
+| `"default"` | Standard VLM-based coordinate resolution using the configured `vlm_model` |
+| `"uitars_grounding"` | UiTars model optimized for GUI understanding and grounding |
+| `"uitars_computer_use"` | UiTars in computer-use mode with enhanced action prediction |
+| `"qwen_computer_use"` / `"qwen3_computer_use"` | Qwen VL in computer-use mode (aliases for the same pipeline) |
+
+The strategy is set via `AgentConfig.grounding_strategy` (configured from `model_profiles.yaml`). All built-in profiles use `"qwen_computer_use"` as the default strategy.
+
+### `GroundingPipelineFactory`
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/grounding_strategies/factory.py`
+
+`GroundingPipelineFactory.create(strategy_name)` returns a `(GroundingStrategy, ImageProcessingStrategy)` tuple. Unknown names fall back to `"default"` with a warning.
+
+| Strategy name | `GroundingStrategy` | `ImageProcessingStrategy` |
+|---|---|---|
+| `"default"` | `DefaultGroundingStrategy` | `DefaultImageProcessor` |
+| `"uitars_grounding"` | `UITarsGroundingStrategy` | `UITarsImageProcessor` |
+| `"uitars_computer_use"` | `UITarsComputerUseStrategy` | `UITarsImageProcessor` |
+| `"qwen_computer_use"` / `"qwen3_computer_use"` | `QwenComputerUseStrategy` | `Qwen3ImageProcessor` |
+
+### `QwenComputerUseStrategy`
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/grounding_strategies/qwen_computer_use.py`
+
+Used for both Qwen2.5-VL and Qwen3-VL models. Outputs coordinates in a 0–1000 normalized space using an inlined tool schema in the system prompt.
+
+**System prompt structure:**
+
+```xml
+<tools>
+{"type": "function", "function": {"name": "computer", "description": "...",
+  "parameters": {
+    "action": {"enum": ["left_click"]},
+    "coordinate": {"description": "The [x, y] coordinates in [0, 1000] space.", "type": "array"}
+  }}}
+</tools>
+```
+
+**Payload parameters:** `max_tokens: 200`, `temperature: 0.7`, `top_p: 0.8`, `top_k: 20`, `min_p: 0.0`, `presence_penalty: 1.5`.
+
+**Output format** (`parse_response()`): Extracts coordinates from `<tool_call>` XML tags using regex `<tool_call>\s*({...})\s*</tool_call>`. Returns `(x: float, y: float, reasoning: str)` where `x` and `y` are raw 0–1000 values. Any reasoning text appearing before `<tool_call>` is preserved as `reasoning`.
+
+### `Qwen3ImageProcessor`
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/grounding_strategies/image_processors.py`
+
+Paired with `QwenComputerUseStrategy`. The image is smart-resized before being sent to the model (to stay within token limits), but the resized dimensions are NOT used for coordinate mapping.
+
+**Back-projection formula:**
+
+```
+physical_x = round(parsed_x / 1000.0 * original_width)
+physical_y = round(parsed_y / 1000.0 * original_height)
+```
+
+Where `original_width` / `original_height` are the screen dimensions before smart resize.
+
+**Smart resize constants:** `IMAGE_FACTOR=28`, `MIN_PIXELS=100×28²`, `MAX_PIXELS=16384×28²`, `MAX_RATIO=200`.
+
+### `UITarsImageProcessor` back-projection (contrast)
+
+For UITars strategies, coordinates are absolute pixel values in the **smart-resized** image space. Back-projection is:
+
+```
+physical_x = round(parsed_x / resized_w * original_w)
+physical_y = round(parsed_y / resized_h * original_h)
+```
+
+This is different from Qwen, which uses a fixed 0–1000 normalized space.
+
+---
+
+## Playwright integration
+
+**Module:** `Agent/Agents/CUA_OrchestratorAgent/playwright/`
+
+Optional Playwright integration enables CDP-based browser control alongside the standard VLM GUI tools. Playwright is activated when `is_playwright_enabled(config)` returns `True`.
+
+### When Playwright is active
+
+- `BrowserActionTool` is registered as an additional tool
+- `DELEGATION_DESCRIPTION` is updated to mention browser + web automation as primary use case
+- `TERMINATION_GUIDELINES_PROMPT` gains Playwright-specific addenda
+- CUA prompt includes Playwright identity and format addenda (`cua_playwright_identity_addendum()`, `cua_playwright_format_addendum()`)
+
+### History compression
+
+Playwright mode requires aggressive history compression to prevent the context window from filling with large DOM snapshots. Two environment variables control the compression:
+
+| Env var | Default | Description |
+|---|---|---|
+| `CUA_MAX_HISTORY_PAIRS` | `6` | Maximum user/assistant message pairs retained |
+| `CUA_ELEMENTS_KEEP_LAST` | `1` | Number of interactive element lists to keep verbatim |
+
+`compress_cua_messages()` is called at the start of each think step to trim the history to these limits. Older element lists are replaced with a placeholder to save tokens.
+
+### Cache invalidation
+
+`invalidate_agent_elements_cache()` resets the Playwright page metadata (`_last_browser_state`, `_last_interactive_selectors`, `_last_interactive_elements_full`) whenever the agent navigates to a new page or when `_clear_playwright_browser_snapshot()` is called explicitly.
+
+---
+
+## Visual context injection
+
+`CUALLMManager` overrides the standard LLM payload construction to include screenshots as image content blocks.
+
+### Before/after screenshot comparison
+
+On the first step, the LLM receives a single screenshot labeled "Initial screen state." On subsequent steps, it receives:
+
+1. The **previous screenshot** (the screen state before the last action)
+2. The **current screenshot** (the screen state after the last action)
+
+The prompt instructs the LLM to compare before/after states and verify each action's outcome before planning the next step.
+
+### Image encoding
+
+Screenshots are base64-encoded via `encode_image_for_llm_with_limit()`. If the encoded image exceeds the size limit, the agent falls back to a text-only UI summary and logs a warning.
+
+---
+
+## File emission
+
+`CUA_OrchestratorAgent` automatically detects files created during a session and emits them to the user.
+
+### Detection methods
+
+1. **Python AST scan** (`_extract_written_files_python()`): Walks the Python AST of `run_python` code arguments looking for file write patterns — `open()` with write modes, `Path.write_text()`, `Path.write_bytes()`, `df.to_csv()`, `plt.savefig()`, `cv2.imwrite()`, `shutil.copy()`, etc.
+
+2. **Shell pattern matching** (`_extract_written_files_shell()`): Applies regex patterns to `execute_command` arguments looking for redirection operators (`>`, `>>`), `tee`, `touch`, `cp`, `mv` targeting write-eligible paths.
+
+3. **Stdout write announcements** (`_STDOUT_WRITE_ANNOUNCE_RES`): Scans tool output for phrases like "wrote", "saved", "created", "exported" followed by a path.
+
+Only paths under `/home/user`, `/tmp`, and `/var/tmp` are tracked.
+
+Detected paths are accumulated in `_pending_emitted_files` and passed to the parent agent via `communicate(emitted_files=[...])`. Files must be included in `emitted_files` — without this, files on the Cloud PC are not accessible to the user.
+
+---
+
+## Structured reasoning protocol
+
+The agent's system prompt mandates a structured JSON reasoning object before each action:
+
+```json
+{
+  "reasoning": {
+    "efficiency_and_sanity_check": "Is there a non-GUI way to get this? Check with Planner if unsure.",
+    "expectation": "What specific change was expected from the last action?",
+    "observation": "What does the current screenshot show? Objective description.",
+    "comparison": "Does the observation match the expectation?",
+    "conclusion": "[SUCCESS] or [FAILURE]",
+    "next_step": "Next logical action. If failure, must be a recovery action."
+  },
+  "actions": [...]
+}
+```
+
+`efficiency_and_sanity_check` is the critical gate: the agent must always consider whether `DataFetcherAgent` could retrieve the needed data faster before starting a GUI sequence.
+
+### Interaction description requirements
+
+For tools with `vlm_required=True`, the LLM must provide an `interaction_description` that includes:
+
+1. **General location**: Where on screen (e.g. "in the taskbar at the bottom")
+2. **Visual features**: Color, shape, icon, label (e.g. "solid blue circular icon with white paper airplane")
+3. **Relative positioning**: What it is next to (e.g. "to the right of the Chrome icon")
+4. **Proactive disambiguation**: Explicit `IGNORE` instructions for nearby elements that could be confused with the target
+
+---
+
+## Bundle rules
+
+The LLM may issue up to 5 actions in a single bundle. Key constraints enforced by the system prompt:
+
+- After a `type` action, no further actions may appear in the same bundle
+- Before `scroll`, a `hover` on the center of the scrollable area must precede it in the same bundle
+- A `type` action must always be preceded by a `click` on the target field in the same bundle (Safe Typing Protocol)
+- The screen state after action N must be predictable for action N+1 to proceed; if uncertain, do not bundle
+
+---
+
+## Workflow artifacts
+
+`CUA_OrchestratorAgent.ARTIFACTS_GUIDANCE` instructs the agent to write Markdown workflow reports for non-trivial sessions:
+
+- **When mandatory**: Exploration tasks mapping an app's UI; multi-step automation (5+ GUI actions) with lasting value
+- **Not needed**: Single click / quick action
+
+Reports are written to `{reports_dir}<short_uuid>_<APP_OR_FLOW>.md` via `run_python`. Key screenshots are saved to `{attachments_dir}` and referenced inline.
+
+The termination message to the parent always includes the artifact path plus a 2–3 sentence summary. Full step lists are not inlined into the chat message.
+
+---
+
+## Configuration reference
+
+The following `AgentConfig` fields are specific to CUA operation. All are populated from the active model profile or environment variables.
+
+| Field | Env var | Default | Description |
+|---|---|---|---|
+| `cua_orchestrator_model` | — | From profile | VLM model for the main CUA think loop |
+| `vlm_model` | — | From profile | VLM model used by the grounding module |
+| `grounding_strategy` | — | `"qwen_computer_use"` | Grounding pipeline to use (see strategies above) |
+| `vlm_image_quality` | — | `65` | JPEG quality % for screenshot encoding |
+| `vlm_image_max_size` | — | `1600` | Maximum image dimension (px) before downscaling |
+| `enable_accessibility_tree` | — | `False` | If `True`, sets `gui_observation_mode="a11y_dom_screenshot"` |
+| `playwright_enabled` | `PLAYWRIGHT_ENABLED` | `False` | Enables Playwright browser integration |
+
+### Environment variables
+
+| Env var | Default | Description |
+|---|---|---|
+| `GUI_ACTION_DELAY` | `0.3` | Seconds to wait between GUI actions in a bundle |
+| `CUA_MAX_HISTORY_PAIRS` | `6` | Max user/assistant pairs in Playwright mode history |
+| `CUA_ELEMENTS_KEEP_LAST` | `1` | Interactive element lists to keep verbatim |
+| `CUA_ACTIVATE_WINDOW_RECOVERY_WAIT_SECONDS` | `1.5` | Wait between activate_window retry attempts |
+| `CUA_ACTIVATE_WINDOW_RECOVERY_RETRIES` | `2` | Number of activate_window retry attempts |
+
+---
+
+## Agent capability matrix (CUA position)
+
+| Agent | Spawns children | Terminate Guard | Vision | Sandbox | MCP tools |
+|---|---|---|---|---|---|
+| `PlannerAgent` | Yes (spawns CUA) | Yes | No | No | No |
+| `CUA_OrchestratorAgent` | **No** | No | **Yes** | No | No |
+
+`CUA_OrchestratorAgent.subagent_classes = {}` — it is a leaf node. If multiple GUI tasks must run in parallel, the parent `PlannerAgent` spawns multiple `CUA_OrchestratorAgent` instances and coordinates them via separate plan steps.
+
+---
+
+## Inter-agent communication
+
+`CUA_OrchestratorAgent` communicates upward to its parent `PlannerAgent` via the standard `communicate()` tool:
+
+```python
+# Request data from parent instead of doing browser search
+communicate(to=PARENT_ID, message_type="inform", content="REQUEST: Please research [X].")
+# Then wait for reply
+wait(seconds=60)
+```
+
+The agent is explicitly instructed to use this pattern when a search or API call would be faster than browser navigation. The Planner delegates to `DataFetcherAgent` and forwards the result back.
+
+### Termination message format
+
+When done, the CUA agent calls:
+
+```python
+communicate(
+    to="parent",
+    message_type="result",
+    content="**Status:** SUCCESS\n**Facts:** ...\n**Extracted Data:** ...\n**Created Files:** ...",
+    emitted_files=["/home/user/Desktop/report.docx"],
+)
+```
+
+The `content` is a technical Markdown report for the Planner, not a user-facing message. The `emitted_files` list is the only mechanism for delivering Cloud PC files to the user.

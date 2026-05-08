@@ -1,0 +1,399 @@
+---
+title: "Session Service"
+description: "Chat session lifecycle, lock management, agent plan recovery, and session cleanup — the coordination layer between REST, Socket.IO, and the agent pipeline."
+---
+
+## Overview
+
+Session management in Skygen spans four cooperating layers:
+
+| Layer | Location | Role |
+|---|---|---|
+| **REST router** | `routers/chat/session_router.py` | CRUD endpoints, device/emplogent validation |
+| **Repository** | `repositories/chat_session_repo.py` | Soft-delete CRUD, pagination, restore |
+| **Session cleanup** | `services/session_cleanup.py` | Terminal response finalization, lock release |
+| **Lock helpers** | `services/device_lock_manager.py` | Redis device + session locking |
+
+All session mutations broadcast real-time events to the user's connected clients via Socket.IO (`/user` namespace, `send_to_user`). Broadcasts are **fire-and-forget** — failures are logged but never propagate to the HTTP response.
+
+---
+
+## REST Endpoints
+
+Base path: `/sessions`  
+Auth: `get_current_active_user` (JWT bearer token required on all routes)
+
+---
+
+### POST /sessions
+
+Create a new chat session.
+
+**Request body** (`ChatSessionCreate`):
+
+<ParamField body="device_id" type="uuid | null">
+  Optional device to associate. If provided the device must belong to the authenticated user. Sessions without a device are "chat-only" — full conversations without device control.
+</ParamField>
+
+<ParamField body="emplogent_id" type="uuid | null">
+  Optional Emplogent (AI persona) to bind to this session. Must be owned by the authenticated user.
+</ParamField>
+
+<ParamField body="title" type="str | null">
+  Optional session title. Logged (truncated to 200 chars).
+</ParamField>
+
+<ParamField body="meta_data" type="dict | null">
+  Arbitrary metadata stored on the session row.
+</ParamField>
+
+**Query params:**
+
+<ParamField query="reuse_existing" type="bool" default="false">
+  If `true` and an active session exists for the same user+device, return it instead of creating a new one.
+</ParamField>
+
+**Returns:** `ChatSessionRead` (201 Created)
+
+**Raises:**
+- `404` — device not found
+- `403` — device does not belong to the authenticated user
+- `404` — emplogent not found or owned by another user
+
+**Side effects:** Emits `session_created` Socket.IO event to the user.
+
+**Enforcement note:** Even admins must use their own devices. The message processing pipeline requires `device.user_id == session.user_id`.
+
+---
+
+### GET /sessions
+
+List the authenticated user's sessions with pagination.
+
+**Query params:**
+
+<ParamField query="limit" type="int" default="20">
+  Page size. Clamped to [1, 100].
+</ParamField>
+
+<ParamField query="offset" type="int" default="0">
+  Zero-based offset. Clamped to ≥ 0.
+</ParamField>
+
+**Returns:**
+
+```json
+{
+  "items": [ChatSessionRead, ...],
+  "total": 47,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**Performance:** Single query using a window function (`COUNT() OVER()`) — no separate count query needed.
+
+---
+
+### GET /sessions/{session_id}
+
+Fetch a single session by ID.
+
+**Raises:**
+- `404` — session not found
+- `403` — session belongs to another user (non-admin)
+
+---
+
+### PATCH /sessions/{session_id}
+
+Update session metadata or title.
+
+**Request body** (`ChatSessionUpdate`): any subset of session fields (uses `exclude_unset=True` to apply only provided fields).
+
+**Returns:** `ChatSessionRead`
+
+**Side effects:** Emits `session_updated` Socket.IO event.
+
+---
+
+### DELETE /sessions/{session_id}
+
+Soft-delete a session (sets `deleted_at`, does not remove data).
+
+**Returns:** 204 No Content
+
+**Side effects:**
+1. Calls `_release_session_locks()` before deletion — releases device lock and Cloud PC session binding so any in-flight agent task is cleanly unblocked rather than left holding stale locks that cause FK violations on message save.
+2. Emits `session_deleted` Socket.IO event with `{"session_id": ..., "permanent": false}`.
+
+---
+
+### DELETE /sessions/{session_id}/permanent
+
+Hard-delete a session and all its messages. **Irreversible.**
+
+**Returns:** 204 No Content
+
+**Side effects:**
+1. Calls `_release_session_locks()` — same lock release as soft delete.
+2. Calls `hard_delete_session()` — removes the session and cascades to messages.
+3. Emits `session_deleted` Socket.IO event with `{"permanent": true}`.
+
+---
+
+### POST /sessions/{session_id}/restore
+
+Restore a soft-deleted session.
+
+**Raises:**
+- `404` — session not found
+- `400` — session is not deleted (nothing to restore)
+- `403` — session belongs to another user
+
+**Returns:** `ChatSessionRead`
+
+**Side effects:** Emits `session_restored` Socket.IO event.
+
+---
+
+### GET /sessions/{session_id}/plan
+
+Retrieve the most recent non-superseded agent plan for a session.
+
+**Purpose:** Used by the frontend on page reload to restore the expandable step list without re-running the agent. Plans are stored as `chat_messages` with `role=system`, `type=ui_meta_update`, and `ui_meta.type=plan`.
+
+**Returns:**
+
+```json
+{"plan": {/* plan payload */}}
+```
+
+or `{"plan": null}` if no plan exists.
+
+**Query:** Direct SQL against `chat_messages` (no ORM model):
+
+```sql
+SELECT meta_data->'ui_meta' AS plan_payload
+FROM chat_messages
+WHERE session_id = :sid
+  AND role = 'system'
+  AND meta_data->>'type' = 'ui_meta_update'
+  AND meta_data->'ui_meta'->>'type' = 'plan'
+  AND COALESCE(meta_data->>'status', '') != 'superseded'
+ORDER BY created_at DESC
+LIMIT 1
+```
+
+---
+
+### GET /sessions/{session_id}/summary
+
+Get a filtered view of session history (user queries + final assistant responses only; intermediate `agent_step` messages excluded).
+
+**Query params:**
+
+<ParamField query="max_messages" type="int" default="10">
+  Maximum messages to return. Clamped to [1, 50]. Returns the most recent `max_messages` qualifying messages.
+</ParamField>
+
+**Returns:**
+
+```json
+{
+  "session_id": "...",
+  "total_messages": 84,
+  "summary_messages": 10,
+  "messages": [
+    {"id": "...", "role": "user", "content": "...", "created_at": "..."},
+    {"id": "...", "role": "assistant", "content": "...", "created_at": "...", "meta_data": {...}}
+  ]
+}
+```
+
+**Inclusion rules:**
+- All `role=user` messages are included.
+- `role=assistant` messages are included only if `meta_data.status` is `"completed"` or `"error"`, OR if the content contains the string `"summary"` (case-insensitive).
+- All other messages (agent steps, intermediate status updates) are excluded.
+
+---
+
+## Session Cleanup (`services/session_cleanup.py`)
+
+Unified finalization logic extracted from two duplicate code paths: Socket.IO `handle_new_message` and Worker `AgentResponseHandler`. Both call `finalize_agent_response()` after saving the terminal agent message.
+
+### finalize_agent_response()
+
+```python
+async def finalize_agent_response(
+    session_id: str,
+    user_id: str,
+    device_id: Optional[str],
+    message_id: Optional[str],
+    content: Optional[str],
+    meta_data: dict,
+    is_scheduled: bool = False,
+    notify_via: str = "socketio",
+) -> None
+```
+
+Unified cleanup after a terminal agent response (`completed` / `error` / `cancelled`).
+
+**Steps performed in sequence:**
+
+1. Unlock session in Redis (`device_lock_manager.unlock_session`)
+2. Unlock device in Redis (`device_lock_manager.unlock_device`)
+3. If `is_scheduled`: update scheduled task run status
+4. Release Cloud PC control (via `CloudPCService.release_control`)
+5. Notify device that the task completed (via Socket.IO `/device` namespace or RabbitMQ depending on `notify_via`)
+
+**Attachment processing is intentionally outside this function.** `emitted_files` arrive on non-terminal `agent_response` messages (CommunicateTool/WebEndpoint path) where the agent has no `status` field. Callers run `process_emitted_attachments()` directly whenever they see `emitted_files`.
+
+<ResponseField name="notify_via" type="str">
+`"socketio"` (default) or `"rabbitmq"` — selects the notification channel for device task-complete signal.
+</ResponseField>
+
+**Called by:**
+- `app/socketio/agent_handlers/message_handlers.py` — `handle_new_message` (Socket.IO path)
+- `app/worker/handlers/agent_response_handler.py` — `AgentResponseHandler` (Worker/RabbitMQ path)
+
+---
+
+### process_emitted_attachments()
+
+```python
+async def process_emitted_attachments(
+    meta_data: dict,
+    user_id: str,
+    session_id: str,
+    message_id: str,
+) -> list
+```
+
+Process `emitted_files` from agent meta_data. Delegates to `AttachmentPipeline.process()`.
+
+**Returns:** List of serialized attachment dicts for forwarding over WebSocket.
+
+---
+
+## Lock Management (`services/device_lock_manager.py`)
+
+Redis-based device locking that prevents race conditions when multiple tasks target the same device.
+
+**Lock TTL:** 3600 seconds (auto-expire safety net).
+
+### lock_device()
+
+```python
+async def lock_device(
+    redis_client: redis.Redis,
+    device_id: str,
+    session_id: str,
+    user_id: str,
+) -> bool
+```
+
+Atomically lock a device for a specific session using Lua (`_LOCK_OR_REACQUIRE_LUA`).
+
+**Lua return values:**
+- `1` — newly acquired (key did not exist)
+- `2` — same-session re-acquire (TTL refreshed, `locked_at` preserved)
+- `0` — held by a different session (caller must back off)
+
+Python returns `True` for 1 or 2, `False` for 0.
+
+**Same-session re-acquire:** Only the TTL is bumped (via `EXPIRE`); `locked_at` is preserved to avoid masking staleness.
+
+---
+
+### unlock_device()
+
+```python
+async def unlock_device(
+    redis_client: redis.Redis,
+    device_id: str,
+    session_id: str,
+) -> bool
+```
+
+Release a device lock. Only the session that holds the lock can release it (atomic compare-and-delete).
+
+---
+
+### lock_session() / unlock_session()
+
+```python
+async def lock_session(redis_client, session_id: str) -> bool
+async def unlock_session(redis_client, session_id: str) -> None
+```
+
+Session-level Redis lock. Used to prevent concurrent message processing for the same chat session. `lock_session` uses SETNX; `unlock_session` unconditionally deletes the key.
+
+---
+
+### CloudPCAccessManager
+
+```python
+class CloudPCAccessManager:
+    def __init__(self, redis_client: redis.Redis)
+    async def acquire(self, session_id: str, cpc_id: str) -> bool
+    async def release(self, session_id: str, force: bool = False) -> bool
+```
+
+High-level facade over device lock + Cloud PC session binding. Used by `_release_session_locks()` in the session router for unified lock cleanup on session deletion.
+
+<ResponseField name="force" type="bool">
+  When `True`, release even if the session doesn't match the current binding.
+</ResponseField>
+
+---
+
+## Activity Tracking (`services/activity_tracker.py`)
+
+### touch_user_activity()
+
+```python
+async def touch_user_activity(user_id: str) -> None
+```
+
+Throttled update of `User.last_active_at`. Uses Redis key `user_active:{user_id}` with 60-second TTL as a write throttle — at most one DB write per user per minute regardless of request frequency.
+
+**Behavior on Redis failure:** Falls through to the DB write anyway so activity tracking is never silently lost.
+
+**Skips:** `user_id=None` and `user_id="superadmin"`.
+
+---
+
+### fire_and_forget_touch()
+
+```python
+def fire_and_forget_touch(user_id: str) -> None
+```
+
+Schedule `touch_user_activity()` as an asyncio background task. No `await` required. Silently no-ops if no running event loop.
+
+**Called by:** Auth middleware, Socket.IO connection handlers — any path that wants to record user activity without blocking the response.
+
+---
+
+## Related Models and Schemas
+
+| Name | Location | Purpose |
+|---|---|---|
+| `ChatSession` | `models/chat_sessions.py` | ORM row with soft-delete, device binding, emplogent binding |
+| `ChatSessionCreate` | `schemas/chat_session.py` | POST body: title, device_id, emplogent_id, meta_data |
+| `ChatSessionUpdate` | `schemas/chat_session.py` | PATCH body: any subset of session fields |
+| `ChatSessionRead` | `schemas/chat_session.py` | Response shape; validated from ORM via `model_validate` |
+
+---
+
+## Socket.IO Events Emitted
+
+| Event | When | Payload |
+|---|---|---|
+| `session_created` | POST /sessions | Full `ChatSessionRead` dict |
+| `session_updated` | PATCH /sessions/{id} | Full `ChatSessionRead` dict |
+| `session_deleted` | DELETE /sessions/{id} | `{"session_id": str, "permanent": bool}` |
+| `session_restored` | POST /sessions/{id}/restore | Full `ChatSessionRead` dict |
+
+All events are sent to the `/user` namespace via `send_to_user(user_id, event, payload)`. Failures are swallowed — never propagated to the REST caller.

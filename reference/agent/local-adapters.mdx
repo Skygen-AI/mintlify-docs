@@ -1,0 +1,601 @@
+---
+title: "Local Adapters"
+description: "LocalPlaywrightClient, LocalDeviceAdapter, DeviceActionRegistry, PlaywrightToolRegistry — automation adapters for local device execution."
+---
+
+## Overview
+
+The `Agent/Utilities/LocalAdapters/` directory contains in-process automation adapters that run directly on the host machine (or a target machine with Python access) — as opposed to Cloud PC adapters, which communicate over WebSocket to a remote VM.
+
+There are two independent adapters:
+
+- **`LocalPlaywrightClient`** — controls a Chromium/Chrome browser using Playwright (in-process).
+- **`LocalDeviceAdapter`** — controls OS-level mouse, keyboard, and screen via PyAutoGUI.
+
+Both adapters use registry-based dispatch so that individual actions can be registered, replaced, or extended without modifying the adapter itself.
+
+---
+
+## LocalPlaywrightClient
+
+**File:** `Agent/Utilities/LocalAdapters/LocalPlaywrightClient.py`
+
+An in-process Playwright browser client. Serves as a drop-in replacement for `PlaywrightBrowserClient`, which proxies browser commands through a Docker backend. `LocalPlaywrightClient` launches or connects to a browser directly inside the running Python process.
+
+### Constructor
+
+```python
+def __init__(self, *, headless: bool | None = None)
+```
+
+If `headless` is `None`, the value is read from the `PLAYWRIGHT_HEADLESS` environment variable (any non-empty value → headless). Defaults to `False` (visible browser) when the env var is unset.
+
+The constructor only stores configuration; no browser is launched until the first tool call (lazy initialization).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PLAYWRIGHT_HEADLESS` | unset (False) | Any non-empty value runs the browser headless |
+| `PLAYWRIGHT_TIMEOUT` | `10000` | Default navigation/action timeout in milliseconds |
+| `PLAYWRIGHT_MAX_PAGES` | `5` | Maximum number of tracked open pages |
+| `PLAYWRIGHT_VIEWPORT_WIDTH` | `1280` | Viewport width in pixels |
+| `PLAYWRIGHT_VIEWPORT_HEIGHT` | `720` | Viewport height in pixels |
+| `PLAYWRIGHT_USER_DATA_DIR` | unset | Path to a Chrome user data dir; enables persistent context with saved cookies and extensions |
+| `PLAYWRIGHT_CDP_URL` | unset | Chrome DevTools Protocol endpoint; connects to an existing browser instead of launching a new one |
+| `PLAYWRIGHT_CDP_CONNECT_URL` | unset | Alias for `PLAYWRIGHT_CDP_URL` (checked second) |
+| `PLAYWRIGHT_CHROME_PROFILE` | unset | Named Chrome profile directory inside `PLAYWRIGHT_USER_DATA_DIR` |
+| `PLAYWRIGHT_CHANNEL` | `chrome` | Playwright browser channel (`chrome`, `chromium`, `msedge`) |
+| `PLAYWRIGHT_CDP_AUTO_LAUNCH_CHROME` | unset | When set with a CDP URL, auto-launches Chrome before connecting |
+
+### Launch Modes
+
+Three exclusive launch modes are selected in priority order at the first tool call:
+
+1. **CDP connect** — when `PLAYWRIGHT_CDP_URL` or `PLAYWRIGHT_CDP_CONNECT_URL` is set. Attaches to an already-running Chrome instance.
+2. **Persistent context** — when `PLAYWRIGHT_USER_DATA_DIR` is set. Launches Chrome with an existing profile directory, preserving cookies, local storage, and extensions across restarts.
+3. **Fresh launch** — default. Launches a clean browser with no persistent state.
+
+### Element Reference System (`@eN`)
+
+`LocalPlaywrightClient` uses a reference numbering system to identify interactive elements: `@e1`, `@e2`, etc. References are assigned per navigation call via an extraction pipeline that tries four strategies in order:
+
+1. **Rich JS snapshot** (`_extract_via_snapshot_refs`) — custom JavaScript that walks the accessibility tree and assigns numbered refs. Fastest and most feature-complete.
+2. **`locator.aria_snapshot()`** — Playwright v1.49+ native ARIA snapshot, used as fallback when JS injection fails.
+3. **Deprecated `accessibility.snapshot()`** — Playwright legacy accessor, used when aria_snapshot is unavailable.
+4. **DOM fallback query** — raw CSS selector query for interactive elements; returns limited metadata.
+
+Each element is returned as a dict with keys: `ref` (`@e1`…), `role`, `name`, `selector`, `tag`, `bbox`, `center`, `text`, `href`, `value`, `checked` (where applicable).
+
+### Three-Tier Selector Cascade
+
+When an action targets a `@eN` reference, `_resolve_ref()` returns a tuple:
+
+```python
+(primary_selector, fallback_selector | None, center_coords | None)
+```
+
+Actions like `_click` and `_fill` attempt resolution in order:
+
+1. **Role-based selector** — the most semantic option, constructed from `role` + `name` attributes.
+2. **CSS selector fallback** — the raw CSS selector stored in the element ref.
+3. **Coordinate click** — if both selectors fail, clicks at the `center` pixel coordinates.
+
+This cascade makes automation self-healing: a page re-render that shifts selectors still succeeds via coordinates.
+
+### `execute(tool_name, args, context)`
+
+Main dispatch entry point. Delegates to `PlaywrightToolRegistry.Dispatch()`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `tool_name` | `str` | One of the 11 registered tool names |
+| `args` | `dict` | Tool-specific arguments |
+| `context` | `Any` | Passed through to the handler; typically ignored |
+
+Returns a `dict` with at minimum `{"success": bool}`.
+
+---
+
+### Navigation Methods
+
+#### `_navigate(url, page_id)`
+
+Navigates the specified page to a URL and extracts interactive elements.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `url` | `str` | required | Full URL to navigate to |
+| `page_id` | `str \| None` | `None` | Target page ID; if `None`, uses the current active page |
+
+Returns:
+
+```python
+{
+    "success": bool,
+    "page_id": str,
+    "url": str,
+    "title": str,
+    "interactive_elements": list[dict]  # @eN refs
+}
+```
+
+**Tool name:** `playwright_navigate`
+
+---
+
+### Interaction Methods
+
+#### `_click(ref, page_id, button, click_count)`
+
+Clicks on an element identified by a `@eN` reference. Applies the three-tier selector cascade.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | `str` | required | Element reference, e.g. `@e3` |
+| `page_id` | `str \| None` | `None` | Target page; defaults to active page |
+| `button` | `str` | `"left"` | Mouse button: `"left"`, `"right"`, `"middle"` |
+| `click_count` | `int` | `1` | Number of clicks (use `2` for double-click) |
+
+Returns `{"success": bool, "ref": str}`.
+
+**Tool name:** `playwright_click`
+
+---
+
+#### `_fill(ref, value, page_id)`
+
+Clears and fills a text input element identified by a `@eN` reference.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | `str` | required | Element reference |
+| `value` | `str` | required | Text to type into the field |
+| `page_id` | `str \| None` | `None` | Target page |
+
+Returns `{"success": bool, "ref": str, "value": str}`.
+
+**Tool name:** `playwright_fill`
+
+---
+
+### DOM and Content Methods
+
+#### `_get_text(ref, page_id)`
+
+Returns the visible text content of a specific element.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | `str` | required | Element reference |
+| `page_id` | `str \| None` | `None` | Target page |
+
+Returns `{"success": bool, "text": str}`.
+
+**Tool name:** `playwright_get_text`
+
+---
+
+#### `_get_page_content(page_id)`
+
+Returns the page title, URL, and a truncated plaintext representation of the page body.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page_id` | `str \| None` | `None` | Target page |
+
+Returns:
+
+```python
+{
+    "success": bool,
+    "title": str,
+    "url": str,
+    "content": str,      # Truncated to 8000 characters
+    "truncated": bool
+}
+```
+
+**Tool name:** `playwright_get_page_content`
+
+---
+
+#### `_get_interactive_elements(page_id)`
+
+Re-runs the element extraction pipeline on the current page state without navigating.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page_id` | `str \| None` | `None` | Target page |
+
+Returns `{"success": bool, "interactive_elements": list[dict]}`.
+
+**Tool name:** `playwright_get_interactive_elements`
+
+---
+
+#### `_evaluate(expression, page_id)`
+
+Evaluates a JavaScript expression in the page context and returns its result.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `expression` | `str` | required | JavaScript expression to evaluate |
+| `page_id` | `str \| None` | `None` | Target page |
+
+Returns `{"success": bool, "result": Any}`.
+
+**Tool name:** `playwright_evaluate`
+
+---
+
+### Screenshot Method
+
+#### `_screenshot(page_id, full_page)`
+
+Captures a screenshot of the current page as a base64-encoded PNG.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page_id` | `str \| None` | `None` | Target page |
+| `full_page` | `bool` | `False` | When `True`, captures the full scrollable page |
+
+Returns:
+
+```python
+{
+    "success": bool,
+    "screenshot_base64": str,   # Base64-encoded PNG
+    "screenshot_length": int,   # Byte length of decoded image
+    "full_page": bool
+}
+```
+
+**Tool name:** `playwright_screenshot`
+
+---
+
+### Wait Method
+
+#### `_wait_for(selector, page_id, timeout, state)`
+
+Waits for a CSS selector to reach a specified visibility state.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `selector` | `str` | required | CSS selector to wait for |
+| `page_id` | `str \| None` | `None` | Target page |
+| `timeout` | `int` | `PLAYWRIGHT_TIMEOUT` | Wait timeout in milliseconds |
+| `state` | `str` | `"visible"` | One of: `"attached"`, `"detached"`, `"visible"`, `"hidden"` |
+
+Returns `{"success": bool, "selector": str, "state": str}`.
+
+**Tool name:** `playwright_wait_for`
+
+---
+
+### Page Management Methods
+
+#### `_list_pages()`
+
+Returns metadata about all currently tracked open pages.
+
+Returns `{"success": bool, "pages": list[dict]}` where each page dict contains `page_id`, `url`, `title`.
+
+**Tool name:** `playwright_list_pages`
+
+---
+
+#### `_close_page(page_id)`
+
+Closes the specified page and removes it from the tracker.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page_id` | `str` | required | Page ID to close |
+
+Returns `{"success": bool, "page_id": str}`.
+
+**Tool name:** `playwright_close_page`
+
+---
+
+### Registered Tools Summary
+
+| Tool Name | Method | Category |
+|-----------|--------|----------|
+| `playwright_navigate` | `_navigate` | Navigation |
+| `playwright_click` | `_click` | Interaction |
+| `playwright_fill` | `_fill` | Interaction |
+| `playwright_get_text` | `_get_text` | DOM |
+| `playwright_get_page_content` | `_get_page_content` | DOM |
+| `playwright_get_interactive_elements` | `_get_interactive_elements` | DOM |
+| `playwright_evaluate` | `_evaluate` | DOM |
+| `playwright_screenshot` | `_screenshot` | Screenshot |
+| `playwright_wait_for` | `_wait_for` | Wait |
+| `playwright_list_pages` | `_list_pages` | Pages |
+| `playwright_close_page` | `_close_page` | Pages |
+
+---
+
+## PlaywrightToolRegistry
+
+**File:** `Agent/Utilities/LocalAdapters/PlaywrightTools/Registry.py`
+
+A name-keyed registry for async Playwright tool handlers. `LocalPlaywrightClient.execute()` delegates to `PlaywrightToolRegistry.Dispatch()`.
+
+### Handler Signature
+
+```python
+async def handler(**args) -> str | dict
+```
+
+Handlers receive keyword arguments from the tool call. Return value can be either a `str` (wrapped automatically) or a `dict`.
+
+`Dispatch` normalizes all return values to:
+
+```python
+{
+    "success": bool,
+    "result": dict,
+    "error": str | None
+}
+```
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `Register(name, handler)` | Registers an async handler under a tool name |
+| `Unregister(name)` | Removes a handler by name |
+| `Get(name)` | Returns the handler callable or raises `KeyError` |
+| `Names()` | Returns a list of all registered tool names |
+| `__contains__(name)` | `True` if a handler is registered under `name` |
+| `__len__()` | Number of registered tools |
+| `Dispatch(name, **kwargs)` | Calls the named handler, normalizes result, catches exceptions |
+
+---
+
+## LocalDeviceAdapter
+
+**File:** `Agent/Utilities/LocalAdapters/LocalDeviceAdapter.py`
+
+An in-process device adapter backed by PyAutoGUI. Replaces `AgentWebSocketClient` (the Cloud PC WebSocket adapter) for local execution. Implements the same `execute_action` interface so agent code is portable across environments.
+
+### Constructor
+
+```python
+def __init__(self, action_registry: DeviceActionRegistry | None = None)
+```
+
+If `action_registry` is `None`, `BuildDefaultRegistry()` is called to populate the 13 built-in device actions.
+
+### Public Methods
+
+#### `execute_action(device_id, action_type, parameters, timeout)`
+
+Dispatches an action to the registry.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `device_id` | `str` | required | Ignored (present for API compatibility with Cloud PC adapter) |
+| `action_type` | `str` | required | Action name, e.g. `"CLICK"`, `"TYPE"`, `"SCREENSHOT"` |
+| `parameters` | `dict` | required | Action-specific parameter dict |
+| `timeout` | `float \| None` | `None` | Not enforced locally; present for API compatibility |
+
+Returns `{"success": bool, "result": dict}`.
+
+#### `disconnect()`
+
+No-op. Present for API compatibility with remote adapters (which close WebSocket connections).
+
+---
+
+### macOS TYPE Behavior
+
+The `TYPE` built-in action has special handling for non-ASCII text on macOS.
+
+**Detection:** Any character with `ord(ch) > 127` triggers the clipboard path.
+
+**Control flow:**
+
+```python
+prefer_clipboard = os.getenv("LOCAL_TYPE_PASTE_MODE", "auto")
+needs_clipboard  = any(ord(ch) > 127 for ch in text)
+use_clipboard    = prefer_clipboard == "always" or (prefer_clipboard == "auto" and needs_clipboard)
+```
+
+When clipboard mode is active:
+1. Text is written to the macOS clipboard via `pbcopy`.
+2. The content is pasted via `Cmd+V`.
+
+When Cyrillic text is detected and `LOCAL_TYPE_ENSURE_LAYOUT=true`, the adapter switches the keyboard layout (up to `LOCAL_LAYOUT_SWITCH_ATTEMPTS` attempts, default 3) using the `Control+Space` shortcut before typing.
+
+| Env Variable | Default | Description |
+|-------------|---------|-------------|
+| `LOCAL_TYPE_PASTE_MODE` | `auto` | `auto` — clipboard for non-ASCII only; `always` — always use clipboard |
+| `LOCAL_TYPE_ENSURE_LAYOUT` | unset | Set to `true` to enable Cyrillic layout detection and switching |
+| `LOCAL_LAYOUT_SWITCH_ATTEMPTS` | `3` | Max `Control+Space` presses before giving up on layout switch |
+
+---
+
+## DeviceActionRegistry
+
+**File:** `Agent/Utilities/LocalAdapters/DeviceActions/Registry.py`
+
+A name-keyed registry for device action handlers. Each built-in action is registered here; custom actions can be added or replaced.
+
+### Handler Signature
+
+```python
+def handler(adapter: LocalDeviceAdapter, params: dict) -> dict | None
+```
+
+Handlers can be sync or async. `adapter` is the `LocalDeviceAdapter` instance so handlers can call back into the adapter if needed.
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `Register(name, handler)` | Registers a sync or async handler |
+| `Unregister(name)` | Removes a handler by name |
+| `Get(name)` | Returns the handler or raises `KeyError` |
+| `Names()` | Returns a list of all registered action names |
+| `__contains__(name)` | `True` if the action is registered |
+| `__len__()` | Number of registered actions |
+| `Dispatch(name, adapter, params)` | Calls the named handler; awaits if async |
+
+### `BuildDefaultRegistry()`
+
+Factory function that calls `BuiltinActions.RegistryFor()` and returns a `DeviceActionRegistry` pre-loaded with all 13 built-in actions.
+
+### Built-in Actions
+
+| Action Name | Description |
+|-------------|-------------|
+| `SCREENSHOT` | Captures the full screen with PyAutoGUI; returns `screenshot_base64` |
+| `CLICK` | Moves the mouse to `(x, y)` and clicks |
+| `HOVER` | Moves the mouse to `(x, y)` without clicking |
+| `MOUSE_DOWN` | Presses and holds a mouse button |
+| `MOUSE_UP` | Releases a held mouse button |
+| `TYPE` | Types text with macOS clipboard-paste fallback (see above) |
+| `PRESS` | Presses a named key (e.g. `"enter"`, `"tab"`) |
+| `HOTKEY` | Presses a key combination (e.g. `["ctrl", "c"]`) |
+| `SCROLL` | Scrolls the mouse wheel at `(x, y)` |
+| `OPEN_FILE_OR_APP` | Opens a file or application by path |
+| `EXECUTE_COMMAND` | Runs a shell command via `subprocess` |
+| `RUN_PYTHON` | Evaluates a Python expression string with `eval()` |
+| `GET_ACCESSIBILITY_TREE` | Stub — returns empty result |
+
+---
+
+## Sandbox Terminals
+
+**Directory:** `Agent/Utilities/Toolkits/sandbox/terminal/`
+
+Two terminal implementations provide a persistent shell session with marker-based output demarcation. Both support the same high-level `execute()` API; the difference is where commands run.
+
+| | DockerSession / AsyncDockerTerminal | LocalSession / AsyncLocalTerminal |
+|--|-------------------------------------|-----------------------------------|
+| **Target** | An existing Docker container | The host machine filesystem |
+| **Communication** | Docker socket (`exec_create` + `exec_start`) | `asyncio` subprocess (bash) |
+| **Isolation** | Container filesystem | Host filesystem with a Python venv |
+| **Use case** | E2B-style sandboxed tasks | Local development, scripting |
+
+---
+
+## AsyncDockerTerminal
+
+**File:** `Agent/Utilities/Toolkits/sandbox/terminal/docker_shell.py`
+
+High-level async context manager for running commands inside an existing Docker container.
+
+### Constructor
+
+```python
+def __init__(
+    self,
+    container,                   # str container ID or docker.models.containers.Container
+    working_dir: str = "/workspace",
+    env_vars: dict | None = None,
+    default_timeout: int = 60,
+    docker_client=None,          # docker.DockerClient
+    api_client=None              # docker.APIClient
+)
+```
+
+### Usage Pattern
+
+```python
+async with AsyncDockerTerminal(container_id, working_dir="/workspace") as term:
+    result = await term.execute("pip install httpx")
+    print(result["output"])
+```
+
+### `init()`
+
+Called automatically by `__aenter__`. Creates the working directory inside the container and opens a `DockerSession`.
+
+### `execute(command, timeout)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `command` | `str` | required | Shell command to run inside the container |
+| `timeout` | `int` | `default_timeout` | Seconds to wait for the command to complete |
+
+Returns `{"success": bool, "output": str, "exit_code": int}`.
+
+Dangerous patterns (e.g. `rm -rf /`) are blocked before sending to the container.
+
+### `DockerSession` (low-level)
+
+`DockerSession` manages the raw exec session via `docker.APIClient.exec_create` + `exec_start(socket=True)`. Output demarcation uses the marker string `___CMD_COMPLETE___` appended by:
+
+```bash
+printf '\n___CMD_COMPLETE___\n'
+```
+
+The client reads from the socket until the marker appears, then returns the buffered output.
+
+```python
+class DockerSession:
+    def __init__(self, container_id: str, api_client=None)
+```
+
+---
+
+## AsyncLocalTerminal
+
+**File:** `Agent/Utilities/Toolkits/sandbox/terminal/local_shell.py`
+
+High-level async context manager for running commands on the host machine inside a dedicated directory with a Python virtual environment.
+
+### Constructor
+
+```python
+def __init__(
+    self,
+    working_dir: str = ".",
+    venv_name: str = ".venv",
+    env_vars: dict | None = None,
+    default_timeout: int = 60,
+    python_version: str = "python3"
+)
+```
+
+### Usage Pattern
+
+```python
+async with AsyncLocalTerminal(working_dir="/tmp/my-task", venv_name=".venv") as term:
+    await term.execute("pip install requests")
+    result = await term.execute("python my_script.py")
+    print(result["output"])
+```
+
+### `init()`
+
+Called automatically by `__aenter__`. Creates the working directory, creates the Python venv, and opens a `LocalSession`. Session startup sends `echo READY` and waits for the response to confirm the shell is live.
+
+### `execute(command, timeout)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `command` | `str` | required | Shell command to run |
+| `timeout` | `int` | `default_timeout` | Seconds to wait for the command to complete |
+
+Returns `{"success": bool, "output": str, "exit_code": int}`.
+
+Output demarcation uses:
+
+```bash
+echo ___CMD_COMPLETE___
+```
+
+### `LocalSession` (low-level)
+
+`LocalSession` manages the subprocess-based bash session via `asyncio.create_subprocess_shell`. At creation it activates the Python venv (`. {venv_path}/bin/activate`) before the first user command.
+
+```python
+class LocalSession:
+    def __init__(self, working_dir: str, venv_path: str)
+```

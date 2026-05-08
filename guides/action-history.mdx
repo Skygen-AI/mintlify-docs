@@ -1,104 +1,156 @@
 ---
-title: "Action history"
-description: "Read-only audit trail of every UI action the agent performed in your sessions."
+title: "Action History"
+description: "How to retrieve and filter the agent's step-by-step action log for any session."
 ---
 
-Action history is the ledger of every click, key press, screenshot, scroll, and shell command the agent executed on your behalf. It is derived from `ui_meta_update` system messages stored in the session's transcript, rendered into a clean, queryable feed.
+## Overview
 
-Use it for debugging ("what did the agent actually do?"), transparency ("show me every action"), or as a timeline visualization of complex sessions.
+Skygen records every meaningful agent action as a `ui_meta_update` system message in the chat history. The action history API queries these records and returns a structured, filterable list of what the agent did, in which mode, and at what time. This is useful for auditing automation tasks, debugging failed sessions, and showing users a clear timeline of agent activity.
 
-## Data source
+---
 
-There is no separate action_history table. Entries come from `chat_messages` where:
+## Data model
 
-- `role = "system"`
-- `meta_data.type = "ui_meta_update"`
+Each action history item is derived from a `chat_messages` row where `meta_data.type = "ui_meta_update"`. The relevant fields are extracted from `meta_data.ui_meta`:
 
-The backend parses the embedded `ui_meta` JSON and returns a clean shape. A partial index `ix_chat_messages_ui_meta` makes this query fast even on large sessions.
+| Field | Description |
+|-------|-------------|
+| `id` | Message UUID |
+| `session_id` | Chat session the action belongs to |
+| `action_type` | Agent action (e.g. `click`, `type`, `screenshot`, `tool`, `browse`) |
+| `title` | Human-readable label for the action |
+| `detail` | Additional context or description |
+| `tool` | Tool name invoked (for MCP tool calls) |
+| `status` | Execution status from the UI perspective |
+| `timestamp` | When the action was recorded |
 
-## Endpoint
+If `ui_meta.title` is absent, the backend applies fallback labels:
 
-### `GET /action-history`
+| `action_type` | Fallback title |
+|---------------|----------------|
+| `click` | Clicked element |
+| `type` | Typed text |
+| `scroll` | Scrolled page |
+| `screenshot` | Took screenshot |
+| `key` | Pressed key |
+| `wait` | Waited |
+| `drag` | Dragged element |
+| `move` | Moved cursor |
+| `double_click` | Double-clicked |
+| `right_click` | Right-clicked |
 
-Query parameters:
+---
 
-| Param | Type | Default | Purpose |
-|-------|------|---------|---------|
-| `session_id` | UUID | — | Filter to one session |
-| `date_from` | ISO datetime | — | Inclusive lower bound |
-| `date_to` | ISO datetime | — | Inclusive upper bound |
-| `mode` | enum | — | `cua`, `deep_research`, `mcp`, `ask_human` |
-| `limit` | int | 50 | Max 200 |
-| `offset` | int | 0 | Standard offset pagination |
+## API reference
 
-Response:
+### List action history
+
+```http
+GET /action-history
+Authorization: Bearer {token}
+```
+
+<ParamField query="session_id" type="string">
+  Optional. Filter to a specific chat session.
+</ParamField>
+
+<ParamField query="date_from" type="string">
+  Optional. ISO-8601 datetime lower bound (inclusive).
+</ParamField>
+
+<ParamField query="date_to" type="string">
+  Optional. ISO-8601 datetime upper bound (inclusive).
+</ParamField>
+
+<ParamField query="mode" type="string">
+  Optional. Filter by agent mode: `cua`, `deep_research`, `mcp`, `ask_human`.
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Number of items to return. Range: 1–200. Default: 50.
+</ParamField>
+
+<ParamField query="offset" type="integer">
+  Pagination offset. Default: 0.
+</ParamField>
+
+**Response — 200 OK:**
 
 ```json
 {
   "items": [
     {
       "id": "msg-uuid",
-      "session_id": "sess-uuid",
+      "session_id": "session-uuid",
       "action_type": "click",
-      "title": "Click 'Submit'",
-      "detail": "x=642, y=389 in Firefox",
-      "tool": "playwright",
+      "title": "Clicked element",
+      "detail": "button#submit",
+      "tool": null,
       "status": "success",
-      "timestamp": "2026-04-20T15:30:12Z"
+      "timestamp": "2026-05-08T10:23:44.123Z"
     }
   ],
-  "total": 247,
-  "session_id": "sess-uuid"
+  "total": 142,
+  "session_id": "session-uuid"
 }
 ```
 
-Fields:
+<ResponseField name="items" type="array">
+  List of `ActionHistoryItem` objects.
+</ResponseField>
 
-- `action_type` — one of `click`, `type`, `scroll`, `screenshot`, `key`, `wait`, `drag`, `move`, `double_click`, `right_click`, or anything the agent writes to `ui_meta.action_type`
-- `title` — user-friendly label. Falls back to a title derived from `action_type` if null
-- `detail` — extra context (coordinates, command, file path)
-- `tool` — the tool class: `playwright`, `computer_use`, `shell`, etc.
-- `status` — `success`, `failure`, `unknown`
+<ResponseField name="total" type="integer">
+  Total matching records (used for pagination).
+</ResponseField>
 
-## Working examples
+<ResponseField name="session_id" type="string">
+  Session ID filter applied, if any.
+</ResponseField>
 
-```bash
-# Everything in a session
-curl "https://api.skygen.ai/action-history?session_id=$SID&limit=100" \
-  -H "Authorization: Bearer $TOKEN"
+---
 
-# Last 24 hours across all sessions
-curl "https://api.skygen.ai/action-history?date_from=2026-04-19T00:00:00&date_to=2026-04-20T00:00:00&limit=200" \
-  -H "Authorization: Bearer $TOKEN"
+## Querying examples
 
-# Only CUA actions
-curl "https://api.skygen.ai/action-history?session_id=$SID&mode=cua" \
-  -H "Authorization: Bearer $TOKEN"
+### All actions for a session
+
+```http
+GET /action-history?session_id=abc123&limit=100
 ```
 
-## Ordering
+### CUA actions on a specific date
 
-Sorted by `created_at DESC`. Most recent action first. `offset`-based pagination works but slows on large offsets — for deep scrolling use `date_to` with the last seen timestamp.
+```http
+GET /action-history?mode=cua&date_from=2026-05-08T00:00:00Z&date_to=2026-05-08T23:59:59Z
+```
 
-## Gotchas
+### MCP tool calls across all sessions
 
-<Note>
-**Lost on hard delete.** If you hard-delete a session (`DELETE /sessions/{id}/permanent`), every action is gone. Soft delete (`DELETE /sessions/{id}`) preserves the history.
-</Note>
+```http
+GET /action-history?mode=mcp&limit=50&offset=0
+```
 
-<Note>
-**Index only helps on the exact filter combo.** The partial index covers `role=system AND type=ui_meta_update`. Filtering on different `role` values won't use it — you'll hit a scan.
-</Note>
+---
 
-<Note>
-**Timestamps are UTC.** `date_from`/`date_to` use server-side UTC, not user-local time. Convert on the client.
-</Note>
+## Database implementation
 
-<Note>
-**Tool string is free-form.** No validation. Two agents could write `"playwright"` and `"Playwright"` into the same feed. Normalize on the client if you group by tool.
-</Note>
+The endpoint uses a raw SQL query against the partial index `ix_chat_messages_ui_meta` created on `chat_messages` rows where `meta_data->>'type' = 'ui_meta_update'`. This makes queries efficient even with large message tables.
 
-## See also
+The query joins `chat_messages` with `chat_sessions` and filters by `cs.user_id` to ensure users only see their own history. Soft-deleted sessions (`deleted_at IS NOT NULL`) are excluded.
 
-- [Agents](/concepts/agents) — where the `ui_meta_update` events originate
-- [Chat sessions](/concepts/chat-sessions) — the underlying message store
+Separate `COUNT(*)` and data queries are used rather than `COUNT(*) OVER()` window function to avoid defeating the `LIMIT` optimization on large result sets.
+
+---
+
+## Notes for frontend integration
+
+The action history powers the "Steps" panel in the chat UI, where users can see a real-time feed of what the agent is doing. Messages are appended in real time via the Socket.IO `chat_message` event — the REST endpoint is primarily for historical viewing and export.
+
+For real-time action monitoring during an active session, subscribe to:
+
+```
+socket.on("chat_message", (msg) => {
+  if (msg.meta_data?.type === "ui_meta_update") {
+    // append to action timeline
+  }
+})
+```

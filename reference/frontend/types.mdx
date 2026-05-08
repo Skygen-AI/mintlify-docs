@@ -1,0 +1,1943 @@
+---
+title: "Frontend Type Reference"
+description: "TypeScript interfaces and types for all Skygen frontend domain models. Source: WebApp/ui-shared-tauri/src/types/."
+---
+
+# Frontend Type Reference
+
+All types are defined in `WebApp/ui-shared-tauri/src/types/`. The file `types/api.ts` is a re-export hub for backward compatibility — prefer importing from domain-specific files in new code.
+
+---
+
+## Authentication (`types/auth.ts`)
+
+### `User`
+
+```typescript
+interface User {
+  id: string;
+  email: string;
+  is_active?: boolean;
+  is_admin?: boolean;
+  is_email_verified?: boolean;
+  otp_secret?: boolean;         // whether 2FA is enrolled
+  is_2fa_verified?: boolean;
+  display_name?: string;
+  auth_provider?: string;       // "local" | "google"
+  created_at?: string;
+}
+```
+
+**Used by:** `authSlice`, `useAuth` hook, `GET /users/me`
+
+<Warning>
+`otp_secret?: boolean` is declared on the frontend `User` type but is **not sent** by the backend `UserRead` schema. `authSlice` uses `!user.otp_secret` to set `needsOTPSetup`, which means `needsOTPSetup` is always `true` for every user (since `undefined` is falsy). This is a confirmed bug — see type-mismatches for severity rating.
+</Warning>
+
+---
+
+### `TokenResponse`
+
+```typescript
+interface TokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  token_type: string;
+}
+```
+
+---
+
+### `RegisterResponse`
+
+```typescript
+interface RegisterResponse {
+  user: User;
+  access_token: string;
+  token_type: string;
+}
+```
+
+**Note:** `POST /auth/register` also sets a `skygen_session` HttpOnly cookie via `Set-Cookie`. Native clients (Tauri / iOS / Android) use the `access_token` in the body; browsers use the cookie.
+
+---
+
+## Sessions (`types/sessions.ts`)
+
+### `Session`
+
+```typescript
+interface Session {
+  id: string;
+  user_id: string;
+  device_id: string | null;
+  title: string;
+  created_at: string;
+  updated_at?: string;
+  is_active: boolean;
+  message_count?: number;
+  meta_data?: Record<string, unknown>;
+  waiting_for_input?: boolean;   // true when agent is in ask_human state
+}
+```
+
+**Used by:** `sessionSlice`, session list, session detail views
+
+<Info>
+Backend `ChatSessionRead` also sends `emplogent_id?: string` (the assigned agent identifier) which is not declared in the frontend `Session` type. `message_count` is a frontend-only field that is not sent by the backend. `updated_at` is always present on the backend but is declared optional on the frontend.
+</Info>
+
+---
+
+## Messages (`types/messages.ts`)
+
+### `Message`
+
+```typescript
+interface Message {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  meta_data?: MessageMetadata;
+  created_at?: string;        // may be absent on optimistic/temp messages
+  timestamp: string;          // required; fabricated client-side if server omits it
+  attachments?: MessageAttachment[];
+  display_type?: string;      // present on new-contract messages; skips legacy resolution
+  render_data?: Record<string, unknown>;
+}
+```
+
+### `MessageAttachment`
+
+Matches `AttachmentInfo` returned inside `ChatMessageRead` from the backend.
+
+```typescript
+interface MessageAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  object_key: string;
+}
+```
+
+<Warning>
+Backend `ChatMessageRead` includes `AttachmentInfo.revision: int = 1` which is not declared in the frontend `MessageAttachment` interface.
+</Warning>
+
+### `MessageMetadata`
+
+The metadata union. All variants extend `BaseMessageMetadata` and intersect with `Record<string, unknown>` for forward compatibility.
+
+```typescript
+// The base — every meta variant carries at least these
+interface BaseMessageMetadata {
+  status?: "processing" | "completed" | "error" | "cancelled" | "paused" | "stopped";
+  action?: string;
+  screenshot_url?: string;
+  cancelled?: boolean;
+  source?: "file_upload" | string;
+  filename?: string;
+  agent_mode?: string;
+  mode?: string;
+  is_follow_up?: boolean;
+  rating?: number;
+  rating_comment?: string | null;
+  type?: string;              // discriminator: "billing_notification" | "agent_error" | "ui_meta_update" | "ask_human"
+  ask_human_action?: string;
+  published_files?: PublishedFile[];
+  is_milestone?: boolean;
+  sub_agent_count?: number;
+  task_group_id?: string;
+  plan_step_id?: string;
+}
+
+// Type-narrowed subtypes
+type MessageMetadata = (
+  | AgentResponseMetadata     // role=assistant, no type
+  | AgentStepMetadata         // type="ui_meta_update" (optional)
+  | UiMetaMessageMetadata     // type="ui_meta_update" (required), ui_meta required
+  | BaseMessageMetadata
+) & Record<string, unknown>;
+```
+
+Use the `isUiMetaUpdate()` type guard to narrow to `UiMetaMessageMetadata` before accessing `ui_meta`.
+
+---
+
+### UI Meta Types
+
+These payloads appear in `meta_data.ui_meta` when `meta_data.type === "ui_meta_update"`. The `UiMetaUpdatePayload` union (WebSocket) includes all five modes. The legacy `AnyUiMeta` in `messages.ts` is a four-member alias (no `SwePayload`) for backward compatibility.
+
+#### `DeepResearchPayload`
+
+```typescript
+interface DeepResearchPayload {
+  mode: "deep_research";
+  stage: "analyze" | "search" | "synthesize";
+  status: UiMetaStatus;       // "started" | "processing" | "completed" | "error" | "warning" | "waiting"
+  title: string;
+  detail?: string;
+  sources?: UiMetaSource[];
+  stages?: UiMetaStageProgress[];
+  task_group_id?: string;
+  plan_step_id?: string;
+  step_id?: string;           // deduplication key
+  phase_id?: string;
+  phase_label?: string;
+  consolidation_key?: string;
+  parallel_group?: string;
+}
+```
+
+#### `CuaPayload`
+
+```typescript
+interface CuaPayload {
+  mode: "cua";
+  stage: "perception" | "action" | "observe";
+  status: UiMetaStatus;
+  title: string;
+  detail?: string;
+  action_type?: CuaActionType;  // "click" | "type" | "scroll" | "key" | "wait" | "screenshot" | "drag" | "double_click" | "right_click"
+  progress?: number;            // 0–100
+  step?: number;
+  total_steps?: number;
+  task_group_id?: string;
+  plan_step_id?: string;
+  step_id?: string;
+}
+```
+
+#### `McpPayload`
+
+```typescript
+interface McpPayload {
+  mode: "mcp";
+  stage: "tool_execution";
+  status: UiMetaStatus;
+  title: string;
+  tool: string;               // required — MCP tool name
+  detail?: string;            // formatted arguments for display
+  task_group_id?: string;
+  plan_step_id?: string;
+  step_id?: string;
+}
+```
+
+#### `SwePayload`
+
+SWE (Software Engineering) mode — bash execution and file operations.
+
+```typescript
+interface SwePayload {
+  mode: "swe";
+  stage: "tool_execution";
+  status: UiMetaStatus;
+  title: string;
+  tool: "bash" | "file_create" | "file_edit" | "file_view";
+  detail?: string;
+  command?: string;           // bash: the command executed
+  output?: string;            // bash: stdout (may be truncated)
+  exit_code?: number;         // bash: exit code
+  file_path?: string;         // file ops: path
+  language?: string;          // file ops: language detected from extension
+  file_content?: string;      // file ops: content or snippet (may be truncated)
+  task_group_id?: string;
+  plan_step_id?: string;
+  step_id?: string;
+}
+```
+
+#### `AskHumanPayload`
+
+```typescript
+interface AskHumanPayload {
+  mode: "ask_human";
+  stage: "confirmation" | "input";
+  status: UiMetaStatus;
+  title: string;
+  detail?: string;
+  input?: UiMetaInputRequest;
+  task_group_id?: string;
+  plan_step_id?: string;
+  step_id?: string;
+}
+
+interface UiMetaInputRequest {
+  type: "confirmation" | "text" | "choice" | "multiline";
+  action_id: string;
+  prompt: string;
+  placeholder?: string;
+  choices?: UiMetaInputChoice[];
+  required?: boolean;
+  validation?: string;        // regex pattern
+}
+
+interface UiMetaInputChoice {
+  value: string;
+  label: string;
+  description?: string;
+}
+```
+
+#### `UiMetaUpdatePayload` (union — WebSocket)
+
+```typescript
+type UiMetaUpdatePayload =
+  | DeepResearchPayload
+  | CuaPayload
+  | McpPayload
+  | AskHumanPayload
+  | SwePayload;
+```
+
+#### `AnyUiMeta` (union — messages, 4-member legacy alias)
+
+```typescript
+// Defined in messages.ts — excludes SwePayload for historical reasons
+type AnyUiMeta = DeepResearchUiMeta | CuaUiMeta | McpUiMeta | AskHumanUiMeta;
+```
+
+Type guard helpers exported from `messages.ts`: `isUiMetaUpdate()`, `isDeepResearchMeta()`, `isCuaMeta()`, `isMcpMeta()`, `isAskHumanMeta()`. Type guards from `websocket.ts`: `isDeepResearchPayload()`, `isCuaPayload()`, `isMcpPayload()`, `isAskHumanPayload()`, `isSwePayload()`.
+
+---
+
+### `MessageFileInfo`
+
+Lightweight file reference stored in `BaseMessageMetadata.files[]`.
+
+```typescript
+interface MessageFileInfo {
+  name: string;
+  type: string;
+  size: number;
+  url?: string;
+  attachment_id?: string;
+}
+```
+
+### `ApiErrorResponse`
+
+Typed wrapper for HTTP 4xx responses whose `detail` field may be a structured error object.
+
+```typescript
+interface ApiErrorResponse {
+  detail:
+    | DeviceBusyError
+    | DeviceUnreachableError
+    | CloudPcSessionConflictError
+    | UpdateRequiredError
+    | string
+    | unknown[];
+}
+```
+
+### `UiMetaUpdateMetadata`
+
+Concrete metadata shape for messages where `type === "ui_meta_update"`. Narrower than the general `MessageMetadata` union.
+
+```typescript
+interface UiMetaUpdateMetadata {
+  type: "ui_meta_update";
+  ui_meta: AnyUiMeta;
+  mode: "deep_research" | "cua" | "mcp" | "ask_human";
+  status: "started" | "processing" | "completed" | "error" | "waiting";
+  stage: string;
+  is_milestone?: boolean;
+  task_group_id?: string;
+}
+```
+
+### Legacy UI Meta aliases (`messages.ts`)
+
+These four interfaces are local copies of the corresponding `websocket.ts` payloads, kept for backward compatibility. They have slightly narrower `status` unions (no `"warning"` value) and no grouping fields (`step_id`, `phase_id`, etc.).
+
+| Alias | Corresponds to |
+|-------|---------------|
+| `DeepResearchUiMeta` | `DeepResearchPayload` (no grouping fields) |
+| `CuaUiMeta` | `CuaPayload` (no grouping fields) |
+| `McpUiMeta` | `McpPayload` (no grouping fields) |
+| `AskHumanUiMeta` | `AskHumanPayload` (inline choice shape, no grouping fields) |
+
+`AnyUiMeta` is the four-member union of these legacy aliases. New code should use `UiMetaUpdatePayload` from `websocket.ts` instead.
+
+Type guard helpers exported from `messages.ts`: `isUiMetaUpdate()`, `isDeepResearchMeta()`, `isCuaMeta()`, `isMcpMeta()`, `isAskHumanMeta()`.
+
+---
+
+## Chat (`types/chat.ts`)
+
+A small auxiliary file for UI-layer chat state. Most chat types live in `messages.ts` and `sessions.ts`.
+
+### `ChatConversation`
+
+```typescript
+interface ChatConversation {
+  id: string;
+  title: string;
+  messages: Message[];     // re-exported from api.ts
+  createdAt: string;
+  updatedAt: string;
+}
+```
+
+### `MessageRole`
+
+```typescript
+type MessageRole = "user" | "assistant";
+```
+
+---
+
+### Error Response Types
+
+These are returned in HTTP error responses (4xx) with `detail` as a structured object.
+
+#### `DeviceBusyError`
+
+```typescript
+interface DeviceBusyError {
+  error: "device_busy";
+  message: string;
+  device_id: string;
+  active_session_id: string | null;
+  locked_at: string | null;
+}
+```
+
+#### `DeviceUnreachableError`
+
+```typescript
+interface DeviceUnreachableError {
+  error: "device_unreachable";
+  message: string;
+  device_id: string;
+  device_name?: string | null;
+  device_status?: string | null;
+  device_type?: string | null;
+}
+```
+
+#### `CloudPcSessionConflictError`
+
+```typescript
+interface CloudPcSessionConflictError {
+  error: "cloud_pc_in_another_session";
+  message: string;
+  active_session_id: string;
+}
+```
+
+#### `UpdateRequiredError`
+
+```typescript
+interface UpdateRequiredError {
+  error: "update_required";
+  message: string;
+  action: "update_app";
+  min_version: string;
+}
+```
+
+#### `PaymentRequiredError`
+
+```typescript
+interface PaymentRequiredError {
+  error: "payment_required";
+  message: string;
+  reason: "no_payment_method" | "insufficient_tokens" | "no_subscription" | string;
+  can_access: boolean;
+  next_renewal?: string;
+}
+```
+
+#### `SendMessageResult` (client-side)
+
+Never thrown — `sessionApi.sendMessage()` always resolves. All error branches are encoded in the result.
+
+```typescript
+interface SendMessageResult {
+  success: boolean;
+  data?: unknown;
+  error?: "device_busy" | "device_unreachable" | "cloud_pc_conflict"
+        | "invalid_otp" | "network" | "update_required" | "payment_required"
+        | "unknown";
+  errorMessage?: string;
+  deviceBusyInfo?: DeviceBusyError;
+  deviceUnreachableInfo?: DeviceUnreachableError;
+  cloudPcConflictInfo?: CloudPcSessionConflictError;
+  updateRequiredInfo?: UpdateRequiredError;
+  paymentRequiredInfo?: PaymentRequiredError;
+}
+```
+
+---
+
+## Devices (`types/devices.ts`)
+
+### `Device`
+
+```typescript
+interface Device {
+  id: string;
+  user_id: string;
+  device_id?: string;         // hardware/OS identifier; optional on cloud devices
+  device_name: string;
+  platform: "macos" | "windows" | "linux" | "desktop";
+  device_type: "real_device" | "e2b_sandbox";
+  capabilities: Record<string, unknown>;
+  connection_status: "online" | "offline" | "deleted";
+  last_seen: string | null;
+  created_at: string;
+}
+```
+
+<Warning>
+Backend `DeviceRead` includes `device_token_kid: str` (required), `sandbox_config?: Dict`, and `machine_id?: str` which are not declared in the frontend `Device` interface. These fields are intentionally omitted from the frontend type because they are only used server-side for KID rotation and sandbox configuration.
+</Warning>
+
+### `CreateDeviceRequest`
+
+```typescript
+interface CreateDeviceRequest {
+  device_name: string;
+  platform: "macos" | "windows" | "linux" | "desktop";
+  device_type?: "real_device" | "e2b_sandbox";
+  capabilities?: Record<string, unknown>;
+  device_id?: string;          // used for re-registration of known devices
+}
+```
+
+---
+
+## Cloud PC (`types/devices.ts` / `types/cloudpc.ts`)
+
+### `CloudPCStatus`
+
+```typescript
+type CloudPCStatus =
+  | 'none'
+  | 'creating'
+  | 'restoring'
+  | 'active'
+  | 'pausing'
+  | 'paused'
+  | 'resuming'
+  | 'error'
+  | 'terminated';
+```
+
+### `CloudPCController`
+
+```typescript
+type CloudPCController = 'user' | 'agent' | null;
+```
+
+### `CloudPCViewMode`
+
+```typescript
+type CloudPCViewMode = 'hidden' | 'pip' | 'split' | 'fullscreen';
+```
+
+### `CloudDesktopDisplayStatus`
+
+```typescript
+type CloudDesktopDisplayStatus =
+  | 'available'
+  | 'in_use'
+  | 'in_another_session'
+  | 'upgrade_required'
+  | 'starting'
+  | 'error';
+```
+
+---
+
+## Billing (`types/billing.ts`)
+
+### `BillingStatus`
+
+Returned by `GET /billing/status`. Central billing gate — every send-message and Cloud PC action checks this.
+
+```typescript
+interface BillingStatus {
+  can_access: boolean;
+  access_reason: string;            // see PAYWALL_REASONS set below
+  access_message?: string;          // human-readable counterpart
+  access_action?: string;
+  has_payment_method: boolean;
+  tier: string;                     // "none" | "free" | "standard" | "trial"
+  status: string;                   // Stripe subscription status
+  balance: number;                  // token balance
+  total_spent: number;              // integer on backend; number on frontend
+  extra?: Record<string, unknown>;  // escape hatch for server-side extension fields
+  current_period_end?: string | null;
+  cancel_at_period_end?: boolean | null;
+  tokens_remaining?: number;
+  monthly_tokens_included?: number;
+  allow_overage?: boolean;
+  overage_tokens_used?: number;
+  overage_cost_usd?: number;
+  plan_name?: string;
+  plan_id?: string;
+  plan_price_usd?: number;
+  plan_type?: string;               // "free" | "paid"
+  daily_usd_limit?: number;
+  limit_renewal_period_days?: number;
+  next_limit_renewal?: string;
+  model_display_name?: string;
+  upgrade_target_plan_id?: string;
+  upgrade_target_plan_name?: string;
+  cloud_pc_enabled?: boolean;
+  max_cloud_pcs?: number;
+  hide_token_balance?: boolean;
+  scheduled_tasks_enabled?: boolean;
+  allowed_model_profiles?: string[];
+  active_model_profile?: string;
+  model_profiles_meta?: ModelProfileMeta[];
+}
+```
+
+**Paywall vs. banner distinction:**
+
+```typescript
+const PAYWALL_REASONS: ReadonlySet<string> = new Set([
+  "no_subscription",
+  "subscription_expired",
+  "subscription_limit_reached",
+  "free_limit_reached",
+]);
+```
+
+Reasons in `PAYWALL_REASONS` → show plan selection UI. Other reasons (e.g., `past_due`, `invalid_payment`) → show billing warning banner.
+
+### `ModelProfileMeta`
+
+```typescript
+interface ModelProfileMeta {
+  key: string;
+  display_name: string;
+  description: string;
+  badge?: string;
+}
+```
+
+### `Plan`
+
+Returned by `GET /admin/api/plans/public/active` (no auth required). Used by the paywall to render plan cards.
+
+```typescript
+interface Plan {
+  id: string;
+  stripe_price_id: string;
+  name: string;
+  description: string | null;
+  price_usd: number;
+  old_price_usd?: number | null;
+  monthly_tokens: number;
+  sort_order: number;
+  is_active: boolean;
+  is_featured: boolean;
+  badge_text?: string | null;
+  button_text?: string | null;
+  credits_label?: string | null;
+  per_month_text?: string | null;
+  features: FeatureItem[] | null;
+  plan_type?: string;
+  features_config?: {
+    cloud_pc?: boolean;
+    max_cloud_pcs?: number;
+    scheduled_tasks?: boolean;
+    [key: string]: unknown;
+  } | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface FeatureItem {
+  text: string;
+  tooltip?: string | null;
+  muted?: boolean;
+}
+```
+
+Plans are sorted client-side by `sort_order` then `price_usd` after loading.
+
+### `SetupCardResponse`
+
+```typescript
+interface SetupCardResponse {
+  client_secret: string;
+  setup_intent_id: string;
+}
+```
+
+### `CheckoutSessionResponse`
+
+```typescript
+interface CheckoutSessionResponse {
+  checkout_url: string;
+  session_id: string;
+}
+```
+
+### `SubscriptionResponse`
+
+Returned by `POST /billing/subscribe` when the subscription is created via Stripe directly (not Checkout).
+
+```typescript
+interface SubscriptionResponse {
+  subscription_id: string;
+  status: string;
+  current_period_end: string;
+}
+```
+
+### `PricingInfo`
+
+Internal pricing parameters returned by the admin pricing endpoint. Used by the billing service to compute overage costs.
+
+```typescript
+interface PricingInfo {
+  subscription_price_usd: number;
+  monthly_tokens_included: number;
+  margin_multiplier: number;
+  overage_price_per_token: number;
+}
+```
+
+### `PlansListResponse`
+
+```typescript
+interface PlansListResponse {
+  items: Plan[];
+  total: number;
+}
+```
+
+### Transaction Types
+
+Token usage history returned by `GET /billing/transactions`.
+
+```typescript
+interface TransactionItem {
+  id: string;
+  transaction_type: string;
+  amount: number;
+  balance_after: number;
+  description?: string;
+  api_cost_usd?: number;
+  created_at: string;
+}
+
+interface SessionTransactionItem {
+  id: string;
+  agent_type: string;
+  model?: string;
+  tokens: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  created_at: string;
+}
+
+interface SessionGroup {
+  session_id: string;
+  session_title: string;
+  total_tokens: number;
+  transaction_count: number;
+  first_activity: string;
+  last_activity: string;
+  transactions: SessionTransactionItem[];
+}
+
+interface GroupedTransactionsResponse {
+  session_groups: SessionGroup[];
+  system_transactions: TransactionItem[];
+  total_tokens_used: number;
+  total_sessions: number;
+}
+```
+
+---
+
+## Notifications (`types/notifications.ts`)
+
+### `NotificationCategory`, `NotificationIconType`
+
+```typescript
+type NotificationCategory = 'updates' | 'messages';
+
+type NotificationIconType =
+  | 'info' | 'success' | 'warning' | 'error'
+  | 'gift' | 'star' | 'bell' | 'message';
+```
+
+### `NotificationItem`
+
+```typescript
+interface NotificationItem {
+  id: string;
+  notification_id: string;
+  title: string;
+  message: string;
+  category: NotificationCategory;
+  icon: NotificationIconType;
+  is_read: boolean;
+  created_at: string;
+  read_at: string | null;
+}
+```
+
+### `NotificationsListResponse`
+
+```typescript
+interface NotificationsListResponse {
+  items: NotificationItem[];
+  total: number;
+  unread_count: number;
+}
+```
+
+### `UnreadCountResponse`
+
+```typescript
+interface UnreadCountResponse {
+  unread_count: number;
+}
+```
+
+### `WsAdminNotification`
+
+Real-time notification pushed over the `/user` Socket.IO namespace:
+
+```typescript
+interface WsAdminNotification {
+  type: 'admin_notification';
+  notification_id: string;
+  title: string;
+  message: string;
+  category: NotificationCategory;
+  icon: NotificationIconType;
+  created_at: string;
+}
+```
+
+---
+
+## Confirmations (`types/confirmations.ts`)
+
+### `ConfirmationRequest`
+
+```typescript
+interface ConfirmationRequest {
+  id: string;
+  device_id: string;
+  agent_id: string;
+  action_type: ConfirmationType;
+  action_description: string;
+  action_parameters?: Record<string, unknown>;
+  status: ConfirmationStatus;
+  created_at: string;
+  expires_at: number;
+  time_remaining_seconds: number;
+  input?: ConfirmationInputRequest;   // present for ask_human mode
+}
+```
+
+### `ConfirmationStatus`
+
+```typescript
+type ConfirmationStatus = "pending" | "approved" | "rejected" | "expired";
+```
+
+### `ConfirmationType`
+
+```typescript
+type ConfirmationType =
+  | "payment"
+  | "order_food"
+  | "request_cvv"
+  | "sensitive_data"
+  | "file_access"
+  | "system_change"
+  | "safety"
+  | "ask_human"
+  | string;   // open-ended for future types
+```
+
+<Warning>
+The previously documented `ConfirmationType` was incomplete. The actual type includes `request_cvv`, `sensitive_data`, `file_access`, `system_change`, `safety`, and `ask_human`, and is an open string union for forward compatibility.
+</Warning>
+
+### `ConfirmationInputRequest`
+
+```typescript
+interface ConfirmationInputRequest {
+  type: "confirmation" | "text" | "choice" | "multiline";
+  action_id: string;
+  prompt: string;
+  placeholder?: string;
+  choices?: ConfirmationInputChoice[];
+  required?: boolean;
+  validation?: string;   // regex
+}
+```
+
+`ConfirmationInputChoice` has both `id` (from backend) and an optional `value` alias for compatibility:
+
+```typescript
+interface ConfirmationInputChoice {
+  id: string;
+  value?: string;   // alias for compatibility
+  label: string;
+  description?: string;
+}
+```
+
+### `ConfirmationResponse`
+
+Payload sent by the frontend to `POST /confirmations/:id/respond`.
+
+```typescript
+interface ConfirmationResponse {
+  approved: boolean;
+  message?: string | number | null;
+}
+```
+
+### `ConfirmationResult`
+
+Backend response after submitting a confirmation response.
+
+```typescript
+interface ConfirmationResult {
+  success: boolean;
+  confirmation_id: string;
+  status: ConfirmationStatus;
+  message: string;
+}
+```
+
+### `ConfirmationRequestEvent`
+
+WebSocket event wrapping a new confirmation request pushed to the frontend.
+
+```typescript
+interface ConfirmationRequestEvent {
+  type: "confirmation_request";
+  confirmation: ConfirmationRequest;
+}
+```
+
+### Legacy Safety Confirmation Types
+
+These types pre-date the unified `ConfirmationRequest` system and are kept for backward compatibility with older agent messages.
+
+```typescript
+interface SafetyConfirmationRequest {
+  confirmation_id: string;
+  reason: string;
+  timestamp: string;
+  timeout?: number;
+}
+
+interface SafetyConfirmationResponse {
+  type: "safety_confirmation_response";
+  confirmation_id: string;
+  approved: boolean;
+  message?: string;
+}
+
+interface SafetyConfirmationRequestEvent {
+  type: "safety_confirmation_request";
+  confirmation_id: string;
+  reason: string;
+  timestamp: string;
+}
+```
+
+---
+
+## Scheduled Tasks (`types/scheduledTasks.ts`)
+
+### `ScheduleFrequency`, `ConnectorRefType`, `ScheduledTaskRunStatus`
+
+```typescript
+type ScheduleFrequency = "once" | "hourly" | "daily" | "weekly" | "monthly";
+
+type ConnectorRefType = "mcp_integration" | "custom_connector";
+
+type ScheduledTaskRunStatus = "pending" | "running" | "completed" | "failed" | "skipped";
+```
+
+### `ConnectorRef`
+
+Reference to an MCP integration or custom connector attached to a scheduled task.
+
+```typescript
+interface ConnectorRef {
+  connector_type: ConnectorRefType;
+  connector_id: string;
+}
+```
+
+### `PlaybookTask`, `PlaybookData`
+
+Playbook template for parameterized scheduled tasks.
+
+```typescript
+interface PlaybookTask {
+  title: string;
+  description?: string;
+}
+
+interface PlaybookData {
+  command_name: string;
+  description?: string;
+  variables: string[];     // variable names (user fills values at schedule creation)
+  tasks: PlaybookTask[];
+}
+```
+
+### `ScheduledTask`
+
+```typescript
+interface ScheduledTask {
+  id: string;
+  user_id: string;
+  device_id: string | null;
+  name: string;
+  prompt: string;
+  frequency: ScheduleFrequency;
+  day_of_week: number | null;      // 0=Monday
+  day_of_month: number | null;     // 1–31
+  time_of_day: string;             // "HH:MM"
+  timezone: string;
+  expires_at: string | null;
+  is_enabled: boolean;
+  computer_use: boolean;
+  max_concurrent_runs: number;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  run_count: number;
+  connectors: ConnectorRef[];
+  playbook_data: PlaybookData | null;
+  variables: Record<string, string> | null;
+  created_at: string;
+  updated_at: string;
+}
+```
+
+### `ScheduledTaskCreate`
+
+Request body for `POST /scheduled-tasks/`.
+
+```typescript
+interface ScheduledTaskCreate {
+  name: string;
+  prompt: string;
+  device_id?: string | null;
+  frequency: ScheduleFrequency;
+  day_of_week?: number | null;
+  day_of_month?: number | null;
+  time_of_day?: string;
+  timezone?: string;
+  scheduled_at?: string | null;
+  expires_at?: string | null;
+  computer_use?: boolean;
+  connectors?: ConnectorRef[];
+  playbook_data?: PlaybookData | null;
+  variables?: Record<string, string>;
+}
+```
+
+### `ScheduledTaskUpdate`
+
+Partial update for `PATCH /scheduled-tasks/:id`. All fields optional.
+
+```typescript
+interface ScheduledTaskUpdate {
+  name?: string;
+  prompt?: string;
+  device_id?: string | null;
+  frequency?: ScheduleFrequency;
+  day_of_week?: number | null;
+  day_of_month?: number | null;
+  time_of_day?: string;
+  timezone?: string;
+  scheduled_at?: string | null;
+  expires_at?: string | null;
+  computer_use?: boolean;
+  connectors?: ConnectorRef[];
+  playbook_data?: PlaybookData | null;
+  variables?: Record<string, string>;
+}
+```
+
+### `ScheduledTaskToggle`
+
+Enable/disable request body for `PATCH /scheduled-tasks/:id/toggle`.
+
+```typescript
+interface ScheduledTaskToggle {
+  is_enabled: boolean;
+}
+```
+
+### `ScheduledTaskRun`
+
+Individual run record from `GET /scheduled-tasks/:id/runs`.
+
+```typescript
+interface ScheduledTaskRun {
+  id: string;
+  scheduled_task_id: string;
+  session_id: string | null;
+  status: ScheduledTaskRunStatus;
+  scheduled_for: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+  result_summary: string | null;
+  created_at: string;
+}
+```
+
+---
+
+## Files (`types/files.ts`)
+
+### `S3ImageSource`, `ParsedImage`
+
+Image references embedded in parsed file messages.
+
+```typescript
+interface S3ImageSource {
+  type: 's3';
+  media_type: string;
+  url: string;
+  object_key: string;
+}
+
+interface ParsedImage {
+  type: 'image';
+  source: S3ImageSource;
+}
+```
+
+### `ParsedMessageMetadata`, `ParsedMessage`
+
+Result of `POST /files/parse` — the backend extracts text and images and returns them as chat-ready messages.
+
+```typescript
+interface ParsedMessageMetadata {
+  source: 'file_upload';
+  filename: string;
+  images?: ParsedImage[];
+  [key: string]: unknown;
+}
+
+interface ParsedMessage {
+  role: 'user';
+  content: string;
+  created_at?: string;
+  meta_data: ParsedMessageMetadata;
+  task_id?: string | null;
+}
+```
+
+### `FileParseMetadata`
+
+```typescript
+interface FileParseMetadata {
+  filename: string;
+  file_type: string;
+  text_length: number;
+  pages?: number;
+  images_count: number;
+  attachment_id: string;
+  file_url: string;
+  image_object_keys: string[];
+}
+```
+
+### `FileParseResponse`
+
+```typescript
+interface FileParseResponse {
+  messages: ParsedMessage[];
+  metadata: FileParseMetadata;
+}
+```
+
+### `Attachment` (legacy)
+
+Older shape kept for backward-compatible callers. New code should use `AttachmentRead`.
+
+```typescript
+interface Attachment {
+  id: string;
+  user_id: string;
+  session_id?: string;
+  filename: string;
+  file_type: string;
+  object_key: string;
+  file_size: number;
+  created_at: string;
+}
+```
+
+### `AttachmentRead`
+
+Current shape returned by `GET /files`, matching backend `AttachmentRead`:
+
+```typescript
+interface AttachmentRead {
+  id: string;
+  session_id?: string | null;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  file_url: string;
+  object_key: string;
+  created_at: string;
+  pages?: number | null;
+  images_count?: number | null;
+}
+```
+
+### `AttachmentListResponse`
+
+```typescript
+interface AttachmentListResponse {
+  items: AttachmentRead[];
+}
+```
+
+---
+
+## Display Contract (`types/display.ts`)
+
+The Display Contract is the typed API between the Backend's `display_transformer` and the Frontend's message renderer. Every agent message is wrapped in a `DisplayMessage` envelope before rendering.
+
+### `DisplayMessage`
+
+```typescript
+interface DisplayMessage {
+  display_type: DisplayType;
+  session_id: string;
+  message_id: string | null;
+  timestamp: string;
+  render_data: Record<string, unknown>;   // typed per display_type below
+  is_terminal: boolean;
+  is_persistent: boolean;
+  tokens_remaining?: number | null;
+  agent_mode?: string | null;
+}
+```
+
+### `DisplayType` values
+
+| Value | Persistent | render_data type |
+|-------|-----------|-----------------|
+| `user_message` | Yes | `UserMessageData` |
+| `assistant_message` | Yes | `AssistantMessageData` |
+| `cancelled_message` | Yes | `CancelledMessageData` |
+| `paused_message` | Yes | `PausedMessageData` |
+| `error_message` | Yes | `ErrorMessageData` |
+| `ask_human_message` | Yes | `AskHumanMessageData` |
+| `status_update` | No | `StatusUpdateData` |
+| `step_progress` | No | `StepProgressData` |
+| `plan_update` | No | `PlanUpdateData` |
+| `mode_progress` | No | `ModeProgressData` |
+| `attachment_ready` | No | `AttachmentReadyData` |
+| `billing_notice` | No | `BillingNoticeData` |
+
+---
+
+## WebSocket (`types/websocket.ts`)
+
+### `JsonRpcMessage<T>`
+
+All WebSocket messages use JSON-RPC 2.0 framing:
+
+```typescript
+interface JsonRpcMessage<T = unknown> {
+  jsonrpc: "2.0";
+  method?: string;
+  params?: T;
+  id?: string | number;
+  result?: unknown;
+  error?: JsonRpcError;
+}
+```
+
+### `JsonRpcError`
+
+```typescript
+interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+```
+
+### `WsMessageMetadata`
+
+Minimal metadata shape used in WebSocket `new_message` events (extends with open `[key: string]: unknown` for forward compatibility).
+
+```typescript
+interface WsMessageMetadata {
+  screenshot_url?: string;
+  action?: string;
+  status?: "processing" | "completed" | "error" | "cancelled" | "paused" | "stopped";
+  cancelled?: boolean;
+  device_notified?: boolean;
+  [key: string]: unknown;
+}
+```
+
+### Incoming Method Param Types
+
+Typed parameter shapes for each Socket.IO method dispatched to the frontend:
+
+```typescript
+// Backend → Frontend: desktop CUA action to execute
+interface DesktopEnvExecuteParams {
+  task_id: string;
+  action_id?: string;
+  action_type: ActionType;
+  parameters: Record<string, unknown>;
+}
+
+// Backend → Frontend: new chat message
+interface NewMessageParams {
+  message: WsChatMessage;
+}
+
+// Backend → Frontend: agent task progress
+interface TaskProgressParams {
+  session_id: string;
+  status: string;
+  progress?: number;
+  current_step?: number;
+  total_steps?: number;
+  description?: string;
+}
+
+// Backend → Frontend: device connection status change
+interface DeviceStatusUpdateParams {
+  device_status: DeviceStatus;
+}
+
+interface DeviceStatus {
+  device_id: string;
+  connection_status: "online" | "offline" | "deleted";
+  last_seen: string;
+}
+
+// Backend → Frontend: agent typing indicator
+interface AgentTypingParams {
+  session_id: string;
+  is_typing: boolean;
+}
+
+// Backend → Frontend: structured UI progress update
+interface UiMetaUpdateParams {
+  session_id: string;
+  payload: UiMetaUpdatePayload | PlanPayload;
+  timestamp: string;
+}
+```
+
+### Outgoing Method Param Types
+
+Typed parameter shapes for methods sent from the frontend to the backend:
+
+```typescript
+// Frontend → Backend: result of a CUA action executed on the desktop
+interface ExecuteTaskParams {
+  task_id: string;
+  status: "completed" | "cancelled" | "failed";
+  result?: unknown;
+  error?: string;
+}
+
+// Frontend → Backend: result of a task action (subtly different from ExecuteTaskParams)
+interface TaskResultParams {
+  task_id: string;
+  action_id?: string;
+  status: "completed" | "failed";
+  result?: unknown;
+  error?: string;
+}
+
+// Frontend → Backend: desktop heartbeat
+interface HeartbeatParams {
+  status: "alive";
+  system_info: SystemInfo;
+}
+
+interface SystemInfo {
+  platform: "macos" | "windows" | "linux";
+  screen_width: number;
+  screen_height: number;
+  physical_screen_width: number;
+  physical_screen_height: number;
+}
+```
+
+### `MethodHandlersMap`, `MethodName`, `MethodHandler<T>`
+
+Typed registry mapping Socket.IO method names to their parameter types. Used by `wsClient` to build type-safe dispatchers.
+
+```typescript
+interface MethodHandlersMap {
+  new_message:           NewMessageParams;
+  task_progress:         TaskProgressParams;
+  device_status_update:  DeviceStatusUpdateParams;
+  agent_typing:          AgentTypingParams;
+  ui_meta_update:        UiMetaUpdateParams;
+  execute_task:          ExecuteTaskParams;
+  desktop_env_execute:   DesktopEnvExecuteParams;
+  task_result:           TaskResultParams;
+  heartbeat:             HeartbeatParams;
+  cloud_pc_status_changed:  CloudPCStatusChangedParams;
+  cloud_pc_control_changed: CloudPCControlChangedParams;
+  attachments_ready:        AttachmentsReadyParams;
+}
+
+type MethodName = keyof MethodHandlersMap;
+
+type MethodHandler<T extends MethodName> = (params: MethodHandlersMap[T]) => void;
+```
+
+### `SweToolType`
+
+```typescript
+type SweToolType = "bash" | "file_create" | "file_edit" | "file_view";
+```
+
+### `ActionType` (Device automation)
+
+Actions the Backend sends to the Desktop App (real device) for execution:
+
+```typescript
+type ActionType =
+  | "SCREENSHOT" | "CLICK" | "TYPE" | "PRESS" | "HOTKEY"
+  | "SCROLL" | "GET_SCREEN_SIZE" | "GET_CURSOR_POSITION"
+  | "GET_ACCESSIBILITY_TREE" | "OPEN_FILE_OR_APP" | "ACTIVATE_WINDOW"
+  | "CLOSE_WINDOW" | "LIST_DIRECTORY" | "READ_FILE" | "WRITE_FILE"
+  | "EXECUTE_COMMAND" | "RUN_PYTHON" | "RUN_BASH";
+```
+
+### Plan Types
+
+Received via `ui_meta_update` events where `payload.type === "plan"`.
+
+```typescript
+interface PlanPayload {
+  type: "plan";
+  plan_version: number;       // monotonic; lower versions are rejected by setPlan()
+  updated_at: string;
+  steps: PlanStep[];
+}
+
+interface PlanStep {
+  id: string;
+  title: string;
+  status: PlanStepStatus;     // "pending" | "in_progress" | "completed" | "skipped" | "error"
+  description?: string;
+  started_at?: string;
+  completed_at?: string;
+  sub_steps: PlanSubStep[];
+}
+
+interface PlanSubStep {
+  id: string;
+  title: string;
+  status: PlanStepStatus;
+  detail?: string;
+}
+```
+
+`PlanPayload` is intentionally excluded from `UiMetaUpdatePayload` because it has a different top-level discriminator (`type: "plan"` vs `mode: "..."` for other payloads). The `isPlanPayload()` type guard handles both union members.
+
+### `WsChatMessage`
+
+WebSocket-specific message format (from backend `new_message` events). Normalized to `Message` by `wsClient.handleAgentResponse()`.
+
+```typescript
+interface WsChatMessage {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  meta_data?: WsMessageMetadata;
+  created_at: string;
+  timestamp: string;
+  attachments?: { id: string; filename: string; content_type: string; size_bytes: number; object_key: string }[];
+}
+```
+
+### Cloud PC Socket.IO Events
+
+```typescript
+interface CloudPCStatusChangedParams {
+  status: string;
+  timestamp: string;
+  cloud_pc_id?: string;
+  stream_url?: string;
+  stream_auth_key?: string;
+  sandbox_id?: string;
+  reason?: string;
+}
+
+interface CloudPCControlChangedParams {
+  controller: 'user' | 'agent' | null;
+  cloud_pc_id?: string;
+  timestamp: string;
+}
+
+interface AttachmentsReadyParams {
+  message_id: string;
+  session_id: string;
+  attachments: { id: string; filename: string; content_type: string; size_bytes: number; object_key: string }[];
+}
+```
+
+---
+
+## Platform Adapter (`types/platform.ts`)
+
+### `IPlatformAdapter`
+
+The interface every platform (Web, macOS, Windows) must implement. The Web implementation lives in `src/platform/webPlatformAdapter.ts`; desktop implementations are in the Tauri Rust layer.
+
+```typescript
+interface IPlatformAdapter {
+  platform: 'macos' | 'windows' | 'web';
+  capabilities: {
+    hasDesktopAutomation: boolean;
+    hasSecureStorage: boolean;
+    hasOverlay: boolean;
+    canOpenOAuthWindow: boolean;
+  };
+  storage: {
+    get(key: string): Promise<string | null>;
+    set(key: string, value: string): Promise<void>;
+    remove(key: string): Promise<void>;
+  };
+  desktop?: {
+    startDeviceWebSocket(): Promise<void>;
+    stopDeviceWebSocket(): Promise<void>;
+    checkDeviceWebSocketStatus(): Promise<boolean>;
+    getDeviceId(): Promise<string | null>;
+  };
+  updater?: IUpdaterService;
+  analytics?: {
+    identify(userId: string): void;
+    track(event: string, properties?: Record<string, unknown>): void;
+  };
+  /** Open an OAuth popup or redirect. Promise resolves when the window closes or auth completes. */
+  openOAuthWindow(url: string): Promise<void>;
+}
+```
+
+### `UpdateInfo`
+
+Returned by `IUpdaterService.checkForUpdates()`.
+
+```typescript
+interface UpdateInfo {
+  version: string;
+  notes: string;
+  date: string;
+}
+```
+
+### `IUpdaterService`
+
+Optional auto-update interface implemented by desktop platforms.
+
+```typescript
+interface IUpdaterService {
+  checkForUpdates(): Promise<UpdateInfo | null>;
+  installUpdate(): Promise<void>;
+  getAppVersion(): Promise<string>;
+  isDevMode(): Promise<boolean>;
+  onDownloadProgress(
+    callback: (progress: { percentage: number; downloaded: number; total: number }) => void
+  ): () => void;
+  onDownloadVerifying(callback: () => void): () => void;
+}
+```
+
+### `ApiConfig`
+
+API endpoint configuration passed from the wrapper application to the shared UI library.
+
+```typescript
+interface ApiConfig {
+  BACKEND_URL: string;
+  WS_URL: string;
+  STRIPE_PUBLISHABLE_KEY?: string;
+}
+```
+
+### `BootstrapConfig`
+
+Root configuration object passed to `bootstrap()` at application startup.
+
+```typescript
+interface BootstrapConfig {
+  apiConfig: ApiConfig;
+  platform: IPlatformAdapter;
+  /**
+   * Base path under which the React app is served.
+   * Used by React Router `basename`. Defaults to "/" when omitted.
+   * The WebApp sets this to "/app".
+   */
+  basePath?: string;
+}
+```
+
+---
+
+## Helpdesk (`types/helpdesk.ts`)
+
+### `TicketCategory`, `TicketPriority`, `TicketStatus`
+
+```typescript
+type TicketCategory = 'bug' | 'feature_request' | 'billing' | 'account' | 'general';
+type TicketPriority = 'low' | 'normal' | 'high' | 'urgent';
+type TicketStatus = 'open' | 'in_progress' | 'resolved' | 'closed' | 'reopened';
+```
+
+### `UserInfo`
+
+Embedded user summary in ticket, message, attachment, and status-change objects.
+
+```typescript
+interface UserInfo {
+  id: string;
+  email: string;
+  display_name: string | null;
+}
+```
+
+### `Ticket`
+
+```typescript
+interface Ticket {
+  id: string;
+  ticket_number: number;
+  user_id: string;
+  assigned_to: string | null;
+  title: string;
+  description: string;
+  category: TicketCategory;
+  priority: TicketPriority;
+  status: TicketStatus;
+  satisfaction_rating: number | null;
+  satisfaction_comment: string | null;
+  first_response_at: string | null;
+  resolved_at: string | null;
+  closed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number | null;
+  user: UserInfo | null;
+  assignee: UserInfo | null;
+}
+```
+
+<Warning>
+The `Ticket` interface documented here is the full shape from `helpdesk.ts`. The earlier version in this file was missing `assigned_to`, `satisfaction_comment`, `first_response_at`, `resolved_at`, `closed_at`, `message_count`, `user`, and `assignee`.
+</Warning>
+
+### `HelpdeskMessage`
+
+```typescript
+interface HelpdeskMessage {
+  id: string;
+  ticket_id: string;
+  author_id: string | null;
+  content: string;
+  is_internal: boolean;        // true for agent/admin internal notes
+  created_at: string;
+  author: UserInfo | null;
+}
+```
+
+### `StatusChange`
+
+Audit record emitted whenever a ticket's status, priority, or assignee changes.
+
+```typescript
+interface StatusChange {
+  id: string;
+  ticket_id: string;
+  changed_by: string | null;
+  old_status: string | null;
+  new_status: string | null;
+  old_priority: string | null;
+  new_priority: string | null;
+  old_assigned_to: string | null;
+  new_assigned_to: string | null;
+  note: string | null;
+  created_at: string;
+  changer: UserInfo | null;
+}
+```
+
+### `HelpdeskAttachment`
+
+```typescript
+interface HelpdeskAttachment {
+  id: string;
+  ticket_id: string;
+  message_id: string | null;
+  uploader_id: string | null;
+  filename: string;
+  content_type: string | null;
+  size_bytes: number | null;
+  created_at: string;
+  uploader: UserInfo | null;
+}
+```
+
+### `HelpdeskTicketDetail`
+
+Full ticket detail including conversation history, attachments, and audit trail.
+
+```typescript
+interface HelpdeskTicketDetail extends Ticket {
+  messages: HelpdeskMessage[];
+  attachments: HelpdeskAttachment[];
+  status_changes: StatusChange[];
+}
+```
+
+### `KBArticle`
+
+Knowledge Base article from `GET /helpdesk/kb/articles`.
+
+```typescript
+interface KBArticle {
+  id: string;
+  title: string;
+  slug: string;
+  content: string;
+  category: string | null;
+  tags: string[] | null;
+  is_published: boolean;
+  author_id: string | null;
+  view_count: number;
+  helpful_count: number;
+  not_helpful_count: number;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+  author: UserInfo | null;
+}
+```
+
+### `TicketListResponse`, `KBArticleListResponse`
+
+Paginated list wrappers:
+
+```typescript
+interface TicketListResponse {
+  items: Ticket[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+interface KBArticleListResponse {
+  items: KBArticle[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+```
+
+### `AttachmentPresignedResponse`
+
+Returned by the helpdesk attachment upload endpoint to get a presigned S3 URL.
+
+```typescript
+interface AttachmentPresignedResponse {
+  attachment_id: string;
+  upload_url: string;
+}
+```
+
+### `HelpdeskStats`
+
+Admin dashboard counters.
+
+```typescript
+interface HelpdeskStats {
+  open_count: number;
+  in_progress_count: number;
+  resolved_today_count: number;
+  avg_response_time_hours: number | null;
+  total_tickets: number;
+}
+```
+
+---
+
+## Admin Panel (`types/admin.ts`)
+
+Types for the in-app developer/admin traffic logger panel. The panel is password-protected and shows live HTTP, WebSocket, and (on desktop) Rust/Tauri/Overlay/System logs.
+
+### `LogChannel`
+
+```typescript
+type LogChannel =
+  | 'http'          // HTTP requests (web + desktop)
+  | 'frontend-ws'   // Frontend WebSocket (web + desktop)
+  | 'agent'         // Agent logs (web + desktop)
+  | 'rust-ws'       // Rust WebSocket (desktop only)
+  | 'tauri-event'   // Tauri events (desktop only)
+  | 'overlay'       // Overlay logs (desktop only)
+  | 'system';       // System events (desktop only)
+```
+
+### `LogDirection`
+
+```typescript
+type LogDirection = 'incoming' | 'outgoing' | 'internal';
+```
+
+### `LogEntryMeta`
+
+```typescript
+interface LogEntryMeta {
+  url?: string;
+  method?: string;
+  status?: number;
+  duration?: number;
+  transport?: string;
+  headers?: Record<string, string>;
+  event?: string;
+}
+```
+
+### `LogEntry`
+
+```typescript
+interface LogEntry {
+  id: string;
+  timestamp: number;
+  channel: LogChannel;
+  direction: LogDirection;
+  preview: string;
+  raw?: string;
+  meta?: LogEntryMeta;
+}
+```
+
+### `LogEntryInput`
+
+Input shape for recording a new log entry (auto-generated `id`, `timestamp`, and `preview` are omitted; `preview` can be provided optionally):
+
+```typescript
+type LogEntryInput = Omit<LogEntry, 'id' | 'timestamp' | 'preview'> & {
+  preview?: string;
+};
+```
+
+### `ITrafficLogger`
+
+Logger service interface. The concrete implementation patches `fetch`, `XMLHttpRequest`, and the `wsClient` to intercept all traffic.
+
+```typescript
+interface ITrafficLogger {
+  init(): void;
+  getLogs(): LogEntry[];
+  clearLogs(): void;
+  subscribe(callback: LogSubscriber): () => void;   // returns unsubscribe fn
+  recordLog(entry: Omit<LogEntry, 'id' | 'timestamp'>): void;
+}
+
+type LogSubscriber = (logs: LogEntry[]) => void;
+```
+
+### `AdminPanelProps`
+
+```typescript
+interface AdminPanelProps {
+  isOpen: boolean;
+  onClose: () => void;
+  logs: LogEntry[];
+  onClearLogs?: () => void;
+  // Desktop-only additional log channels
+  rustLogs?: LogEntry[];
+  overlayLogs?: LogEntry[];
+  systemEvents?: LogEntry[];
+}
+```
+
+### `AdminPasswordDialogProps`
+
+```typescript
+interface AdminPasswordDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onAuthenticate: (password: string) => boolean;
+}
+```
+
+### `LogsViewerProps`, `LogEntryProps`
+
+```typescript
+interface LogsViewerProps {
+  logs: LogEntry[];
+  title?: string;
+  onClear?: () => void;
+}
+
+interface LogEntryProps {
+  entry: LogEntry;
+}
+```
+
+### `UseAdminPanelReturn`
+
+Return type of the `useAdminPanel()` hook.
+
+```typescript
+interface UseAdminPanelReturn {
+  isOpen: boolean;
+  isAuthenticated: boolean;
+  showPasswordDialog: boolean;
+  openPasswordDialog: () => void;
+  closePasswordDialog: () => void;
+  authenticate: (password: string) => boolean;
+  open: () => void;
+  close: () => void;
+}
+```
+
+### `AdminTab`, `TabConfig`
+
+```typescript
+type AdminTab =
+  | 'http' | 'websocket' | 'agent'
+  | 'rust' | 'tauri' | 'overlay' | 'system';
+
+interface TabConfig {
+  id: AdminTab;
+  label: string;
+  channels: LogChannel[];
+  desktopOnly?: boolean;
+}
+```
+
+The constant `ADMIN_TABS: TabConfig[]` provides the default tab configuration used by the admin panel. Desktop-only tabs (`rust`, `tauri`, `overlay`, `system`) are hidden on the web platform.

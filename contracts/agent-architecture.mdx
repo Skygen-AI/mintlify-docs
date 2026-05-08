@@ -1,0 +1,364 @@
+---
+title: "Agent Architecture Contract"
+description: "Class hierarchy, BaseAgent contract, lifecycle states, IoC factory methods, and step-by-step guide to adding a new agent type."
+---
+
+> Generated: 2026-05-08 · Source: `Agent/Agents/`, `Agent/Services/`, `Agent/Utilities/` · Regenerate with `/doc-gen`
+
+---
+
+## Class Hierarchy
+
+```
+BrokerAgent                              # BrokerAgent/broker.py — NOT a BaseAgent subclass
+│                                        # Coordinator only: routes sessions, owns Socket.IO client
+│
+└── [creates and drives]
+    │
+    BaseAgent                            # Agents/BaseAgent/base.py
+    │   (not ABC; concrete with overridable hooks)
+    │
+    ├── PlannerAgent                     # Agents/PlannerAgent/base.py
+    │   │  TERMINATE_GUARD_ENABLED = True
+    │   │  Owns: PlanManager, PlanReporter → _BrokerPlanSnapshotSink
+    │   │  Registers sub-agents: DataFetcherAgent, MCPToolsAgent,
+    │   │                        CUA_OrchestratorAgent, SoftwareEngineerAgent
+    │   │
+    │   └── [spawns as sub-agents]
+    │       ├── DataFetcherAgent         # Agents/DataFetcherAgent/base.py
+    │       ├── MCPToolsAgent            # Agents/MCPToolsAgent/base.py
+    │       ├── CUA_OrchestratorAgent    # Agents/CUA_OrchestratorAgent/base.py
+    │       └── SoftwareEngineerAgent    # Agents/ProjectSoftwareAgent/base.py
+    │
+    ├── DataFetcherAgent                 # Agents/DataFetcherAgent/base.py
+    │     Web research specialist
+    │     Components: BraveSearcher, ArxivSearcher, TavilySearcher, Reranker, GeminiFuser
+    │
+    ├── MCPToolsAgent                    # Agents/MCPToolsAgent/base.py
+    │     Composio MCP tool execution
+    │     Module-level _REMOTE_TOOL_MANAGER_REGISTRY (WeakSet) for live toggle
+    │
+    ├── CUA_OrchestratorAgent            # Agents/CUA_OrchestratorAgent/base.py
+    │     GUI automation on remote devices
+    │     Components: RemotePerceptionModule, GroundingModule, remote_gui_tools
+    │
+    └── SoftwareEngineerAgent            # Agents/ProjectSoftwareAgent/base.py
+          Code execution via E2B or local sandbox
+          Uses: file_toolkit (str_replace_editor, bash, match)
+```
+
+**Supporting infrastructure (not agent subclasses):**
+```
+BrokerAgent/MessageTransport/
+    Transport (ABC)
+    ├── WebSocketTransport
+    ├── RabbitMqTransport
+    └── CompositeTransport
+
+Utilities/Hibernation/
+    Sentinel                     # polling loop
+    SentinelStore                # Redis state
+    Waker (ABC)
+    └── BrokerWaker
+    HibernationStrategyRegistry
+    Strategies: TimerStrategy, VisualConditionStrategy
+
+Utilities/LLM_Providers/
+    BaseProvider (ABC)
+    ├── OpenAIProvider
+    ├── AnthropicProvider
+    ├── GeminiProvider
+    ├── OpenRouterProvider
+    └── CerebrasProvider
+    ModelCatalog                 # LLM_Providers/ModelRegistry.py
+    CircuitBreakerRegistry       # LLM_Providers/CircuitBreakerRegistry.py
+```
+
+---
+
+## BaseAgent Contract
+
+`BaseAgent` (`Agents/BaseAgent/base.py`) is a **concrete class using IoC via factory methods**. It is not an ABC; subclasses override factory methods and hook methods, not abstract methods.
+
+### Class-level flags
+
+| Attribute | Type | Default | Effect |
+|-----------|------|---------|--------|
+| `TERMINATE_GUARD_ENABLED` | `bool` | `False` | Enable B3 false-completion guard (PlannerAgent sets `True`) |
+| `CONFIRMATION_TOOL_DOCUMENTATION` | `str` | template | Injected into system prompt to document `RequestConfirmationTool` |
+
+### IoC Factory Methods
+
+All called in `__init__()`. Override to swap out a component.
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `_create_tool_manager()` | `ToolManager` | Register agent tools |
+| `_create_safety_manager()` | `SafetyManager` | Guardrail evaluation |
+| `_create_ux_manager()` | `UXInteractionManager` | UI frame emission |
+| `_create_action_executor()` | `ActionExecutor` | Tool call execution |
+| `_create_prompt_builder()` | `PromptBuilder` | LLM request assembly |
+| `_create_memory_manager()` | `MemoryManager` | Scratchpad management |
+| `_create_knowledge_manager()` | `KnowledgeManager` | KB retrieval |
+| `_create_llm_manager()` | `LLMManager` | LLM call dispatch |
+| `_create_session_manager()` | `SessionManager` | State persistence |
+| `_create_budget_alert_manager()` | `BudgetAlertManager` | Alert rule evaluation |
+
+All components defined in `Agents/BaseAgent/Components.py`.
+
+### Hook Methods
+
+| Method | Signature | When called | Override contract |
+|--------|-----------|-------------|-------------------|
+| `_observe_phase()` | `(execution_records, state, context) → List[Dict]` | After each action execution | MUST return list (may be empty). CUA injects screenshots here. |
+| `prepare_subagent_kwargs()` | `(agent_type, task, context, state) → dict` | Before spawning a sub-agent | MUST call `super()` and merge kwargs |
+| `on_subagent_spawn()` | `async (agent_id, agent_type, plan_step_id, context, state)` | After sub-agent created | No-op by default |
+| `pre_action_guard()` | `async (action_name, args, context, state) → None \| str` | Before each tool call | Return non-None string to block action |
+| `on_subagent_finish()` | `async (agent_id, context, summary, failed)` | When child completes | No-op by default |
+
+### Core Public Method
+
+```python
+async def chat(
+    self,
+    context: AgentContext,
+    state: BaseAgentState,
+    llm_params: Dict,
+) -> Tuple[Dict[str, Any], List[Dict]]
+```
+
+Returns `(result_dict, message_history)`:
+```python
+{
+    "status": "completed | hibernated | cancelled | paused | error | billing_limit_reached",
+    "summary": "string | null",
+    "content_already_emitted": bool,
+    "hibernate_params": {...} | None,
+    "reason": "string | null",
+}
+```
+
+### Built-in Tools (always present)
+
+Defined in `Agents/BaseAgent/Tools.py`:
+
+| Tool name | Purpose |
+|-----------|---------|
+| `communicate` | Send message to user or parent agent |
+| `hibernate` | Suspend agent with a wake strategy |
+| `switch_lifecycle_mode` | Change orchestration mode |
+| `wait` | Simple blocking wait (legacy) |
+| `request_confirmation` | ARCH-001: ask user + hibernate |
+| `manage_scratchpad` | Working memory CRUD |
+| `spawn_subagent` | Create/stop/wake sub-agents |
+| `parallel_branches` | Parallel tool execution |
+
+---
+
+## Agent Lifecycle States
+
+```
+CREATED → RUNNING ─── TERMINATED (status=completed)
+             │
+             ├── BillingLimitReached    (status=billing_limit_reached)
+             ├── SafetyManager blocks   (status=guardrail_blocked)
+             ├── max_iterations         (status=max_iterations)
+             ├── HibernateTool ──► HIBERNATED ── (wake → RUNNING)
+             ├── PAUSE ──────────► PAUSED    ── (resume → RUNNING)
+             ├── STOP / USER_CANCEL ──► CANCELLED
+             └── unhandled exception ──► ERROR
+```
+
+### State persistence
+
+- Message history stored in Redis: `agent_history:{session_id}`
+- Written by `AgentStateRepository.persist_state()` in `finally` block of `chat()`
+- Read by `BrokerAgent._process_planner_mode()` on session resume
+- Guard: `persist_state()` is a no-op unless `state.is_persisted = True`
+
+---
+
+## How to Add a New Agent Type
+
+### Step 1: Create the agent file
+
+```
+Agent/Agents/MyNewAgent/
+    __init__.py
+    base.py
+```
+
+### Step 2: Subclass BaseAgent
+
+```python
+# Agents/MyNewAgent/base.py
+from Agents.BaseAgent.base import BaseAgent
+from Agents.BaseAgent.Components import ToolManager, PromptBuilder
+
+class MyNewAgent(BaseAgent):
+    """Single-sentence description of what this agent does."""
+
+    def _create_tool_manager(self) -> ToolManager:
+        tm = super()._create_tool_manager()
+        tm.register(MyDomainTool())
+        return tm
+
+    def _create_prompt_builder(self) -> PromptBuilder:
+        pb = super()._create_prompt_builder()
+        pb.set_system_prompt(MY_SYSTEM_PROMPT)
+        return pb
+
+    async def _observe_phase(self, execution_records, state, context):
+        return await super()._observe_phase(execution_records, state, context)
+```
+
+### Step 3: Register with PlannerAgent (if spawnable as sub-agent)
+
+```python
+# Agents/PlannerAgent/base.py → __init__()
+agent_classes = [DataFetcherAgent, MCPToolsAgent, CUA_OrchestratorAgent, MyNewAgent]
+```
+
+Also update `prepare_subagent_kwargs()` if the agent needs non-standard init args.
+
+### Step 4: Add routing in BrokerAgent (if top-level session mode)
+
+```python
+# BrokerAgent/broker.py → _route_session()
+elif agent_mode == "my_new_mode":
+    result = await self._process_my_new_mode(payload, session_id, user_id, ...)
+```
+
+### Step 5: Wire cost tracking
+
+BaseAgent's `LLMManager` calls `cost_tracker.record_api_call_async()` automatically after each LLM call. No additional wiring needed unless the agent makes direct HTTP calls to LLM APIs outside of `LLMManager`.
+
+### Step 6: Write tests
+
+```
+Agent/tests/agents/test_my_new_agent.py
+```
+Use `AsyncMock` for `context.ws_client.send_event`. Use `MockCostTracker` from `tests/conftest.py`.
+
+---
+
+## LLM Routing (ModelRouter)
+
+**File:** `Utilities/ModelRouter.py`
+**Entry point:** `choose_model_route(llm_params, routing_params)` (module-level function)
+
+### Input types
+
+```python
+class RoutingParams(TypedDict):
+    session_id: str
+    user_id: str
+    skip_models: List[str]           # session-level skip list (already failed)
+    requires_vision: bool            # payload contains images
+    requires_long_context: bool      # estimated tokens > threshold
+    requires_heavy_reasoning: bool   # needs extended chain-of-thought
+    complexity: str                  # "high" | "medium" | "low"
+    priority: str                    # "high" | "standard" | "low" | "batch"
+    force_model: str                 # bypass all routing logic
+
+class ModelRouteDecision:
+    model: str       # e.g. "gpt-4o", "claude-3-5-sonnet-20241022"
+    provider: str    # "openai" | "anthropic" | "gemini" | "openrouter" | "cerebras"
+    reason: str      # human-readable rationale (logged)
+    context_tokens: int
+    tier: str        # "economy" | "standard" | "heavy" | "long_context"
+```
+
+### Routing decision tree
+
+```
+force_model set?          → Use forced model directly
+requires_long_context?    → _LongContextStrategy
+priority in {low, batch}? → _EconomyStrategy
+requires_heavy_reasoning
+  OR complexity == "high"? → _HeavyReasoningStrategy
+default                   → _CandidateStrategy (standard tier, vision-aware)
+```
+
+After tier selection: `CircuitBreakerRegistry` consulted to skip models with open circuit breakers.
+Token estimation: `_estimate_tokens()` uses `char/4` approximation (no tokenizer dependency).
+
+---
+
+## Cost Tracking
+
+**File:** `Services/cost_tracker.py`
+**Class:** `CostTracker` — instantiated once per `BrokerAgent`
+
+### Call flow
+
+```
+BaseAgent.chat()
+  └── LLMManager._call_provider()
+        └── CostTracker.record_api_call_async(
+                session_id, user_id, model, provider,
+                input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens
+            )
+```
+
+### Billing limit check
+
+1. POSTs to `{backend_url}/api/billing/check-budget`
+2. If budget exceeded: raises `BillingLimitReached(session_id=..., limit_type="token_budget")`
+3. `BaseAgent.chat()` catches → `_terminal_return(status=billing_limit_reached)`
+4. BrokerAgent emits `agent_status` + billing marker message
+
+### Local storage fallback
+
+When `COST_TRACKING_BACKEND=false`: costs appended to JSONL at `{COST_TRACKER_PATH}/{date}.jsonl` (default: `../agent_costs/`).
+
+---
+
+## Services Layer
+
+| Service | File | Purpose |
+|---------|------|---------|
+| `AgentSocketIOClient` | `Services/socketio_client.py` | Primary connection to Backend `/agent` namespace |
+| `CostTracker` | `Services/cost_tracker.py` | Token billing + Prometheus metrics |
+| `RedisEventBus` | `Services/redis_event_bus.py` | Cross-process pub/sub for hibernate wake |
+| `SandboxHeartbeat` | `Services/sandbox_heartbeat.py` | E2B idle timeout prevention |
+| `TaskCancellationManager` | `Services/task_cancellation_manager.py` | Redis cancel flags for two-stage cancellation |
+| `CostTrackingMiddleware` | `Services/cost_tracking_middleware.py` | Token counting wrapper for LLM providers |
+| `AgentWebSocketClient` | `Services/agent_websocket_client.py` | **DEPRECATED** — replaced by AgentSocketIOClient |
+
+**AgentSocketIOClient design decisions:**
+- Built-in python-socketio reconnection disabled — replaced with single-task `_reconnect_loop` to prevent parallel reconnect storms
+- Subscription recovery: saved subscriptions restored after reconnect (`_saved_subscriptions`)
+- `_connect_event: asyncio.Event` — `connect()` awaits this event to avoid race between `.connect()` return and `on_connect` handler firing
+
+---
+
+## Component Interaction Map
+
+```
+BrokerAgent
+│
+├── AgentSocketIOClient      ← Socket.IO /agent namespace
+├── CostTracker              ← shared across all agent instances
+├── TaskCancellationManager  ← Redis cancel flags
+│
+└── [creates] BaseAgent subinstance
+    │
+    ├── LLMManager           ← routes via ModelRouter → BaseProvider
+    │                           charges via CostTracker
+    ├── ToolManager          ← registry of all available tools
+    ├── ActionExecutor       ← executes tool calls from LLM response
+    ├── PromptBuilder        ← assembles LLM message array
+    ├── MemoryManager        ← scratchpad
+    ├── SafetyManager        ← guardrail evaluation
+    ├── UXInteractionManager ← emits ui_meta_update via ws_client
+    ├── BudgetAlertManager   ← evaluates alert rules each iteration
+    │   ├── TimeLimitAlertRule
+    │   ├── TokenBudgetAlertRule
+    │   ├── ScratchpadUsageAlertRule
+    │   ├── StepBudgetAlertRule
+    │   └── PlanStagnationAlertRule  ← PlannerAgent only
+    ├── SessionManager       ← AgentStateRepository (Redis)
+    └── KnowledgeManager     ← KB retrieval (RAG)
+```

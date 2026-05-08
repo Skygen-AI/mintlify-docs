@@ -1,0 +1,341 @@
+---
+title: "ComposioService / MCP Tools"
+description: "Toolkit discovery, OAuth connection management, trigger lifecycle, and MCP config generation for agent tool integrations."
+---
+
+## Overview
+
+`ComposioService` (`app/services/composio_service.py`) is the business logic layer for Composio integrations — the gateway to 500+ external app toolkits (GitHub, Gmail, Slack, Notion, Jira, etc.) used by agents via the Model Context Protocol (MCP).
+
+It follows the **Dependency Inversion** pattern: all SDK calls go through `ComposioPort` (protocol), implemented by `ComposioAdapter`. This allows easy mocking in tests.
+
+**Singleton:** `get_composio_service()` — lazy initialization, caches the API key at creation time. A process restart is required after API key rotation.
+
+**Constructor:** `ComposioService(adapter: ComposioPort)` — injects the adapter.
+
+Methods decorated with `@composio_enabled_guard` raise `ComposioUnavailableError` when Composio is disabled (`COMPOSIO_API_KEY` not set).
+
+---
+
+## Toolkit Discovery
+
+### ComposioService.search_toolkits()
+
+```python
+async def search_toolkits(
+    self,
+    query: Optional[str] = None,
+    category: Optional[str] = None,
+) -> List[ToolkitInfo]
+```
+
+Searches the Composio toolkit catalog.
+
+<ResponseField name="query" type="str">Free-text search string (e.g. `"gmail"`, `"calendar"`).</ResponseField>
+<ResponseField name="category" type="str">Toolkit category filter (e.g. `"communication"`, `"productivity"`).</ResponseField>
+
+**Returns:** `List[ToolkitInfo]` — toolkit metadata (slug, name, description, auth_type, categories).
+
+**Raises:** `ComposioUnavailableError` if Composio is disabled.
+
+**Called by:** `routers/mcp_toolkits.py` — GET `/mcp/toolkits/search`.
+
+---
+
+### ComposioService.get_toolkit_details()
+
+```python
+async def get_toolkit_details(self, slug: str) -> Optional[ToolkitDetails]
+```
+
+Returns detailed information for a specific toolkit by slug, including available tools and auth schema.
+
+**Called by:** `routers/mcp_toolkits.py` — GET `/mcp/toolkits/{slug}`.
+
+---
+
+### ComposioService.get_toolkit_categories()
+
+```python
+async def get_toolkit_categories(
+    self, managed_only: bool = True,
+) -> List[ToolkitCategoryInfo]
+```
+
+Returns all toolkit categories with toolkit counts. `managed_only=True` (default) filters counts to user-connectable toolkits only, keeping sidebar counts consistent with `/search`.
+
+**Called by:** `routers/mcp_toolkits.py` — GET `/mcp/toolkits/categories`.
+
+---
+
+### ComposioService.get_managed_toolkit_slugs()
+
+```python
+async def get_managed_toolkit_slugs(self) -> set[str]
+```
+
+Returns the set of toolkit slugs that Composio manages auth for (lowercase). Cached in Redis with 1-hour TTL. Used to filter out unmanaged toolkits (e.g. Twitter, TikTok) from user-facing surfaces and the agent's tool registry.
+
+**Called by:** `routers/mcp_integrations.py`, `routers/agent/mcp_tools.py` — disabled-toolkits endpoint.
+
+---
+
+## Connection Management
+
+### ComposioService.list_user_composio_connections()
+
+```python
+async def list_user_composio_connections(self, user_id: str) -> List[Dict[str, Any]]
+```
+
+HTTP-only variant of `get_user_connections`. Fetches Composio connections without a DB session. Returns `[]` and logs a warning on Composio failure.
+
+**Returns:** List of dicts: `{source, toolkit, account_id, status, created_at, email, display_name, account_label}`.
+
+**Note:** This method has `@composio_enabled_guard` applied twice in the source (lines 92–93 of `composio_service.py`). The duplicate decorator is a no-op — the second application wraps an already-wrapped coroutine, so behavior is unchanged. Harmless but worth cleaning up.
+
+---
+
+### ComposioService.get_user_connections()
+
+```python
+async def get_user_connections(
+    self,
+    user_id: str,
+    db: Optional[AsyncSession] = None,
+) -> List[Dict[str, Any]]
+```
+
+Merges Composio connections with non-Composio providers (e.g. Telegram). Pre-loads DB account labels before making the Composio HTTP call to avoid holding a DB pool connection during the external call.
+
+**Returns:** Merged list of connection dicts.
+
+**Called by:** `routers/mcp_integrations.py` — GET `/mcp/integrations/connections`.
+
+---
+
+### ComposioService.connect_toolkit()
+
+```python
+async def connect_toolkit(
+    self,
+    user_id: str,
+    toolkit: str,
+    redirect_url: Optional[str] = None,
+    db: Optional[AsyncSession] = None,
+    allow_multiple: bool = False,
+    connection_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]
+```
+
+Initiates an OAuth connection for a toolkit. For non-Composio providers (Telegram), returns a manual credentials prompt.
+
+<ResponseField name="toolkit" type="str" required>Toolkit slug (e.g. `"github"`, `"gmail"`).</ResponseField>
+<ResponseField name="redirect_url" type="str">Custom OAuth redirect URL. Defaults to the app callback.</ResponseField>
+<ResponseField name="allow_multiple" type="bool">Whether to allow multiple accounts for the same toolkit. Default: False.</ResponseField>
+<ResponseField name="connection_data" type="dict">Extra fields required by some toolkits (e.g. `{"subdomain": "my-org"}` for Jira).</ResponseField>
+
+**Returns:** `{"auth_type": "composio", "redirect_url": str, "toolkit": str, "connection_id": str}` for OAuth toolkits, or `{"auth_type": "manual", ...}` for non-Composio providers.
+
+**Side effects:** Inserts a `ComposioConnection(status=pending)` row in the DB if `db` is provided.
+
+**Called by:** `routers/mcp_integrations.py` — POST `/mcp/integrations/connect`.
+
+---
+
+### ComposioService.disconnect_toolkit()
+
+```python
+async def disconnect_toolkit(
+    self,
+    user_id: str,
+    toolkit: str,
+    account_id: Optional[str] = None,
+    db: Optional[AsyncSession] = None,
+) -> Dict[str, Any]
+```
+
+Disconnects a toolkit account. Resolves `account_id` from the first matching connection if not provided. Updates local `ComposioConnection.status = revoked` if `db` is provided.
+
+**Returns:** `{"success": bool, "toolkit": str, "account_id": str, "message": str}`
+
+**Called by:** `routers/mcp_integrations.py` — POST `/mcp/integrations/disconnect`.
+
+---
+
+### ComposioService.get_connected_account()
+
+```python
+async def get_connected_account(self, account_id: str) -> Any
+```
+
+Fetches the latest state of a single connected account by ID. Used by the OAuth callback completion poller to detect when an account transitions from `INITIATED` to `ACTIVE`/`FAILED`/`EXPIRED`.
+
+**Called by:** `services/mcp_connection_completion.py`.
+
+---
+
+## Agent MCP Config
+
+### ComposioService.get_mcp_config()
+
+```python
+async def get_mcp_config(
+    self,
+    user_id: str,
+    toolkits: Optional[List[str]] = None,
+    disabled_toolkits: Optional[List[str]] = None,
+) -> MCPConfig
+```
+
+Generates the MCP server configuration for the agent to connect directly to Composio. The agent receives an MCP server URL + auth token and calls Composio tools as if they were local MCP tools.
+
+<ResponseField name="toolkits" type="list[str]">If provided, only expose tools from these toolkit slugs.</ResponseField>
+<ResponseField name="disabled_toolkits" type="list[str]">If provided, exclude tools from these toolkit slugs.</ResponseField>
+
+**Returns:** `MCPConfig` with server URL and auth details.
+
+**Called by:** `routers/agent/mcp_tools.py` — GET `/agent/mcp/config`.
+
+---
+
+## Task-based Tool Discovery
+
+### ComposioService.get_tools_for_task()
+
+```python
+async def get_tools_for_task(
+    self,
+    user_id: str,
+    task_description: str,
+    max_tools: int = 20,
+) -> List[ToolInfo]
+```
+
+Uses Composio's semantic search to find the most relevant tools for a task description.
+
+<ResponseField name="task_description" type="str" required>Natural-language description of the task to accomplish.</ResponseField>
+<ResponseField name="max_tools" type="int">Maximum number of tools to return. Default: 20.</ResponseField>
+
+**Returns:** `List[ToolInfo]` ranked by relevance.
+
+**Called by:** `routers/mcp_toolkits.py` — POST `/mcp/toolkits/tools-for-task`.
+
+---
+
+## Triggers
+
+### ComposioService.create_trigger()
+
+```python
+async def create_trigger(
+    self,
+    user_id: str,
+    toolkit: str,
+    config: Dict[str, Any],
+    account_id: Optional[str] = None,
+) -> TriggerCreateResult
+```
+
+Creates a Composio trigger for event-driven agent reactions. Resolves `connected_account_id` for the toolkit if not provided.
+
+<ResponseField name="toolkit" type="str" required>Toolkit slug for the trigger (e.g. `"gmail"`).</ResponseField>
+<ResponseField name="config" type="dict" required>Must contain `trigger_name` and optionally `config` (trigger-specific parameters).</ResponseField>
+<ResponseField name="account_id" type="str">Specific connected account to use. Auto-resolved if omitted.</ResponseField>
+
+**Returns:** `TriggerCreateResult` with the trigger ID and status.
+
+**Called by:** `routers/mcp_triggers.py` — POST `/mcp/triggers`.
+
+---
+
+### ComposioService.list_triggers()
+
+```python
+async def list_triggers(self, user_id: str) -> List[TriggerInfo]
+```
+
+Returns the user's active Composio triggers.
+
+**Called by:** `routers/mcp_triggers.py` — GET `/mcp/triggers`.
+
+---
+
+### ComposioService.delete_trigger()
+
+```python
+async def delete_trigger(self, user_id: str, trigger_id: str) -> bool
+```
+
+Deletes a trigger by ID.
+
+**Returns:** `True` on success.
+
+**Called by:** `routers/mcp_triggers.py` — DELETE `/mcp/triggers/{trigger_id}`.
+
+---
+
+### ComposioService.list_trigger_types()
+
+```python
+async def list_trigger_types(
+    self, toolkit: Optional[str] = None
+) -> List[TriggerTypeInfo]
+```
+
+Returns available trigger types, optionally filtered by toolkit.
+
+---
+
+### ComposioService.list_trigger_app_counts()
+
+```python
+async def list_trigger_app_counts(self) -> List[Dict[str, Any]]
+```
+
+Fast path: returns trigger counts per app without fetching config schemas. Used for sidebar badge rendering.
+
+---
+
+## Related services
+
+### MCP Integration Builder (`mcp_integration_builder/`)
+
+Provides low-level MCP server construction:
+
+- `builder.py` — `MCPIntegrationBuilder` — top-level coordinator
+- `client_pool.py` — `MCPClientPool` — manages persistent MCP client connections
+- `generator.py` — `IntegrationCodeGenerator` — generates Python provider/service/config/client stubs from `IntegrationMetadata` using Jinja2 templates
+- `introspector.py` — `MCPIntrospector` — discovers tools and schemas from an MCP server
+- `launcher.py` — `MCPServerLauncher` — starts and monitors MCP server processes
+- `schemas.py` — Pydantic schemas for MCP integration configuration
+
+**`IntegrationCodeGenerator` methods:**
+
+| Method | Description |
+|---|---|
+| `generate_provider(metadata) → str` | Renders `BaseMCPProvider` subclass with all tools pre-wired |
+| `generate_service(metadata) → str` | Renders service class with method stubs for each tool |
+| `generate_config(metadata) → str` | Renders `*Config` dataclass with OAuth credentials fields |
+| `generate_client(metadata) → str` | Renders thin HTTP client stub (skeleton only) |
+| `generate_all(metadata) → Dict[str, str]` | Runs all 4 generators; returns `{provider, service, config, client}` map |
+| `write_to_disk(metadata, output_dir, overwrite=False)` | Writes generated files to `output_dir/integrations/{provider_name}/`; raises if files exist and `overwrite=False` |
+
+### MCP Probe Service (`mcp_probe_service.py`)
+
+Probes an MCP server URL to discover available tools and validate connectivity. Used during integration setup.
+
+### MCP Token Store (`mcp_token_store.py`)
+
+Manages encrypted OAuth tokens for MCP integrations. Stores tokens in the DB, decrypts on demand for agent use.
+
+### OAuth State (`oauth_state.py`)
+
+Manages short-lived Redis state for OAuth flows: stores state parameters during redirect and validates on callback.
+
+### MCP Connection Completion (`mcp_connection_completion.py`)
+
+Polls Composio for connection status transitions after OAuth redirect. Uses Redis SETNX dedup to prevent duplicate reconciliation.
+
+For the low-level integration layer (`MCPFacade`, `MCPToolsService`, `BaseMCPProvider`, `MCPOAuthService`, `OAuthMCPService`, `GoogleOAuthAdapter`, `IntegrationCodeGenerator`, `ComposioConnectionAdapter`, `ComposioToolkitAdapter`, `ComposioTriggerAdapter`) see the dedicated reference page: [MCP Integration Layer](/reference/backend/mcp-integration).
+

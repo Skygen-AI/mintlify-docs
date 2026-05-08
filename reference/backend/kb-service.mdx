@@ -1,0 +1,256 @@
+---
+title: "KB Service"
+description: "Knowledge base CRUD with 3-level Copy-on-Write, tombstone deletes, and Gemini-powered semantic search."
+---
+
+## Overview
+
+`app/services/kb_service.py` (1004 lines) is a **module-level async function library** — no class, no singleton. It provides the full CRUD surface for the `GeneralInsight` table backed by `pgvector` cosine-similarity search.
+
+**Embedding provider:** Gemini Developer API (`generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents`), authenticated via `GEMINI_API_KEY`. Produces **768-dimensional** vectors.
+
+> **Important:** `get_embeddings_openrouter` exists in the file but is **not called** from any CRUD path. It is dead/alternative code. All production embedding calls go through `get_embeddings()` → Gemini.
+
+**DB model:** `GeneralInsight` — stores `content`, `embedding` (pgvector), `agent_type`, `insight_type`, `global_insight_type`, `user_id`, `overrides_global_id`, `is_tombstone`, `is_user_visible`.
+
+---
+
+## Copy-on-Write Hierarchy
+
+The knowledge base is shared across three levels. More specific levels shadow less specific ones:
+
+```
+Level 0 (global)      user_id = "global"
+Level 1 (user)        user_id = <user_uuid>
+Level 2 (emplogent)   user_id = <user_uuid>, agent_type = "character:<emplogent_id>"
+```
+
+**CoW rule for `update_knowledge` and `delete_knowledge`:**
+
+- Editing/deleting a **global** insight from a user context: creates a user-level copy (`overrides_global_id` set) rather than modifying the shared row.
+- Editing/deleting a **global or user-level** insight from an emplogent context: creates an emplogent-level copy (`agent_type = "character:<id>"`).
+- Editing an insight that is already owned at the caller's scope: direct `UPDATE`.
+
+**Tombstone deletes:** Instead of physically removing global insights, a tombstone row (`is_tombstone=True`, `is_user_visible=False`, `overrides_global_id=<global_id>`) is created at the caller's scope. The retrieval query filters out tombstoned rows.
+
+---
+
+## Embeddings
+
+### get_embeddings()
+
+```python
+async def get_embeddings(texts: List[str]) -> Optional[List[List[float]]]
+```
+
+Calls Gemini `batchEmbedContents` API with `outputDimensionality=768`. Texts are chunked into batches of 128 before sending. Falls back to `output_dimensionality` key if the first attempt fails (Gemini API inconsistency across versions).
+
+<ResponseField name="texts" type="list[str]" required>Texts to embed. Empty list returns `None`.</ResponseField>
+
+**Returns:** List of 768-dim float vectors, or `None` on any failure.
+
+**Failure modes:** Missing `GEMINI_API_KEY`, HTTP non-200, malformed response, network error. All failures return `None` — callers must handle gracefully.
+
+**Logs:** `log_external_api_call` with `service="Gemini"`, `endpoint=":batchEmbedContents"`, latency, and count.
+
+---
+
+## CRUD Functions
+
+### save_knowledge()
+
+```python
+async def save_knowledge(
+    db: AsyncSession,
+    agent_type: str,
+    insight_type: str,
+    global_insight_type: str,
+    user_id: str,
+    content: str,
+    key: str,
+    metadata: Dict,
+    timestamp: str,
+    is_user_visible: bool = True,
+) -> Dict[str, Any]
+```
+
+Creates a new insight or updates an existing one via **semantic dedup**.
+
+**Dedup logic:** Before inserting, embeds `key` and searches for similar insights with cosine distance `< 0.08` for the same `(user_id, insight_type)`. Global insights are skipped when the caller is a regular user — only user-level duplicates are matched. If a duplicate is found, the content is updated instead of creating a new row. The result dict includes `"dedup": True` when an update occurred.
+
+**`INTERNAL_INSIGHT_TYPES`:** `{"trajectory_plan"}` — always forces `is_user_visible=False` regardless of caller argument. Used for agent-internal planning memory that should never surface in user-facing knowledge panels.
+
+<ResponseField name="agent_type" type="str" required>Scope identifier. Use `"character:<emplogent_id>"` for emplogent-level scope.</ResponseField>
+<ResponseField name="insight_type" type="str" required>Semantic category (e.g. `"preference"`, `"trajectory_plan"`).</ResponseField>
+<ResponseField name="global_insight_type" type="str" required>Top-level category enum value.</ResponseField>
+<ResponseField name="user_id" type="str" required>User UUID, or `"global"` for platform-wide insights.</ResponseField>
+<ResponseField name="content" type="str" required>Human-readable content stored in the row.</ResponseField>
+<ResponseField name="key" type="str" required>Short summary used for embedding generation (dedup + retrieval key).</ResponseField>
+<ResponseField name="metadata" type="dict" required>Arbitrary JSON metadata stored on the row.</ResponseField>
+<ResponseField name="timestamp" type="str" required>ISO 8601 creation timestamp.</ResponseField>
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "insight_id": "<uuid>",
+  "dedup": true   // only present when an existing row was updated
+}
+```
+
+**Never raises.** All exceptions are caught and returned as `{"success": false, "errors": ["..."]}`.
+
+---
+
+### update_knowledge()
+
+```python
+async def update_knowledge(
+    db: AsyncSession,
+    insight_id: str,
+    user_id: Optional[str] = None,
+    agent_type: Optional[str] = None,
+    insight_type: Optional[str] = None,
+    global_insight_type: Optional[str] = None,
+    content: Optional[str] = None,
+    key: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+    timestamp: Optional[str] = None,
+    is_user_visible: Optional[bool] = None,
+) -> Dict[str, Any]
+```
+
+Updates an insight with full CoW support. Only provided fields are changed (`None` = keep existing).
+
+**CoW behavior:**
+
+1. **Emplogent scope + different `agent_type`** → create emplogent-level override (new row with `overrides_global_id=insight_id`). If an override already exists for this emplogent, update it and clear `is_tombstone`.
+2. **Global insight + non-global user** → create user-level CoW copy. If an override already exists, update it and clear `is_tombstone` (resurrection).
+3. **Own scope** → direct `UPDATE`.
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "insight_id": "<uuid>",
+  "cow": true   // present when a CoW copy was created/updated
+}
+```
+
+**Never raises.**
+
+---
+
+### delete_knowledge()
+
+```python
+async def delete_knowledge(
+    db: AsyncSession,
+    insight_id: str,
+    user_id: str,
+    agent_type: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+Deletes an insight with CoW tombstone support.
+
+**CoW behavior:**
+
+1. **Emplogent scope + different `agent_type`** → create emplogent-level tombstone row (`is_tombstone=True`, `is_user_visible=False`). If an emplogent override already exists, flip `is_tombstone=True` on it.
+2. **Global insight + non-global user** → create user-level tombstone. If a user override already exists, flip `is_tombstone=True` on it.
+3. **Own-scope insight** → physical `DELETE`.
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "tombstone_id": "<uuid>",   // present for CoW tombstone path
+  "cow": true
+}
+```
+
+**Never raises.**
+
+---
+
+### retrieve_relevant_knowledge()
+
+```python
+async def retrieve_relevant_knowledge(
+    db: AsyncSession,
+    query: str,
+    agent_type: str,
+    user_id: str,
+    insight_type: str,
+    num_insights: int,
+) -> Optional[Dict[str, Any]]
+```
+
+Semantic search: embeds `query` and runs pgvector cosine-similarity search scoped to `(agent_type, user_id, insight_type)`.
+
+<ResponseField name="query" type="str" required>Natural-language query to find relevant knowledge for.</ResponseField>
+<ResponseField name="agent_type" type="str" required>Scope for the search (regular user or `"character:<id>"`).</ResponseField>
+<ResponseField name="num_insights" type="int" required>Maximum number of results to return.</ResponseField>
+
+**Returns:**
+
+```json
+{
+  "insights": [
+    {
+      "agent_type": "...",
+      "user_id": "...",
+      "insight_type": "...",
+      "global_insight_type": "...",
+      "timestamp": "2024-01-01T00:00:00",
+      "metadata": {},
+      "content": "...",
+      "insight_id": "<uuid>"
+    }
+  ]
+}
+```
+
+Returns `{"insights": [], "error": "<msg>"}` when embedding fails or on exception. **Never raises.**
+
+---
+
+### save_task_evaluation()
+
+```python
+async def save_task_evaluation(
+    db: AsyncSession,
+    task_id: str,
+    user_id: str,
+    agent_type: str,
+    trajectory: List[Dict],
+    evaluation_results: Optional[Dict] = None,
+) -> bool
+```
+
+Persists a completed task's trajectory (action sequence) and optional evaluation scores. Used by agents to store learning signals for future retrieval.
+
+**Returns:** `True` on success, `False` on error. **Never raises.**
+
+---
+
+## Architecture Notes
+
+- **No class, no singleton** — all functions are module-level and receive `AsyncSession` as their first argument.
+- **Repository layer** — all DB queries delegate to `app/repositories/kb_repository.py`. The service owns CoW logic; the repository owns SQL.
+- **Embedding generation is in the service, not the repository** — because the CoW logic may need to re-embed content when copying from an existing row.
+- **Cosine distance computed in Python** (numpy) for the dedup check in `save_knowledge`. The pgvector `<=>` operator handles retrieval ranking in `retrieve_relevant_knowledge`.
+- **`get_embeddings_openrouter`** reads `OPENROUTER_API_KEY` and `OPENROUTER_EMBEDDING_MODEL` (default `google/gemini-embedding-001`). It is not called from any CRUD path and can be considered dead code.
+
+---
+
+## Related
+
+| Component | Location | Role |
+|---|---|---|
+| `kb_repository` | `app/repositories/kb_repository.py` | SQL queries: search_similar_insights, create_insight, update_insight, delete_insight, find_user_override, find_emplogent_override |
+| `GeneralInsight` | `app/models/` | ORM model with pgvector `embedding` column |
+| KB router | `app/routers/knowledge/` | REST endpoints for agent-facing KB CRUD |

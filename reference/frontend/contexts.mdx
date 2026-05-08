@@ -1,0 +1,215 @@
+---
+title: "Frontend Contexts Reference"
+description: "React contexts in the Skygen shared UI library — state provided, usage hooks, and provider setup."
+---
+
+# Frontend Contexts Reference
+
+All contexts live in `ui-shared-tauri/src/contexts/`. The context tree is established in `App.tsx`.
+
+<Warning>
+Most application state lives in the Zustand store (`useStore`), not in these contexts. Contexts here serve two roles: (1) thin Zustand bridges for backward compatibility, and (2) larger shared-state domains (`ConnectorsContext`) that are too stateful and side-effect-heavy to fit cleanly in a store slice.
+</Warning>
+
+---
+
+## Provider Order (App.tsx)
+
+```tsx
+<PlatformProvider>
+  <BrowserRouter>
+    <ThemeProvider>
+      <AuthProvider>
+        <StripeWrapper>
+          <BillingProvider>
+            <ConnectorsProvider>
+              <DevicesProvider>
+                {/* Routes */}
+              </DevicesProvider>
+            </ConnectorsProvider>
+          </BillingProvider>
+        </StripeWrapper>
+      </AuthProvider>
+    </ThemeProvider>
+  </BrowserRouter>
+</PlatformProvider>
+```
+
+---
+
+## PlatformContext
+
+**File:** `contexts/PlatformContext.tsx`  
+**Hook:** `usePlatform()`
+
+Provides the `IPlatformAdapter` instance and derived boolean flags for platform detection.
+
+### Value
+<ResponseField name="platform" type="IPlatformAdapter">The full platform adapter instance (access to storage, desktop, analytics, etc.).</ResponseField>
+<ResponseField name="platformType" type="'web' | 'macos' | 'windows'">Raw platform identifier.</ResponseField>
+<ResponseField name="isWeb" type="boolean">True on the browser web app.</ResponseField>
+<ResponseField name="isDesktop" type="boolean">True on Tauri desktop (macOS or Windows).</ResponseField>
+<ResponseField name="isMacOS" type="boolean">True on macOS desktop app.</ResponseField>
+<ResponseField name="isWindows" type="boolean">True on Windows desktop app.</ResponseField>
+
+### Usage
+```tsx
+const { isWeb, platform } = usePlatform();
+```
+
+### Conditional Rendering Components
+
+`PlatformContext.tsx` also exports render-guard components:
+
+```tsx
+<PlatformWeb>Only shown on web</PlatformWeb>
+<PlatformDesktop>Only shown on macOS/Windows</PlatformDesktop>
+<PlatformMacOS>Only shown on macOS</PlatformMacOS>
+<PlatformWindows>Only shown on Windows</PlatformWindows>
+
+<PlatformSwitch
+  web={<WebView />}
+  desktop={<DesktopView />}
+  fallback={<DefaultView />}
+/>
+```
+
+Each component accepts an optional `fallback` prop that renders when the condition does not match.
+
+**Used by:** `App.tsx`, `TaskInput`, `UpdateNotification`, and any component that branches on platform.
+
+---
+
+## ThemeContext
+
+**File:** `contexts/ThemeContext.tsx`  
+**Hook:** `useTheme()`
+
+Provides theme state (`light` / `dark`) and applies the `dark` class to `document.documentElement`.
+
+### Value
+<ResponseField name="theme" type="'light' | 'dark'">Current theme.</ResponseField>
+<ResponseField name="toggleTheme" type="() => void">Toggle between light and dark.</ResponseField>
+
+Persisted to `localStorage` via `uiSlice.setTheme()`. Initialised from storage on provider mount via `initTheme()`.
+
+### Usage
+```tsx
+const { theme, toggleTheme } = useTheme();
+```
+
+**Used by:** `SecuritySection` (settings), `AppHeader`
+
+---
+
+## AuthContext
+
+**File:** `contexts/AuthContext.tsx`  
+**Hook:** `useAuthContext()`
+
+Thin bridge over `authSlice` in Zustand. Calls `restoreSession()` on mount. Provides a subset of auth state.
+
+<Note>
+Prefer `useAuth()` (from `hooks/useAuth.ts`) over `useAuthContext()`. Both read from the same Zustand store; `useAuth` exposes more fields (2FA state, `setNeedsOTPSetup`, etc.). `AuthContext` is kept for components that were written before the hook existed.
+</Note>
+
+### Value
+<ResponseField name="user" type="User | null">Authenticated user.</ResponseField>
+<ResponseField name="isAuthenticated" type="boolean">Session active.</ResponseField>
+<ResponseField name="isLoading" type="boolean">Session restore in progress.</ResponseField>
+<ResponseField name="login" type="(email, password) => Promise<void>">Authenticate with credentials.</ResponseField>
+<ResponseField name="signup" type="(email, password) => Promise<void>">Register a new account.</ResponseField>
+<ResponseField name="logout" type="() => Promise<void>">Clear session.</ResponseField>
+
+**Used by:** `App.tsx` (mounts the provider)
+
+---
+
+## BillingContext
+
+**File:** `contexts/BillingContext.tsx`  
+**Hook:** `useBillingContext()`
+
+<Warning>
+This context is a **no-op stub**. Its `status` is always `null`, `isStatusLoading` is always `false`, and `refreshStatus` / `markOnboardingComplete` are empty functions. The real billing state is in `billingSlice` (Zustand). Use `useBilling()` from `hooks/useBilling.ts` for all billing state.
+</Warning>
+
+`BillingProvider` is kept in the context tree only to maintain the React tree shape and to avoid a breaking change for any code that imports `useBillingContext`.
+
+---
+
+## DevicesContext
+
+**File:** `contexts/DevicesContext.tsx`  
+**Hook:** `useDevicesContext()`
+
+Thin bridge over `deviceSlice`. Exposes devices list, selected device, load, select, and delete.
+
+<Note>
+Prefer `useDevices()` (from `hooks/useDevices.ts`). `useDevicesContext` does not expose `registerDevice`, `getSelectedDevice`, or `getOnlineDevices`. `DevicesContext` is kept for backward compatibility.
+</Note>
+
+### Value
+<ResponseField name="devices" type="Device[]">All registered devices.</ResponseField>
+<ResponseField name="selectedDeviceId" type="string | null">Currently selected device ID.</ResponseField>
+<ResponseField name="isLoading" type="boolean">True while loading.</ResponseField>
+<ResponseField name="loadDevices" type="() => Promise<void>">Fetch devices from API.</ResponseField>
+<ResponseField name="selectDevice" type="(id: string | null) => void">Select a device.</ResponseField>
+<ResponseField name="deleteDevice" type="(id: string) => Promise<void>">Delete a device.</ResponseField>
+
+---
+
+## ConnectorsContext
+
+**File:** `contexts/ConnectorsContext.tsx`  
+**Hook:** `useConnectors()`
+
+The largest and most stateful context. Manages the full integration layer: legacy connectors (Telegram, custom APIs), Composio toolkits, automation triggers, OAuth polling, connection health, and the Composio trust flow. This is the **primary** connector state source — do not use the API modules directly from components.
+
+### Value (selected — see source for full interface)
+<ResponseField name="connectors" type="IntegrationWithActive[]">Active legacy integrations with an `active` flag (tools enabled/disabled for agent).</ResponseField>
+<ResponseField name="isLoading" type="boolean">True while loading integrations.</ResponseField>
+<ResponseField name="composioUnavailable" type="boolean">True when Composio backend returned `composio_status: "unavailable"`. UI should show degraded state instead of empty list.</ResponseField>
+<ResponseField name="refreshConnectors" type="() => Promise<void>">Re-fetch all connectors.</ResponseField>
+<ResponseField name="connect" type="(provider: string) => Promise<void>">Start OAuth connect for a legacy provider.</ResponseField>
+<ResponseField name="disconnect" type="(provider: string, accountId?: string) => Promise<void>">Disconnect a provider.</ResponseField>
+<ResponseField name="connecting" type="Set<string>">Providers currently connecting.</ResponseField>
+<ResponseField name="disconnecting" type="Set<string>">Providers currently disconnecting.</ResponseField>
+<ResponseField name="toolkits" type="Toolkit[]">Composio toolkit list.</ResponseField>
+<ResponseField name="toolkitsLoading" type="boolean">Loading state for toolkit search.</ResponseField>
+<ResponseField name="searchToolkits" type="(query?, category?) => Promise<void>">Search available toolkits.</ResponseField>
+<ResponseField name="connectToolkit" type="(slug, connectionData?) => Promise<void>">Connect a Composio toolkit (may trigger trust dialog first).</ResponseField>
+<ResponseField name="disconnectToolkit" type="(slug, accountId) => Promise<void>">Disconnect a specific toolkit account.</ResponseField>
+<ResponseField name="addAnotherAccount" type="(slug) => Promise<void>">Add a second account for a toolkit.</ResponseField>
+<ResponseField name="renameAccount" type="(slug, accountId, newLabel) => Promise<void>">Rename a toolkit account.</ResponseField>
+<ResponseField name="composioTrustShown" type="boolean">Whether the user has seen the Composio data-handling disclosure.</ResponseField>
+<ResponseField name="pendingComposioConnect" type="{ slug, connectionData? } | null">Set before opening the OAuth window; cleared after trust is confirmed.</ResponseField>
+<ResponseField name="triggers" type="Trigger[]">All automation triggers.</ResponseField>
+<ResponseField name="triggersLoading" type="boolean">Loading state for triggers.</ResponseField>
+<ResponseField name="createTrigger" type="(toolkit, triggerType, actionPrompt, config?) => Promise<void>">Create an automation trigger.</ResponseField>
+<ResponseField name="updateTrigger" type="(triggerId, updates) => Promise<void>">Update a trigger.</ResponseField>
+<ResponseField name="deleteTrigger" type="(triggerId) => Promise<void>">Delete a trigger.</ResponseField>
+
+### Usage
+```tsx
+const {
+  connectors,
+  toolkits,
+  connectToolkit,
+  composioUnavailable,
+} = useConnectors();
+```
+
+**Used by:** `HomeUpdated`, `ChatPage`, `ConnectorsModal`, `MainLayout`, `useChatConnectors`
+
+---
+
+## Adding a New Context
+
+Contexts in this codebase follow three patterns:
+
+1. **Zustand bridge** — `useContext` wraps `useStore` calls. Add only when a legacy API contract must be preserved.
+2. **Stateful domain** — Complex state with multiple async effects that is shared across many components. `ConnectorsContext` is the model.
+3. **Platform-level** — Read once from `bootstrap()`, never mutated. `PlatformContext` is the model.
+
+For new features, prefer adding a Zustand slice and a hook wrapper over a new context.

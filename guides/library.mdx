@@ -1,127 +1,155 @@
 ---
-title: "Library"
-description: "Curated catalog of reusable use-case templates organized by category."
+title: "Agent Library"
+description: "The use-case library: pre-built agent prompt templates organized by category."
 ---
 
-The library is a **public, no-auth** catalog of reusable "use case" templates. Each card bundles a title, description, prompt, image, and badge. Admins curate the content; users browse, click a card, and open a new session pre-filled with the template's prompt.
+## Overview
 
-## Model
+The Agent Library is a curated collection of prompt templates organized into categories (Finance, Research, Productivity, Marketing, etc.). Each card contains a title, subtitle, description, badge text, and a ready-to-use prompt. Users click a card to instantly launch an agent task with that prompt — no typing required.
 
-**LibraryCategory**:
+The library is admin-managed (content curated by the Skygen team) and displayed prominently on the home page and the dedicated Library page.
 
-- `id` UUID
-- `slug` unique URL-safe string (e.g. `finance`, `research`)
-- `name`, `description`
-- `sort_order`
-- `is_active` (soft delete)
+---
 
-**LibraryCard**:
+## Data model
 
-- `id` UUID
-- `category_id` FK
-- `title`, `subtitle`, `description`
-- `prompt` — the full instruction text
-- `image_base64` — PNG/JPG encoded for inline display
-- `badge_text` — "New", "Popular", etc.
-- `send_to_landing_main_screen` — boolean for homepage featuring
-- `is_active`, `sort_order`
+### LibraryCategory
 
-## Endpoints (public, no auth)
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Category identifier |
+| `slug` | string | URL-friendly slug (e.g. `productivity`) |
+| `name` | string | Display name (e.g. `Productivity`) |
+| `description` | string | Optional description |
+| `sort_order` | integer | Display ordering |
+| `is_active` | boolean | Visibility toggle |
 
-### `GET /library/types`
+### LibraryCard
 
-All active categories.
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Card identifier |
+| `category_id` | UUID | Parent category |
+| `title` | string | Card title (max 200 chars) |
+| `subtitle` | string | Subtitle for landing bullets |
+| `description` | string | Short description shown on the card |
+| `prompt` | string | Full agent prompt template |
+| `image_base64` | string | Card image as data URI (`data:image/png;base64,...`) |
+| `badge_text` | string | Optional badge (e.g. "Saved $3k/year on average") |
+| `send_to_landing_main_screen` | boolean | Whether to feature on the home page |
+| `sort_order` | integer | Display ordering within category |
 
-Response:
+---
+
+## API reference
+
+### List categories
+
+```http
+GET /library/types
+```
+
+No authentication required. Returns all active categories ordered by `sort_order`.
 
 ```json
 {
   "items": [
-    { "id": "cat-1", "slug": "finance", "name": "Finance & Accounting", "description": "..." },
-    { "id": "cat-2", "slug": "research", "name": "Research", "description": "..." }
+    {"id": "...", "slug": "productivity", "name": "Productivity", "description": null},
+    {"id": "...", "slug": "finance", "name": "Finance", "description": null}
   ],
-  "total": 2
+  "total": 6
 }
 ```
 
-### `GET /library/cards`
+### Get cards by category
 
-All cards, with optional filters.
+```http
+GET /library/cards?type_slug=productivity
+```
 
-Query:
+No authentication required.
 
-- `type` — filter by category slug (e.g. `finance`)
-- `filter` — `send_to_landing_main_screen` to get homepage features
-- `ids` — comma-separated IDs; returns in specified order
-
-Response:
+<ParamField query="type_slug" type="string" required>
+  Category slug returned from `/library/types`.
+</ParamField>
 
 ```json
 {
   "items": [
     {
-      "id": "card-1",
-      "title": "Generate Q1 financial report",
-      "subtitle": "From spreadsheet",
-      "description": "...",
-      "prompt": "Analyze the attached Q1 spreadsheet...",
-      "image_base64": "iVBORw0KGgo...",
-      "badge_text": "Popular"
+      "id": "card-uuid",
+      "title": "Daily Email Digest",
+      "subtitle": "Summarize your inbox every morning",
+      "description": "Reads unread emails and creates a structured digest",
+      "prompt": "Read my unread emails from the last 24 hours and create a structured daily digest...",
+      "image_base64": "data:image/png;base64,...",
+      "badge_text": "Saves 30 min/day"
     }
   ],
-  "total": 1
+  "total": 12
 }
 ```
 
-### `GET /library/cards/{id}`
+### Get all library cards (paginated)
 
-Single card detail. 404 if not found or soft-deleted.
-
-## Working examples
-
-```bash
-# Browse finance cards
-curl "https://api.skygen.ai/library/cards?type=finance"
-
-# Homepage features
-curl "https://api.skygen.ai/library/cards?filter=send_to_landing_main_screen"
-
-# Specific cards in order
-curl "https://api.skygen.ai/library/cards?ids=card-1,card-2,card-3"
-
-# Single card
-curl "https://api.skygen.ai/library/cards/card-abc-123"
+```http
+GET /library/cards/all?limit=50&offset=0
 ```
 
-## Frontend integration
+Returns all active cards regardless of category. Useful for search or bulk display.
 
-In the WebApp, `LibraryPage` loads categories + cards at mount. Clicking a card:
+---
 
-1. Saves `{ prompt: card.prompt }` to `sessionStorage.pendingPrompt`
-2. Navigates to `/` (HomeUpdated)
-3. HomeUpdated reads the pending prompt and pre-fills `TaskInput` in the next session
+## Using a library card
 
-## Gotchas
+In the frontend, clicking a library card:
 
-<Note>
-**Image payload can be large.** `image_base64` is returned with every card. For a page with 50 cards, that's megabytes of JSON. Consider paginating or adding a separate endpoint that returns cards without images.
-</Note>
+1. Pre-fills the chat input with the card's `prompt` value.
+2. Optionally auto-submits the prompt to start the agent task immediately.
+3. Creates a new chat session (or reuses the active one).
 
-<Note>
-**Prompt can be long.** Some templates are 2–10 KB of instructions. Fine for an API, but budget accordingly on the client.
-</Note>
+From the API:
 
-<Note>
-**Category slug is URL-safe but unvalidated at client.** A typo in `?type=finace` returns 404 with a generic message, not a typo hint.
-</Note>
+```python
+import httpx
 
-## Admin
+# 1. Get card prompt
+cards = httpx.get("https://api.skygen.ai/library/cards?type_slug=productivity").json()
+card = cards["items"][0]
 
-Categories and cards are created through the admin panel. See [Admin overview](/admin/overview). Key admin endpoints:
+# 2. Create a session and send the prompt
+session = httpx.post(
+    "https://api.skygen.ai/chat/sessions",
+    headers={"Authorization": f"Bearer {token}"},
+    json={"title": card["title"]},
+).json()
 
-- `GET/POST/PUT/DELETE /admin/api/library/categories`
-- `GET/POST/PUT/DELETE /admin/api/library/cards`
+httpx.post(
+    f"https://api.skygen.ai/chat/sessions/{session['id']}/messages",
+    headers={"Authorization": f"Bearer {token}"},
+    json={"content": card["prompt"]},
+)
+```
 
-## See also
+---
 
-- [Chat sessions](/concepts/chat-sessions) — how a template becomes a session
+## Admin management
+
+Admins manage library content at:
+
+- `GET /admin/api/library/categories` — list all categories
+- `POST /admin/api/library/categories` — create a category
+- `PUT /admin/api/library/categories/{id}` — update a category
+- `DELETE /admin/api/library/categories/{id}` — delete a category
+- `GET /admin/api/library/cards` — list all cards
+- `POST /admin/api/library/cards` — create a card
+- `PUT /admin/api/library/cards/{id}` — update a card
+- `DELETE /admin/api/library/cards/{id}` — delete a card
+
+Cards with `send_to_landing_main_screen = true` appear in the home page quick-actions grid. Up to 6 featured cards are displayed.
+
+---
+
+## Landing page integration
+
+The library homepage widget shows featured cards (those with `send_to_landing_main_screen = true`) grouped by the `quickActions` categories (`productivity`, `research`, `health`). These are rendered as suggestion chips that auto-fill the main task input on click.

@@ -1,217 +1,346 @@
 ---
-title: "Expose your HTTP API to the agent"
-description: "Define a custom_api connector with encrypted secrets, then let the agent call it as a tool."
+title: "Tutorial: Custom API Connector"
+description: "Register any HTTP API as a Skygen connector so your agent can call its endpoints as native tools."
 ---
 
-This tutorial shows how to turn any internal HTTP API into a tool the agent can call. You'll define a connector, configure encrypted secrets, and use templated substitution so secrets never leave backend memory.
+## Overview
 
-## Scenario
+Skygen custom connectors let you expose any HTTP API — your own backend, a SaaS API, an internal tool — as a set of tools the agent can invoke. In this tutorial you will:
 
-Your company runs an internal orders service at `https://orders.internal.acme.corp`. Authenticated with a bearer token. You want the agent to be able to fetch an order or cancel it on your behalf.
+1. Register an OpenAPI-based connector (auto tool discovery)
+2. Register a manual REST connector (explicit tool definitions)
+3. Test tool execution via the agent
+4. Secure the connector with authentication
 
-## 1. Create the connector
+We will use a public API (JSONPlaceholder) for OpenAPI and a fictional internal CRM for manual definitions.
 
-```bash
-curl -X POST https://api.skygen.ai/connectors/custom \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Internal Orders",
-    "slug": "internal-orders",
-    "type": "custom_api",
-    "description": "ACME internal orders service",
+---
+
+## Prerequisites
+
+- Skygen account with Standard plan
+- Python 3.9+ with `httpx`
+- Your Skygen API token
+
+---
+
+## Part 1: OpenAPI connector (auto-discovery)
+
+### Step 1.1: Register the connector
+
+OpenAPI connectors introspect a spec URL and automatically generate tool definitions for every endpoint.
+
+```python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+}
+
+# Register a connector using JSONPlaceholder's OpenAPI spec
+connector_payload = {
+    "type": "openapi",
+    "name": "JSONPlaceholder API",
+    "description": "A fake REST API for testing. Provides posts, comments, users, todos.",
     "config": {
-      "server_url": "https://orders.internal.acme.corp",
-      "timeout": 30,
-      "secrets": {
-        "API_KEY": "sk-real-key-abc123"
-      }
+        "base_url": "https://jsonplaceholder.typicode.com",
+        "spec_url": "https://jsonplaceholder.typicode.com",  # or actual OpenAPI JSON URL
+        "auth_type": "none",
     },
-    "tools": []
-  }'
-```
-
-Response:
-
-```json
-{
-  "id": "conn_xyz",
-  "type": "custom_api",
-  "slug": "internal-orders",
-  "config": {
-    "server_url": "https://orders.internal.acme.corp",
-    "timeout": 30,
-    "secrets": {
-      "API_KEY": "***"
-    }
-  },
-  "status": "connected"
 }
+
+resp = httpx.post(f"{BASE_URL}/connectors", headers=headers, json=connector_payload)
+connector = resp.json()
+CONNECTOR_ID = connector["id"]
+print(f"Connector created: {CONNECTOR_ID}")
+print(f"Slug: {connector['slug']}")
+print(f"Status: {connector['status']}")
 ```
 
-The secret is redacted in the response — stored encrypted with `MCP_CRYPTO_KEY` (Fernet) in the DB.
+### Step 1.2: Add an icon (optional)
 
-## 2. How the agent sees the tool
+```python
+import requests
 
-Custom-API connectors expose a single generic tool named `custom_api__<connector_id>`:
+# Step A: Get presigned URL
+icon_resp = httpx.post(
+    f"{BASE_URL}/connectors/icon/presigned",
+    headers=headers,
+    json={"content_type": "image/png", "file_extension": "png"},
+)
+presigned = icon_resp.json()
 
-```json
-{
-  "name": "custom_api__conn_xyz",
-  "description": "Custom API: Internal Orders\n\nAvailable secrets: API_KEY\nUse {{SECRET_NAME}} syntax in headers and body.",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "method": {"type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE"]},
-      "url": {"type": "string"},
-      "headers": {"type": "object"},
-      "body": {"type": "object"}
+# Step B: Upload icon to S3
+with open("my-api-icon.png", "rb") as f:
+    requests.post(
+        presigned["upload_url"],
+        data=presigned["fields"],
+        files={"file": f},
+    )
+
+# Step C: Link icon to connector
+httpx.patch(
+    f"{BASE_URL}/connectors/{CONNECTOR_ID}/icon",
+    headers=headers,
+    json={"icon_key": presigned["icon_key"]},
+)
+print("Icon uploaded")
+```
+
+### Step 1.3: Use it in a task
+
+```python
+# Create a session and ask the agent to use the connector
+session = httpx.post(
+    f"{BASE_URL}/chat/sessions",
+    headers=headers,
+    json={"title": "JSONPlaceholder test"},
+).json()
+
+SESSION_ID = session["id"]
+
+httpx.post(
+    f"{BASE_URL}/chat/sessions/{SESSION_ID}/messages",
+    headers=headers,
+    json={
+        "content": "Use the JSONPlaceholder API connector to fetch the first 5 posts "
+                   "and summarize their titles.",
     },
-    "required": ["method", "url"]
-  }
-}
+)
+print(f"Task running at: https://app.skygen.ai/chat/{SESSION_ID}")
 ```
 
-The agent reads this schema, plans a call, and uses `{{API_KEY}}` templates where it wants the secret substituted.
+---
 
-## 3. Example agent call
+## Part 2: Manual REST connector
 
-The agent, reasoning through "fetch order 42", emits a tool call like:
+For APIs without OpenAPI specs, define tools explicitly.
 
-```json
-{
-  "tool_name": "custom_api__conn_xyz",
-  "arguments": {
-    "method": "GET",
-    "url": "https://orders.internal.acme.corp/orders/42",
-    "headers": {
-      "Authorization": "Bearer {{API_KEY}}"
-    }
-  }
-}
-```
+### Step 2.1: Define the connector with tools
 
-Skygen's backend decrypts the connector config, substitutes `{{API_KEY}}` with the plaintext, and makes the HTTP request:
-
-```
-GET /orders/42 HTTP/1.1
-Host: orders.internal.acme.corp
-Authorization: Bearer sk-real-key-abc123
-```
-
-The response flows back to the agent as the tool result.
-
-<Warning>
-**The agent never sees the plaintext secret.** Substitution happens server-side, after the agent's tool-call arguments arrive. Logs show `{{API_KEY}}` not the resolved value.
-</Warning>
-
-## 4. Mark destructive tools
-
-For endpoints that mutate or destroy data, make the agent pause for user approval by tagging the tool with `requires_confirmation: true` in the connector's `tools` array. This triggers the [confirmations flow](/concepts/confirmations) and the agent won't run until the user clicks Approve.
-
-```json
-{
-  "tools": [
-    {
-      "name": "cancel_order",
-      "description": "Cancel an order by ID",
-      "input_schema": {
-        "type": "object",
-        "properties": { "order_id": {"type": "string"} },
-        "required": ["order_id"]
-      },
-      "action": {
-        "type": "http",
-        "method": "POST",
-        "path": "/orders/{order_id}/cancel",
-        "headers": {"X-API-Key": "{{API_KEY}}"},
-        "requires_confirmation": true
-      }
-    }
-  ]
-}
-```
-
-## 5. Upload an icon
-
-```bash
-# Get presigned URL
-curl -X POST https://api.skygen.ai/connectors/icon/presigned \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"content_type": "image/png", "file_extension": "png"}'
-# → { "upload_url": "https://s3.../presigned", "fields": {...}, "icon_key": "connector-icons/<user>/abc.png" }
-
-# Upload (multipart POST with fields + file) — done client-side
-
-# Attach to connector
-curl -X PATCH https://api.skygen.ai/connectors/custom/conn_xyz \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"icon_url": "https://minio.../connector-icons/<user>/abc.png"}'
-```
-
-Max 2 MB. Allowed types: PNG, JPEG, SVG, WebP. Presigned URL valid 5 minutes.
-
-## 6. Test the connector
-
-A simple session that exercises the new tool:
-
-```bash
-curl -X POST https://api.skygen.ai/sessions \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"title": "Test orders connector"}'
-# → { "id": "sess_test" }
-
-curl -X POST https://api.skygen.ai/sessions/sess_test/messages \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"role": "user", "content": "Using the internal-orders connector, fetch order 42 and tell me its status."}'
-```
-
-Watch the `/user` Socket.IO namespace for the tool call and result, or read the message history afterwards.
-
-## 7. Update or rotate secrets
-
-```bash
-curl -X PATCH https://api.skygen.ai/connectors/custom/conn_xyz \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
+```python
+crm_connector = {
+    "type": "rest",
+    "name": "Internal CRM",
+    "description": "Access customer records, create tickets, and manage accounts.",
     "config": {
-      "server_url": "https://orders.internal.acme.corp",
-      "secrets": {"API_KEY": "sk-new-rotated-key"}
-    }
-  }'
+        "base_url": "https://crm.internal.example.com/api/v1",
+        "auth_type": "bearer",
+        "auth_token": "crm-internal-api-key-xyz",
+    },
+    "tools": [
+        {
+            "name": "get_customer",
+            "description": "Retrieve a customer record by their email address.",
+            "method": "GET",
+            "path": "/customers",
+            "parameters": {
+                "email": {
+                    "type": "string",
+                    "description": "Customer email address",
+                    "required": True,
+                    "location": "query",
+                }
+            },
+        },
+        {
+            "name": "create_support_ticket",
+            "description": "Create a new support ticket for a customer.",
+            "method": "POST",
+            "path": "/tickets",
+            "body_schema": {
+                "customer_id": {
+                    "type": "string",
+                    "description": "Customer UUID from get_customer",
+                    "required": True,
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Ticket subject line",
+                    "required": True,
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high", "urgent"],
+                    "description": "Ticket priority",
+                    "required": False,
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Full ticket description",
+                    "required": True,
+                },
+            },
+        },
+        {
+            "name": "list_customer_tickets",
+            "description": "List open support tickets for a customer.",
+            "method": "GET",
+            "path": "/tickets",
+            "parameters": {
+                "customer_id": {
+                    "type": "string",
+                    "description": "Customer UUID",
+                    "required": True,
+                    "location": "query",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "in_progress", "resolved"],
+                    "required": False,
+                    "location": "query",
+                },
+            },
+        },
+    ],
+}
+
+resp = httpx.post(f"{BASE_URL}/connectors", headers=headers, json=crm_connector)
+crm = resp.json()
+print(f"CRM connector created: {crm['id']}")
+print(f"Tools: {len(crm.get('tools', []))}")
 ```
 
-Full `config` is re-encrypted. Old secret replaced.
+### Step 2.2: Test the connector
 
-## 8. Delete
+```python
+session = httpx.post(
+    f"{BASE_URL}/chat/sessions",
+    headers=headers,
+    json={"title": "CRM automation test"},
+).json()
 
-```bash
-curl -X DELETE https://api.skygen.ai/connectors/custom/conn_xyz \
-  -H "Authorization: Bearer $TOKEN"
+SESSION_ID = session["id"]
+
+httpx.post(
+    f"{BASE_URL}/chat/sessions/{SESSION_ID}/messages",
+    headers=headers,
+    json={
+        "content": "Look up the customer with email alice@example.com in the CRM. "
+                   "If they have any open tickets, summarize them. "
+                   "If they have no tickets, create a new one with subject "
+                   "'Welcome check-in' and priority 'low'.",
+    },
+)
+print(f"CRM task running at: https://app.skygen.ai/chat/{SESSION_ID}")
 ```
 
-Any scheduled task or trigger referencing it will fail gracefully at execution ("connector not found").
+---
 
-## Common mistakes
+## Part 3: Authentication patterns
 
-<Warning>
-**URL rejected as SSRF.** Localhost, private IP ranges (`10.x.x.x`, `169.254.x.x`), `.local` TLDs all fail the SSRF check. For testing, configure a reachable dev URL or relax the validator in `services/url_validation.py` (not recommended for prod).
-</Warning>
+### Bearer token
 
-<Note>
-**MCP probe timeout 10 seconds.** For `custom_mcp` type, the probe runs synchronously at create. Slow-starting MCP servers fail. Either warm them up first or use `custom_api` if you don't need MCP specifics.
-</Note>
+```python
+{
+    "auth_type": "bearer",
+    "auth_token": "your-api-token"
+}
+# Sends: Authorization: Bearer your-api-token
+```
 
-<Note>
-**Slug normalization.** Non-alphanumeric chars become `-` and everything is lowercased. `"My Orders API"` → `"my-orders-api"`. Pass your own slug if you care about the exact form.
-</Note>
+### API key in custom header
 
-<Note>
-**Secrets in `description` leak.** Don't write real credentials into `description` or `note`. Those fields are plaintext and returned verbatim.
-</Note>
+```python
+{
+    "auth_type": "api_key",
+    "api_key": "your-api-key",
+    "api_key_header": "X-API-Key"
+}
+# Sends: X-API-Key: your-api-key
+```
 
-## What to read next
+### Basic authentication
 
-- [Custom connectors](/guides/custom-connectors) — full schema reference
-- [MCP integrations](/concepts/mcp-integrations) — Composio comparison
-- [Confirmations](/concepts/confirmations) — gating destructive tools
+```python
+{
+    "auth_type": "basic",
+    "username": "api-user",
+    "password": "api-password"
+}
+# Sends: Authorization: Basic <base64>
+```
+
+### No authentication (public API)
+
+```python
+{
+    "auth_type": "none"
+}
+```
+
+---
+
+## Part 4: Managing connectors
+
+### List connectors
+
+```python
+resp = httpx.get(f"{BASE_URL}/connectors", headers=headers)
+for c in resp.json()["items"]:
+    print(f"- {c['name']} ({c['type']}) — {c['status']} — slug: {c['slug']}")
+```
+
+### Update a connector
+
+```python
+httpx.put(
+    f"{BASE_URL}/connectors/{CONNECTOR_ID}",
+    headers=headers,
+    json={
+        "description": "Updated description",
+        "config": {
+            "base_url": "https://crm.internal.example.com/api/v2",  # Upgrade to v2
+            "auth_type": "bearer",
+            "auth_token": "new-api-token",
+        },
+    },
+)
+```
+
+### Deactivate a connector
+
+```python
+httpx.patch(
+    f"{BASE_URL}/connectors/{CONNECTOR_ID}/status",
+    headers=headers,
+    json={"status": "inactive"},
+)
+```
+
+### Delete a connector
+
+```python
+httpx.delete(f"{BASE_URL}/connectors/{CONNECTOR_ID}", headers=headers)
+```
+
+---
+
+## Part 5: Security considerations
+
+**All connector configs are encrypted at rest** using AES with the `MCP_CRYPTO_KEY`. Secrets in API responses are always shown as `[REDACTED]`.
+
+**SSRF protection:** Skygen validates all `base_url` and `spec_url` values against a blocklist before saving. Requests to localhost, link-local addresses (169.254.0.0/16), and private RFC 1918 ranges are blocked.
+
+**Per-user isolation:** Connectors belong to the user who created them. Other users on the platform cannot access or see your connectors.
+
+**Agent access:** The agent can only use connectors belonging to the authenticated user for the current session. It cannot access other users' connectors.
+
+---
+
+## Troubleshooting
+
+**Connector created but agent doesn't use it**  
+The agent discovers tools by their `description` field. Write clear, specific descriptions that match the tasks you want to automate. Include what the tool returns, not just what it accepts.
+
+**401 errors when agent calls tool**  
+Your `auth_token` may have expired. Update the connector config with a fresh token via `PUT /connectors/{id}`.
+
+**500 errors from your API**  
+Check the action history (`GET /action-history?session_id={id}`) to see the exact tool call parameters the agent sent. The agent may be sending unexpected parameter types — add explicit type and format constraints to your tool definitions.
+
+**SSRF block on internal URL**  
+Connectors cannot target internal IP ranges from Skygen's servers. For internal APIs, expose them via a public endpoint (behind authentication) or use a self-hosted Skygen deployment.

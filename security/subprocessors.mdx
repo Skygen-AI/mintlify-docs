@@ -1,276 +1,179 @@
 ---
 title: "Subprocessors"
-description: "Third-party services that process Skygen user data — what they do, what data they see, and where it lives. Updated April 2026."
+description: "Third-party services used by Skygen, their purpose, and what data they receive."
 ---
 
-Skygen uses a small number of vetted third-party services to deliver its platform. This page lists every service that processes user data, categorizes it, and describes the data flow. It is the single source of truth for compliance reviews (SOC 2, data-processing agreements) and for users who want to know who sees what.
+## Overview
 
-<Note>
-We update this page whenever a subprocessor is added, removed, or changes role. Material changes are announced at least **30 days in advance** for existing customers unless the change is required to remediate a security issue.
-</Note>
+Skygen uses the following third-party subprocessors to provide its service. When you use Skygen, your data may be processed by these services. This list is maintained as part of our privacy and compliance commitments.
 
-## Summary
+---
 
-| Category | Service | Data seen | Region |
-|----------|---------|-----------|--------|
-| Infrastructure | Amazon Web Services (AWS) | All platform data at rest + in transit | us-east-1, eu-north-1 |
-| Payments | Stripe | Email, billing country, last-4 card digits (via Stripe.js token) | US + EU |
-| LLM — via router | OpenRouter | Prompt text + model name | US (router); downstream varies |
-| LLM — direct | OpenAI | Prompt text, file contents when passed as context | US |
-| LLM — direct | Google (Gemini) | Prompt text, file contents | US + EU |
-| LLM — direct | Cerebras | Prompt text (small-volume inference) | US |
-| LLM — direct | Groq | Prompt text (small-volume inference) | US |
-| Audio | RunPod (Whisper) | Voice recordings pending transcription | US |
-| Sandbox / Cloud PC | E2B | Desktop state, files you upload, screenshots | EU (primary) |
-| Integration broker | Composio | OAuth tokens + request payloads you send to connected apps | US |
-| Email (transactional) | Amazon SES | Recipient email address, email body | us-east-1 |
-| Error monitoring | Sentry | Stack traces, non-user-identifying metadata (Agent only) | EU |
-| Product analytics (web) | Google Analytics 4, Google Tag Manager, Google Ads | Pageviews, anonymous device ID | US |
-| Product analytics (web) | Yandex Metrica | Pageviews, anonymous device ID | RU/EU |
-| Product analytics (server) | Amplitude | Event properties (no PII by policy) | US |
-| OAuth identity providers | Google, GitHub, Microsoft, Apple | Email, profile identifier (per provider) | varies |
-| MCP connected apps (user-chosen) | Google Workspace, Telegram, Slack, Zoom, etc. | Only data you authorize each app to share | varies |
+## Infrastructure subprocessors
 
-## Core infrastructure
+| Subprocessor | Purpose | Data processed | Region |
+|-------------|---------|----------------|--------|
+| **Amazon Web Services (AWS)** | Cloud infrastructure (EKS, RDS, ElastiCache, S3, Secrets Manager, Amazon MQ) | All application data, session data, files, secrets | us-east-1 (primary), eu-north-1 (legacy) |
+| **AWS ECR** | Container image registry | Container images (no user data) | us-east-1 |
+| **AWS CloudWatch** | Infrastructure log collection | Kubernetes control plane logs | us-east-1 |
 
-### Amazon Web Services (AWS) {#aws}
-
-- **Role:** Primary cloud provider. Hosts all application compute, databases, queues, caches, object storage, email relay, certificates, secrets, and logs.
-- **Data seen:** Everything. Account details, chat sessions, messages, devices, Cloud PC snapshots, attachments, logs, metrics.
-- **Regions used:**
-  - `us-east-1` (N. Virginia) — EKS clusters, RDS, ElastiCache, S3 primary buckets, SES, Secrets Manager, most compute.
-  - `eu-north-1` (Stockholm) — legacy ECS Fargate services (webapp, landing, admin panel), Lightsail support host. Migrating to `us-east-1`.
-- **Encryption:** Data encrypted at rest (EBS, RDS, S3 default SSE-S3; Secrets Manager KMS). In transit via TLS 1.2+.
-- **Authentication to Skygen workloads:** IAM Roles for Service Accounts (IRSA) — keyless auth from EKS pods, no static access keys in Kubernetes.
-- **DPA:** [aws.amazon.com/compliance/data-privacy-faq](https://aws.amazon.com/compliance/data-privacy-faq/)
-- **Compliance:** SOC 1/2/3, ISO 27001, PCI DSS, HIPAA, GDPR-ready.
-
-For the full inventory of AWS services, see [AWS stack inventory](/deployment/aws-inventory).
-
-## Payments
-
-### Stripe {#stripe}
-
-- **Role:** Subscription billing ($14.99/mo), metered overage (pay-per-token), webhook-driven payment confirmation.
-- **Data seen:** Email address, billing country, card information. **Skygen never touches raw card data** — the frontend uses Stripe.js (via `@stripe/react-stripe-js`) to tokenize cards client-side.
-- **Data written back to us:** Customer ID, subscription status, invoice metadata, payment method last-4. Stored in `users.stripe_customer_id` and related billing tables.
-- **Webhooks:** Stripe calls `POST /billing/webhook` with HMAC-signed events (`invoice.paid`, `customer.subscription.updated`, etc.).
-- **Regions:** Stripe processes data in the US and EU.
-- **DPA:** [stripe.com/legal/dpa](https://stripe.com/legal/dpa)
-- **Compliance:** PCI DSS Level 1, SOC 1/2, ISO 27001.
+---
 
 ## AI / LLM providers
 
-Skygen routes LLM calls through `Agent/Utilities/LLM_Providers/ProviderFactory.py`. Most models are accessed via **OpenRouter** (a reseller/aggregator); a few go direct for latency or feature reasons.
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Anthropic** | Claude LLM API (agent reasoning) | User prompts, task context, session history | Optional; used when `claude-*` models are selected |
+| **OpenAI** | GPT LLM API (agent reasoning) | User prompts, task context, session history | Optional; used when `gpt-*` models are selected |
+| **Google (Gemini)** | Gemini LLM API (agent reasoning, safety classifier) | User prompts, task context | Used as default and safety judge model |
+| **OpenRouter** | LLM routing API (Qwen, Mistral, and other models) | User prompts, task context | Routes to various model providers |
+| **Cerebras** | Fast inference LLM API | User prompts, task context | Optional; high-throughput inference |
 
-### OpenRouter {#openrouter}
+<Note>
+  LLM providers receive the content of your messages and task context to generate responses. They do not receive your authentication credentials, billing information, or device details.
+</Note>
 
-- **Role:** Default LLM reseller for the broadest set of models (Anthropic Claude, OpenAI GPT, Meta Llama, Mistral, Google Gemini in some flows, etc.).
-- **Endpoint:** `https://openrouter.ai/api/v1`
-- **Data seen:** The full prompt, which may include:
-  - The user's message
-  - Recent chat history (for context)
-  - File contents the user attached (images, documents parsed to text)
-  - Screenshots from Cloud PC / desktop agents
-  - Tool call parameters (e.g., MCP calls the model is directing)
-- **Downstream models:** OpenRouter forwards traffic to the underlying model provider (Anthropic, OpenAI, Google, etc.). Each provider may have its own data-retention stance. Skygen's OpenRouter account is configured with provider-level privacy preferences where available.
-- **DPA:** [openrouter.ai/privacy](https://openrouter.ai/privacy)
-- **Compliance:** SOC 2 in progress (public roadmap).
+---
 
-### OpenAI {#openai}
+## Integration platform
 
-- **Role:** Direct calls for specific models where OpenRouter adds latency or misses features. Used inside the Agent's reasoning and some tool-calling flows.
-- **SDK:** `openai==2.8.1` (Agent only; not in Backend).
-- **Data seen:** Prompt text, file contents passed into the request, model name.
-- **Data retention:** Skygen's API access uses the OpenAI API terms (zero data retention available for paid tier when opted in).
-- **DPA:** [openai.com/policies/business-terms](https://openai.com/policies/business-terms/)
-- **Compliance:** SOC 2 Type 2, CCPA, GDPR.
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Composio** | OAuth integration management and tool execution | OAuth tokens for connected services (Gmail, Slack, GitHub, etc.), tool call payloads | All OAuth-based MCP integrations route through Composio. Tokens are stored by Composio and used to execute tool calls on your behalf. |
 
-### Google (Gemini) {#google-gemini}
+---
 
-- **Role:** Embedding generation for the Knowledge Base (`GEMINI_API_KEY`, `gemini-embedding` model family) plus direct Gemini inference for some agent flows.
-- **SDK:** `google-generativeai` / `google-genai`.
-- **Data seen:** Text to embed (knowledge base documents, user queries), or full prompts for inference.
-- **DPA:** [cloud.google.com/terms/data-processing-addendum](https://cloud.google.com/terms/data-processing-addendum)
-- **Compliance:** SOC 1/2/3, ISO 27001.
+## Compute / sandboxing
 
-### Cerebras {#cerebras}
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **E2B** | Cloud PC VM sandboxes | Desktop screenshots, file contents within the sandbox, keyboard/mouse inputs | E2B runs the isolated VM environment for Cloud PC sessions. All agent GUI actions occur inside E2B sandboxes. |
+| **RunPod** | Audio transcription (Faster Whisper) | Audio file content | Used for `POST /audio/transcribe`. Audio is sent to RunPod for processing and not retained. |
 
-- **Role:** Low-latency inference for specific models (`llama-3.3-70b`, `qwen-3-235b-a22b-instruct-2507`). Used sparingly when latency matters.
-- **Endpoint:** `https://api.cerebras.ai/v1`
-- **Data seen:** Prompt text, model name.
-- **DPA:** [cerebras.ai/policies](https://cerebras.ai/policies)
+---
 
-### Groq {#groq}
+## Payments
 
-- **Role:** Low-latency inference for select open-weights models (matcher: model name starts with `groq/`).
-- **Endpoint:** `https://api.groq.com/openai/v1`
-- **Data seen:** Prompt text, model name.
-- **DPA:** [groq.com/privacy-policy](https://groq.com/privacy-policy/)
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Stripe** | Payment processing and subscription management | Credit card information, billing address, invoices | Skygen never stores raw card data. Stripe handles PCI DSS compliance. |
 
-### RunPod — Faster Whisper {#runpod}
+---
 
-- **Role:** Voice transcription. When a user sends audio, the agent forwards it to RunPod's `worker-faster_whisper` serverless endpoint.
-- **Configuration:** `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID=worker-faster_whisper`, model `turbo`.
-- **Data seen:** Raw audio bytes (time-bounded — deleted from RunPod after transcription per their default policy).
-- **DPA:** [runpod.io/legal/privacy-policy](https://www.runpod.io/legal/privacy-policy)
+## Communications
 
-## Sandboxed execution
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Telegram** | Internal alert delivery (Alertmanager, helpdesk notifications, rating alerts) | Alert messages including anonymous usage metrics and ticket summaries | Used for operator notifications only, not user-facing communication. |
 
-### E2B {#e2b}
-
-- **Role:** Sandboxed Cloud PC and code-interpreter environments. When a user starts Cloud PC or the agent runs code, it spins up an isolated VM on E2B.
-- **SDK:** `e2b==2.15.1` and `e2b-desktop==2.3.0` (Backend), `e2b-code-interpreter==2.3.0` (Agent).
-- **Data seen:**
-  - Screenshots of the remote desktop (streamed to the user).
-  - Files the user uploads into the sandbox.
-  - Shell commands the agent runs inside the sandbox.
-  - Browser session cookies if the user logs into websites inside Cloud PC.
-- **Persistence:** Per-user Cloud PC backup snapshots are stored back in our own S3 bucket (`skygen-cloudpc-profiles-prod`). E2B holds the live sandbox only while it runs.
-- **Region:** E2B's default region is the EU; confirm per workload.
-- **DPA:** [e2b.dev/dpa](https://e2b.dev/dpa) (on request).
-
-## Integration brokers
-
-### Composio {#composio}
-
-- **Role:** Managed MCP integrations — handles the OAuth flow, token refresh, and tool-call proxying for a wide catalogue of third-party apps (Gmail, Calendar, Drive, Docs, Sheets, Contacts, YouTube, Zoom, Slack, and more).
-- **SDK:** `composio==0.11.x` in Backend (`app/services/composio_*.py`).
-- **Data seen:**
-  - OAuth access tokens for every app the user connects.
-  - Request and response payloads for every tool call routed through Composio (e.g., "send an email," "read a calendar event").
-- **Webhook:** Composio calls `POST /mcp/webhooks` with HMAC-signed events; secret `COMPOSIO_WEBHOOK_SECRET`.
-- **DPA:** [composio.dev/legal/dpa](https://composio.dev/legal/dpa) (request from Composio).
-- **Status:** `COMPOSIO_ENABLED` is a feature flag. When disabled, connector calls return a service-upgrading error.
-
-## Email
-
-### Amazon SES {#ses}
-
-- **Role:** Primary transactional and lifecycle email sender — verification, password reset, helpdesk replies, inactive-user nudges, receipts.
-- **Region:** `us-east-1` (production access, 50k/day quota, 14/s send rate).
-- **Verified identity:** `skygen.ai` with DKIM + DMARC.
-- **Data seen:** Recipient email, sender name, subject, body.
-- **Covered under:** AWS DPA (see [AWS](#aws)).
-
-### Resend (legacy, being retired) {#resend}
-
-- **Role:** Historical email sender for lifecycle campaigns and contact audiences.
-- **Current use:** Only `Backend/scripts/migrate_resend_contacts.py` references Resend — it's a one-shot migration tool to move contact lists from Resend audiences into our `user_email_segments` table. Resend is no longer in the runtime send path.
-- **Timeline:** Resend API key and DNS records scheduled for removal once contact migration is complete.
-
-## Observability
-
-### Sentry {#sentry}
-
-- **Role:** Error monitoring and performance tracing for the Agent service.
-- **SDK:** `sentry-sdk==2.43.0` in Agent.
-- **Data seen:** Python stack traces, breadcrumbs, request metadata (URL, method, status). User PII is scrubbed by Sentry-side filters.
-- **Backend status:** Sentry is **not** initialized in Backend (as of April 2026). Backend errors go to Loki only.
-- **DPA:** [sentry.io/legal/dpa](https://sentry.io/legal/dpa/)
-- **Compliance:** SOC 2 Type 2, ISO 27001, GDPR.
+---
 
 ## Analytics
 
-Analytics subprocessors are **opt-in at the environment level** (`ANALYTICS_ENABLED=true` on Backend, `VITE_GTM_ID`/`VITE_GOOGLE_ADS_ID` on WebApp). When disabled, no events are sent.
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Google Analytics (GA4)** | Landing page analytics | Anonymous page view events, referrer data | No PII; uses `GA4_API_SECRET` for server-side event collection. Only landing page traffic is tracked. |
 
-### Google Analytics 4 (GA4) {#ga4}
+---
 
-- **Role:** Pageview and event tracking for marketing and product analytics.
-- **Configuration:** `GA4_MEASUREMENT_ID` (Backend, for server-side Measurement Protocol), client-side via GTM on WebApp.
-- **Data seen:** Anonymized device ID, pageview URL, event name, user agent. No email or user content.
-- **DPA:** Google Ads Data Processing Terms.
+## Monitoring
 
-### Google Tag Manager (GTM) {#gtm}
+| Subprocessor | Purpose | Data processed | Notes |
+|-------------|---------|----------------|-------|
+| **Grafana (self-hosted)** | Metrics dashboards | Aggregate application metrics; no user-identifiable data in dashboards | Self-hosted on EKS. No data leaves AWS. |
+| **Loki (self-hosted)** | Log aggregation | Application logs including user IDs in log lines (not message content) | Self-hosted on EKS via loki-stack. |
 
-- **Role:** Client-side tag container — loads GA4, Google Ads pixel, etc. dynamically from the container you configure.
-- **Loaded in:** `WebApp/src/main.tsx` (`https://www.googletagmanager.com/gtm.js?id=${GTM_ID}`) when `VITE_GTM_ID` is present.
+---
 
-### Google Ads {#google-ads}
+## Data residency
 
-- **Role:** Conversion tracking for advertising campaigns.
-- **Loaded in:** `WebApp/src/main.tsx` (`https://www.googletagmanager.com/gtag/js?id=${GOOGLE_ADS_ID}`) when `VITE_GOOGLE_ADS_ID` is present.
+All primary data (PostgreSQL, Redis, S3, Secrets Manager) resides in **AWS us-east-1**. The legacy ECS frontend deployment in eu-north-1 does not store persistent data.
 
-### Yandex Metrica {#yandex-metrica}
+LLM provider data processing occurs in the respective provider's infrastructure. Composio processes data in their own cloud environment. E2B sandboxes are provisioned in E2B's cloud.
 
-- **Role:** Product analytics for the Russian-speaking audience.
-- **Configuration:** `YANDEX_COUNTER_ID`.
-- **Data seen:** Pageviews, anonymous device ID, session recording where enabled.
-- **DPA:** [yandex.com/legal/confidential](https://yandex.com/legal/confidential/)
+---
 
-### Amplitude {#amplitude}
+## Data processing agreements
 
-- **Role:** Server-side event analytics for product KPIs (activation, retention, funnel steps).
-- **Configuration:** `AMPLITUDE_API_KEY`.
-- **Data seen:** Event name + properties. Our event schemas exclude direct PII — user IDs are hashed where sent.
-- **DPA:** [amplitude.com/legal/dpa](https://amplitude.com/legal/dpa)
+Skygen maintains Data Processing Agreements (DPAs) with all subprocessors that handle personal data. Copies are available upon request for compliance purposes.
 
-## OAuth identity providers
+| Subprocessor | DPA available | GDPR compliant | SOC 2 certified |
+|-------------|--------------|----------------|----------------|
+| AWS | Yes | Yes (SCCs) | Yes (SOC 2 Type II) |
+| Anthropic | Yes | Yes | In progress |
+| OpenAI | Yes | Yes (SCCs) | Yes (SOC 2 Type II) |
+| Google (Gemini) | Yes | Yes | Yes (ISO 27001, SOC 2) |
+| Composio | In progress | In progress | In progress |
+| E2B | In progress | In progress | In progress |
+| Stripe | Yes | Yes (SCCs) | Yes (PCI DSS Level 1) |
+| RunPod | In progress | In progress | In progress |
 
-Users sign in with one of these providers. Skygen receives only what the provider releases for the chosen scope (typically: email, profile name, provider-side user ID).
+---
 
-| Provider | Env vars | Scopes requested |
-|----------|----------|------------------|
-| Google | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, plus `GOOGLE_ANDROID_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID` for mobile | `openid email profile` |
-| GitHub | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | `user:email` |
-| Microsoft | `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` (MSAL) | `User.Read` |
-| Apple | (via iOS app) | email, name (first-time only) |
+## User data not shared with subprocessors
 
-Sign-in flows are implemented in `Backend/app/routers/security/` and are the **only** path through which identity-provider data enters our system. We do not ingest address books, social graphs, or extended profile data.
+The following data types are never transmitted to any subprocessor:
 
-## MCP connected apps (user-authorized)
+- Raw passwords (hashed before storage, never transmitted)
+- Stripe payment card numbers (handled entirely by Stripe's SDK; Skygen never receives raw card data)
+- AWS Secrets Manager secrets (used server-side only; never in agent prompts or LLM calls)
+- Other users' session content (strict per-user isolation enforced at API level)
 
-When a user connects a third-party app via MCP (either directly or through Composio), the app becomes a subprocessor **for that user**. The categories we support include:
+---
 
-- **Google Workspace**: Gmail, Calendar, Drive, Docs, Sheets, Contacts, YouTube — per-integration OAuth pairs (`GMAIL_CLIENT_ID`, `CALENDAR_CLIENT_ID`, etc.)
-- **Telegram**: user-connected personal accounts via Telethon (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`), plus bot API
-- **Slack**: via Composio (`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`)
-- **Zoom**: via Composio
-- **Plus the full Composio catalogue** (200+ apps) — see [MCP integrations](/concepts/mcp-integrations) for the current list.
+## Opting out of analytics
 
-**What they see:** Only the data scopes the user explicitly authorizes during OAuth consent. Revoking access in the user's connected-apps page revokes the token immediately.
+Google Analytics is used only for the marketing landing page (anonymous page view tracking). The Skygen application itself (`app.skygen.ai`) does not include Google Analytics. Authenticated user sessions are not tracked by any third-party analytics service.
 
-**Storage:** OAuth tokens are encrypted at rest in Postgres using the `MCP_CRYPTO_KEY` AES key, rotated separately from application secrets.
+---
 
-## Data flow summary
+## Data flows by feature
 
-What actually leaves the Skygen AWS account:
+Understanding which subprocessors receive data for each Skygen feature:
 
-1. **Every agent run** → LLM provider (OpenRouter primary, OpenAI/Gemini/Cerebras/Groq for specific models)
-2. **Every transcription request** → RunPod
-3. **Every Cloud PC / code execution** → E2B sandbox
-4. **Every MCP tool call** → Composio (or the app's own API if not brokered)
-5. **Every payment event** → Stripe
-6. **Every transactional email** → Amazon SES
-7. **Every agent error** → Sentry
-8. **Every pageview (if analytics enabled)** → GA4, GTM, Google Ads, Yandex Metrica
-9. **Every KPI event** → Amplitude
+### Agent chat
 
-Everything else (sessions, messages, file blobs, user accounts, billing state, vector embeddings) stays inside the Skygen AWS account.
+A user message in a chat session may flow through:
 
-## User controls
+1. **AWS** — stored in PostgreSQL (RDS) and cached in ElastiCache (Redis)
+2. **Anthropic / OpenAI / Gemini / OpenRouter** — the message and relevant session history is sent to the configured LLM provider for agent reasoning
+3. **Composio** — if the agent calls a connected integration tool (e.g., reading Gmail), the tool call payload passes through Composio
+4. **E2B** — if the agent opens a Cloud PC, the task prompt and subsequent GUI instructions go to E2B's sandbox
 
-Users can limit data flow:
+### File uploads and screenshots
 
-- **Turn off analytics:** Admin → Feature flags → `ANALYTICS_ENABLED=false`. No events sent to GA4/Amplitude/Yandex.
-- **Disconnect an MCP app:** Settings → Integrations → Disconnect. Revokes the OAuth token, deletes cached credentials.
-- **Pause Cloud PC:** Settings → Cloud PC → Pause. Releases the E2B sandbox and uploads a backup snapshot to our S3.
-- **Delete account:** Settings → Account → Delete. Triggers soft-delete (30-day hold) then hard-delete of rows, files, and backup snapshots. Stripe customer is also cancelled; the subprocessor retains its own records per their retention policy.
+Uploaded files and agent-captured screenshots are stored in **AWS S3**. Files are accessible only via presigned URLs (time-limited, user-scoped). No LLM provider receives raw file bytes — only text extracted from files as needed by the agent.
 
-## Subprocessor change notifications
+### Audio transcription
 
-When we add, remove, or change a subprocessor:
+Audio submitted to `POST /audio/transcribe` is forwarded to **RunPod** (Faster Whisper). The audio file is not retained by RunPod after transcription. Transcription output is stored in Skygen's database (AWS RDS).
 
-1. We update this page with the new line item and effective date.
-2. We notify existing customers by email at least **30 days before** the change for non-security-critical additions.
-3. Security-critical changes (removing a provider for compliance reasons) may happen faster, with prompt notification after.
+### Billing
 
-Subscribe to subprocessor change notifications by emailing `security@skygen.ai`.
+When a user subscribes, payment details are entered directly into **Stripe**'s hosted payment form. Skygen receives only a Stripe customer ID and subscription status — never raw card data.
 
-## See also
+### OAuth integrations
 
-- [AWS stack inventory](/deployment/aws-inventory) — every AWS service, with costs
-- [Environment variables](/deployment/environment) — every API key by name
-- [MCP & Integrations](/concepts/mcp-integrations) — how user-authorized apps plug in
-- [Billing](/concepts/billing) — Stripe flow details
-- [LLM routing](/guides/llm-routing) — how prompts reach each model provider
+When connecting a service like Gmail or GitHub, the OAuth flow redirects through **Composio**. Composio holds the OAuth access/refresh tokens and executes tool calls on the user's behalf. Skygen does not store OAuth tokens directly for Composio-managed integrations.
+
+---
+
+## Self-hosted deployment considerations
+
+Organizations deploying Skygen on their own infrastructure can eliminate or replace several subprocessors:
+
+| Subprocessor | Self-hosted alternative |
+|---|---|
+| AWS RDS | Any PostgreSQL instance |
+| AWS ElastiCache | Self-hosted Redis |
+| AWS S3 | MinIO (S3-compatible; configured via `S3_ENDPOINT_URL`) |
+| RunPod (transcription) | Local Faster Whisper instance; update `RUNPOD_AUDIO_ENDPOINT` |
+| Composio | Direct OAuth implementation per toolkit (significant engineering work) |
+
+LLM providers (Anthropic, OpenAI, Gemini, OpenRouter) cannot be eliminated if you use AI capabilities, but can be restricted to a single provider by configuring `DEFAULT_LLM_PROVIDER` and removing other provider API keys.
+
+---
+
+## Updates to this list
+
+This list is updated when new subprocessors are added or existing ones are removed. Material changes are announced to customers with at least 30 days notice where required by applicable law. Last reviewed: May 2026.

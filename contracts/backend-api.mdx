@@ -1,0 +1,970 @@
+---
+title: "Backend API Contract"
+description: "Authoritative reference for every REST endpoint in the Skygen backend. Generated from source — do not edit manually."
+---
+
+import { Warning, Note, Info } from "mintlify/components";
+
+> Generated: 2026-05-08 · Source: `Backend/app/routers/` · Regenerate with `/doc-gen`
+
+This document is the authoritative reference for every REST endpoint in the Skygen backend.
+Socket.IO namespaces (`/device`, `/user`, `/agent`) are documented in the [Socket.IO Reference](/reference/backend/socketio).
+
+---
+
+## Auth conventions
+
+| Method | How it works |
+|--------|-------------|
+| **Bearer JWT** | `Authorization: Bearer <token>` header **or** `skygen_session` cookie |
+| **Agent Token** | `Authorization: Bearer <AGENT_API_TOKEN>` or `X-Agent-Token: <token>` header |
+| **Internal Token** | `X-Internal-Token` header — blocked by `InternalRouteGuard` for external (ALB) traffic |
+| **Admin JWT** | Bearer JWT where `user.is_admin == True` |
+| **HTTP Basic** | `admin` / `skygen_docs_pass!2026*` — only for `/docs` and `/openapi.json` |
+
+---
+
+## Infrastructure endpoints
+
+### GET /health
+**Auth:** none
+**Response 200:** `{"status": "healthy", "service": "skygen-backend"}`
+
+### GET /ready
+**Auth:** none
+**Response 200:** `{"status": "ready", "service": "skygen-backend"}`
+**Response 503:** `{"status": "not_ready", "checks_failed": ["database"|"redis"]}`
+**Side effects:** pings PostgreSQL and Redis
+
+### GET /metrics
+**Auth:** none (Prometheus scrape)
+**Response:** Prometheus text format
+
+---
+
+## Auth — `/auth`
+
+### POST /auth/register
+**Auth:** none
+**Request body:**
+- `email`: str (required)
+- `password`: str (required)
+- `display_name`: str (optional)
+- `invite_code`: str (optional, required when `REGISTRATION_MODE=invite_only`)
+- `meta`: dict (optional — UTM/GA params)
+
+**Response 201:**
+```json
+{"user": <UserRead>, "access_token": "jwt", "token_type": "bearer"}
+```
+Sets `skygen_session` cookie.
+**Response 400:** email taken, invalid invite code, expired invite
+**Side effects:** inserts `users`, optionally updates `invite_codes` (marks used), inserts `user_email_segments`, fires `registration_completed` analytics event, sends verification email via SES
+
+### GET /auth/verify?token=
+**Auth:** none (link from verification email)
+**Response 200:** `{"msg": "Email successfully verified"}`
+**Response 400:** invalid/expired token
+**Side effects:** sets `users.is_email_verified=True`, sends welcome email
+
+### POST /auth/token (login)
+**Auth:** none
+**Request:** `application/x-www-form-urlencoded` — `username`, `password`
+**Response 200:**
+```json
+{"access_token": "jwt", "token_type": "bearer"}
+```
+Sets `skygen_session` cookie.
+**Response 401:** invalid credentials
+**Rate limit:** login_rate_limit
+
+### POST /auth/logout
+**Auth:** none (cookie present or not)
+**Response 204:** empty
+**Side effects:** clears `skygen_session` and `skygen_logged_in` cookies
+
+### POST /auth/forgot-password
+**Auth:** none
+**Request body:** `{"email": "str"}`
+**Response 202:** `{"msg": "..."}` (always 202, no enumeration)
+**Rate limit:** forgot_password_rate_limit
+**Side effects:** sends password reset email if user exists
+
+### POST /auth/reset-password
+**Auth:** none
+**Request body:** `{"token": "str", "new_password": "str"}`
+**Response 200:** `{"msg": "Password successfully reset"}`
+**Response 400:** invalid/expired token
+**Side effects:** updates `users.password_hash` and `users.password_changed_at`
+
+### POST /auth/upgrade-session
+**Auth:** `Authorization: Bearer <legacy-token>`
+**Response 204:** Sets `skygen_session` cookie
+**Response 410:** `AUTH_LEGACY_UPGRADE_DISABLED=True`
+**Side effects:** pins localStorage JWT into cookie
+
+### GET /auth/google
+**Auth:** none
+**Response 302:** redirect to Google OAuth consent
+
+### GET /auth/google/callback?code=&state=
+**Auth:** none (OAuth callback)
+**Response 302:** redirect to `/app/home` (success) or `/app/login?google_error=` (failure)
+**Side effects:** creates/links Google user in `users`, sends `registration_completed` event, sets `skygen_session` cookie
+
+### POST /auth/google-mobile/token
+**Auth:** none
+**Request body:** `{"id_token": "google_id_token_str"}`
+**Response 200:** `{"access_token": "jwt", "token_type": "bearer"}`
+**Response 401:** invalid Google token
+
+### PATCH /auth/update-registration-meta
+**Auth:** Bearer JWT
+**Request body:** `{"meta": {"ga_client_id": ..., "utm_source": ...}}`
+**Response 200:** `{"status": "ok"}`
+**Side effects:** merges into `users.registration_meta`, re-fires `registration_completed` analytics
+
+### POST /auth/setup-2fa
+**Auth:** Bearer JWT
+**Response 200:** `{"secret": "", "uri": "", "is_new": false, "message": "..."}` *(2FA disabled stub)*
+
+### POST /auth/verify-2fa
+**Auth:** Bearer JWT
+**Request body:** `{"otp_code": "str"}`
+**Response 200:** `{"success": false, ...}` *(2FA disabled stub)*
+
+### GET /auth/2fa-status
+**Auth:** Bearer JWT
+**Response 200:** `{"is_enabled": false, "is_session_valid": true, ...}` *(2FA disabled stub)*
+
+---
+
+## Users — `/users`
+
+### GET /users/me
+**Auth:** Bearer JWT
+**Response 200:** `UserRead`
+
+### PATCH /users/me
+**Auth:** Bearer JWT
+**Request body (partial):** `SoftUserUpdate` — `display_name`, `preferences`, `kb_enabled`, `safety_level`
+Strips `is_admin`, `is_active`.
+**Response 200:** `UserRead`
+
+### DELETE /users/me
+**Auth:** Bearer JWT
+**Response 204:** empty
+**Side effects:** sets `users.is_active=False` (soft delete)
+
+### GET /users (admin)
+**Auth:** Admin JWT
+**Query:** `skip`, `limit`, `is_active`, `is_email_verified`, `days`, `sort_by`, `sort_desc`
+**Response 200:** `List[UserRead]`
+
+### GET /users/{user_id} (admin)
+**Auth:** Admin JWT
+**Response 200:** `UserRead`
+
+### DELETE /users/{user_id} (admin)
+**Auth:** Admin JWT
+**Response 204:** sets `users.is_active=False`
+
+### PATCH /users/admin
+**Auth:** Admin JWT
+**Request body:** `UserUpdate`
+**Response 200:** `UserRead`
+
+---
+
+## Sessions — `/sessions`
+
+### POST /sessions
+**Auth:** Bearer JWT
+**Request body:** `ChatSessionCreate`
+- `title`: str (optional)
+- `device_id`: UUID (optional)
+- `meta_data`: dict (optional)
+- `emplogent_id`: UUID (optional)
+
+**Query param:** `reuse_existing: bool = False`
+**Response 201:** `ChatSessionRead`
+**Response 403:** device belongs to another user
+**Response 404:** device not found
+**Side effects:** inserts `chat_sessions`, emits `session_created` to `/user` Socket.IO namespace
+
+### GET /sessions
+**Auth:** Bearer JWT
+**Query:** `limit` (1-100, default 20), `offset`
+**Response 200:** `{"items": List[ChatSessionRead], "total": int, "limit": int, "offset": int}`
+
+### GET /sessions/{session_id}
+**Auth:** Bearer JWT
+**Response 200:** `ChatSessionRead`
+**Response 403:** session belongs to another user
+**Response 404:** session not found
+
+### PATCH /sessions/{session_id}
+**Auth:** Bearer JWT
+**Request body:** `ChatSessionUpdate` (partial — `title`, `meta_data`)
+**Response 200:** `ChatSessionRead`
+**Side effects:** updates `chat_sessions`, emits `session_updated` to `/user`
+
+### DELETE /sessions/{session_id}
+**Auth:** Bearer JWT
+**Response 204:**
+**Side effects:** sets `chat_sessions.deleted_at` (soft delete), releases Redis device/session locks, emits `session_deleted`
+
+### DELETE /sessions/{session_id}/permanent
+**Auth:** Bearer JWT
+**Response 204:**
+**Side effects:** hard deletes session and all messages, releases locks, emits `session_deleted`
+
+### POST /sessions/{session_id}/restore
+**Auth:** Bearer JWT
+**Response 200:** `ChatSessionRead`
+**Side effects:** clears `chat_sessions.deleted_at`, emits `session_restored`
+
+### GET /sessions/{session_id}/plan
+**Auth:** Bearer JWT
+**Response 200:** `{"plan": <plan_payload>|null}`
+**Used by:** WebApp session reload (restore agent plan steps)
+
+### GET /sessions/{session_id}/summary
+**Auth:** Bearer JWT
+**Query:** `max_messages` (1-50, default 10)
+**Response 200:** `{"session_id", "total_messages", "summary_messages", "messages": [...]}`
+
+---
+
+## Messages — `/sessions/{session_id}/messages`
+
+### POST /sessions/{session_id}/messages
+**Auth:** Bearer JWT
+**Request body:**
+- `role`: str (required — `"user"`)
+- `content`: str (required)
+- `meta_data`: dict (optional)
+- `task_id`: UUID (optional)
+- `agent_mode`: str (default `"auto"`)
+- `client_version`: str (optional)
+- `device_id`: UUID (optional)
+
+**Response 201:** `ChatMessageRead`
+**Response 402:** billing check failed
+**Response 404:** session not found
+**Response 403:** session belongs to another user
+**Response 409:** device busy
+**Side effects:** inserts `chat_messages`, publishes to RabbitMQ queue, emits `display_message` to `/user`, marks `ask_human` resolved, checks billing
+
+### GET /sessions/{session_id}/messages
+**Auth:** Bearer JWT
+**Response 200:** `List[ChatMessageRead]` (enriched, filters `agent_step` rows)
+
+### DELETE /sessions/{session_id}/messages/{message_id}
+**Auth:** Bearer JWT
+**Response 204:**
+**Side effects:** deletes `chat_messages`, emits `message_deleted` to `/user`
+
+### POST /sessions/{session_id}/messages/{message_id}/rate
+**Auth:** Bearer JWT
+**Request body:** `{"rating": int (1-5), "comment": str|null}`
+**Response 200:** `{"success": true, "rating": int, "comment": str|null}`
+**Side effects:** upserts `message_ratings`, fires Telegram alert if rating ≤ 2
+
+---
+
+## Tasks — `/tasks`
+
+### POST /tasks
+**Auth:** Bearer JWT
+**Request body:** `TaskCreate` — `title`, `description`, `device_id`, `payload`
+**Response 201:** `TaskRead`
+**Side effects:** inserts `tasks`, emits `task_created` to `/user`
+
+### GET /tasks
+**Auth:** Bearer JWT
+**Query:** `limit` (1-200), `offset`
+**Response 200:** `List[TaskRead]`
+
+### GET /tasks/{task_id}
+**Auth:** Bearer JWT
+**Response 200:** `TaskRead`
+
+### PATCH /tasks/{task_id}
+**Auth:** Bearer JWT
+**Request body:** `TaskUpdate` (partial)
+**Response 200:** `TaskRead`
+**Side effects:** updates `tasks`, emits `task_updated` to `/user`
+
+### DELETE /tasks/{task_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+---
+
+## Devices — `/devices`
+
+### POST /devices
+**Auth:** Bearer JWT
+**Request body:** `DeviceCreate` — `device_name`, `platform`, `capabilities`, `machine_id`, `device_token_kid`, `device_type`
+**Response 201:** `DeviceRead` (new) or **200** (existing/restored via upsert)
+**Side effects:** inserts or restores `devices`, fires `device_installed` analytics
+
+### GET /devices
+**Auth:** Bearer JWT
+**Query:** `skip`, `limit`, `device_type`, `connection_status`, `user_id` (admin only), `sort_by`, `sort_desc`, `include_cloud_pc`
+**Response 200:** `{"items": List[DeviceRead|dict], "total": int, "limit": int, "offset": int}`
+
+### GET /devices/{device_id}
+**Auth:** Bearer JWT
+**Response 200:** `DeviceRead`
+
+### PATCH /devices/{device_id}
+**Auth:** Bearer JWT
+**Request body:** `DeviceUpdate` (partial)
+**Response 200:** `DeviceRead`
+
+### DELETE /devices/{device_id}
+**Auth:** Bearer JWT
+**Response 204:**
+**Side effects:** sets `devices.connection_status="deleted"` (soft delete), emits `device_status_update` to `/user`
+
+### POST /devices/{device_id}/restore
+**Auth:** Bearer JWT
+**Response 200:** `DeviceRead`
+
+### POST /devices/{device_id}/rotate
+**Auth:** Bearer JWT
+**Response 200:** `DeviceRead`
+**Response 429:** rate limit (1 rotation per 5 minutes)
+**Side effects:** rotates `devices.device_token_kid`
+
+### POST /devices/{device_id}/force-release
+**Auth:** Bearer JWT
+**Response 200:** `{"status": "released", "device_id": str, "released": dict}`
+**Response 503:** Redis unavailable
+**Side effects:** clears Redis locks: device_lock, cloud_pc_session binding, session_active marker
+
+---
+
+## Billing — `/billing`
+
+### GET /billing/pricing
+**Auth:** none
+**Response 200:** `PricingResponse` — `subscription_price_usd`, `monthly_tokens_included`, etc.
+
+### GET /billing/status
+**Auth:** Bearer JWT
+**Response 200:** `BillingStatusResponse` — `can_access`, `reason`, `tier`, `balance`, etc.
+**Side effects:** self-healing webhook recovery, pending plan change retry
+
+### GET /billing/balance
+**Auth:** Bearer JWT
+**Response 200:** `{"balance": int, "total_spent": int}`
+
+### PATCH /billing/model-profile
+**Auth:** Bearer JWT
+**Request body:** `{"model_profile": "fast"|"default"|"pro"}`
+**Response 200:** `BillingStatusResponse`
+
+### GET /billing/internal/check-access/{user_id}
+**Auth:** Agent Token
+**Response 200:** `BillingStatusResponse`
+**Used by:** BrokerAgent billing check
+
+### POST /billing/setup-card?plan_id=
+**Auth:** Bearer JWT
+**Response 200:** `SetupCardResponse` — `client_secret`, `setup_intent_id`, `customer_id`
+**Side effects:** creates Stripe SetupIntent, creates/gets StripeCustomer
+
+### POST /billing/confirm-card
+**Auth:** Bearer JWT
+**Request body:** `ConfirmCardRequest` — `setup_intent_id`, `prompt_event_id`
+**Response 200:** `{"success": true, "message": str, "status": BillingStatusResponse}`
+**Side effects:** attaches payment method to Stripe customer
+
+### POST /billing/create-checkout-session
+**Auth:** Bearer JWT
+**Request body:** `CreateCheckoutSessionRequest` — `plan_id`, `success_url`, `cancel_url`, `prompt_event_id`
+**Response 200:** `CreateCheckoutSessionResponse` — `checkout_url`, `session_id`
+
+### POST /billing/subscribe?plan_id=
+**Auth:** Bearer JWT
+**Response 200:** `SubscriptionResponse`
+**Response 409:** already subscribed
+**Side effects:** creates `subscriptions`, `token_balances`, initial `token_transactions`
+
+### POST /billing/change-plan?plan_id=
+**Auth:** Bearer JWT
+**Response 200:** `{"payment_url": str|null, ...}`
+**Side effects:** proration via Stripe
+
+### POST /billing/cancel?at_period_end=
+**Auth:** Bearer JWT
+**Response 200:** `{"success": true, "message": str}`
+
+### POST /billing/enable-overage
+**Auth:** Bearer JWT
+**Response 200:** `{"success": true, "message": str, "overage_price_per_token": float}`
+**Side effects:** sets `subscriptions.allow_overage=True`
+
+### GET /billing/portal?return_url=
+**Auth:** Bearer JWT
+**Response 200:** `{"portal_url": str}`
+
+### GET /billing/transactions
+**Auth:** Bearer JWT
+**Query:** `limit` (1-100), `offset`
+**Response 200:** `List[TransactionResponse]`
+
+### GET /billing/transactions/grouped
+**Auth:** Bearer JWT
+**Response 200:** `GroupedTransactionsResponse` — `session_groups`, `system_transactions`, `total_tokens_used`
+
+### POST /billing/webhooks/stripe
+**Auth:** Stripe signature (`Stripe-Signature` header)
+**Side effects:** processes Stripe webhook events: `customer.subscription.updated`, `invoice.paid`, etc.
+
+---
+
+## Cloud PC — `/cloud-pc`
+
+### POST /cloud-pc/connect
+**Auth:** Bearer JWT
+**Request body:** `CloudPCConnectRequest` — `cloud_pc_id`, `session_id`, `force_reattach`
+**Response 200:** `CloudPCConnectResponse`
+**Response 402:** billing required
+**Response 409:** device busy (`cloud_pc_busy`)
+**Side effects:** creates/resumes E2B sandbox, locks device in Redis
+
+### POST /cloud-pc/disconnect
+**Auth:** Bearer JWT
+**Request body:** `CloudPCDisconnectRequest`
+**Response 200:** `CloudPCDisconnectResponse`
+**Side effects:** pauses/terminates E2B sandbox, releases Redis locks
+
+### GET /cloud-pc/status
+**Auth:** Bearer JWT
+**Response 200:** `CloudPCStatusResponse`
+
+### GET /cloud-pc
+**Auth:** Bearer JWT
+**Response 200:** `CloudPCListResponse`
+
+### PATCH /cloud-pc/{cloud_pc_id}
+**Auth:** Bearer JWT
+**Request body:** `CloudPCUpdateRequest`
+**Response 200:** updated CloudPC
+
+### GET /cloud-pc/{cloud_pc_id}/files
+**Auth:** Bearer JWT
+**Response 200:** `FileListResponse`
+
+### POST /cloud-pc/{cloud_pc_id}/files/download
+**Auth:** Bearer JWT
+**Response 200:** `FileDownloadResponse`
+
+### POST /cloud-pc/{cloud_pc_id}/files/upload
+**Auth:** Bearer JWT
+**Response 200:** `FileUploadResponse`
+
+### POST /cloud-pc/{cloud_pc_id}/link-device
+**Auth:** Bearer JWT
+**Response 200:** `LinkDeviceResponse`
+
+### POST /cloud-pc/{cloud_pc_id}/take-control
+**Auth:** Bearer JWT
+**Response 200:** `TakeControlResponse`
+
+### POST /cloud-pc/{cloud_pc_id}/resume-ai
+**Auth:** Bearer JWT
+**Response 200:** `ResumeAIResponse`
+
+---
+
+## E2B Sandboxes — `/e2b/sandboxes`
+
+### POST /e2b/sandboxes
+**Auth:** Bearer JWT
+**Request body:** `CreateSandboxRequest` — `device_id`, `template_id`, `resolution`, `timeout`
+**Response 201:** `{"sandbox_id", "stream_url", "status", "device_id"}`
+
+### GET /e2b/sandboxes/{sandbox_id}
+**Auth:** Bearer JWT
+**Response 200:** sandbox status
+
+### DELETE /e2b/sandboxes/{sandbox_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+### POST /e2b/sandboxes/{sandbox_id}/execute
+**Auth:** Bearer JWT
+**Request body:** `ExecuteActionRequest` — `action`, `params`
+**Response 200:** action result
+
+---
+
+## Screenshots — `/screenshots`
+
+### POST /screenshots
+**Auth:** Bearer JWT (flexible)
+**Request:** multipart/form-data — `file: UploadFile`, `task_id`, `session_id`
+**Response 201:** `{"screenshot_id", "url", "task_id", "session_id"}`
+**Rate limit:** upload_rate_limit
+**Side effects:** uploads to MinIO, returns presigned URL
+
+### GET /screenshots/{screenshot_id}
+**Auth:** flexible
+**Response 200:** image bytes
+
+---
+
+## Knowledge Base — `/knowledge`
+
+### POST /knowledge/save
+**Auth:** Agent Token
+**Request body:** `SaveKnowledgeRequest` — `agent_type`, `insight_type`, `global_insight_type`, `user_id`, `content`, etc.
+**Response 201:** `{"insight_id", "message"}`
+
+### POST /knowledge/retrieve
+**Auth:** Agent Token
+**Request body:** `RetrieveKnowledgeRequest` — `query`, `agent_type`, `insight_type`, `user_id`, `num_insights`
+**Response 200:** `KnowledgeResponse` — `insights: List[InsightResponse]`
+
+### DELETE /knowledge/{insight_id}
+**Auth:** Agent Token
+**Response 204:**
+
+### PUT /knowledge/{insight_id}
+**Auth:** Agent Token
+**Response 200:** updated insight
+
+### POST /knowledge/save-summary
+**Auth:** Agent Token
+**Response 201:** `{"summary_id", "message"}`
+
+### GET /knowledge/summaries/{user_id}
+**Auth:** Bearer JWT
+**Response 200:** list of summaries
+
+---
+
+## Safety — `/safety`
+
+### POST /safety/log-violation
+**Auth:** Agent Token
+**Request body:** `LogViolationRequest` — `verdict`, `reason`, `user_id`, `task_id`, `device_id`, `triggered_by`, `user_input`, `agent_output`
+**Response 201:** `{"violation_id", "message"}`
+
+### GET /safety/violations
+**Auth:** Bearer JWT
+**Query:** `verdict`, `limit`, `offset`
+**Response 200:** list of user violations
+
+### PATCH /safety/violations/{violation_id}/approve
+**Auth:** Bearer JWT
+**Response 200:** updated violation
+
+---
+
+## MCP Integrations — `/mcp/integrations`
+
+### GET /mcp/integrations/available
+**Auth:** Bearer JWT
+**Response 200:** `List[ComposioIntegrationResponse | IntegrationResponse]`
+**Side effects:** triggers `reconcile_pending_connections` in background
+
+### GET /mcp/integrations/connected
+**Auth:** Bearer JWT
+**Response 200:** `List[ComposioIntegrationResponse | IntegrationResponse]`
+
+### POST /mcp/integrations/connect
+**Auth:** Bearer JWT
+**Request body:** `{"provider": "slack"|..., "return_to": "/path", "platform": "web"|"tauri", "account_id": str|null}`
+**Response 200:** `{"auth_url": str, "provider": str}` or `{"status": "already_connected"}`
+
+### POST /mcp/integrations/disconnect
+**Auth:** Bearer JWT
+**Request body:** `DisconnectIntegrationRequest` — `{"provider": str}`
+**Response 200:** `{"success": true}`
+
+### PATCH /mcp/integrations/{provider}/toggle
+**Auth:** Bearer JWT
+**Request body:** `ToggleActiveRequest` — `is_active`, `account_id`
+**Response 200:** `ToggleActiveResponse`
+
+---
+
+## MCP Toolkits — `/mcp/toolkits`
+
+### GET /mcp/toolkits/search?q=&limit=
+**Auth:** Bearer JWT
+**Response 200:** `{"toolkits": List[ToolkitSummary], "total": int}`
+
+### GET /mcp/toolkits/{slug}
+**Auth:** Bearer JWT
+**Response 200:** `ToolkitSummary`
+
+---
+
+## MCP Triggers — `/mcp/triggers`
+
+### GET /mcp/triggers
+**Auth:** Bearer JWT
+**Response 200:** `TriggerListResponse`
+
+### POST /mcp/triggers
+**Auth:** Bearer JWT
+**Request body:** `CreateTriggerRequest` — `toolkit`, `trigger_name`, `config`, `action_prompt`, `account_id`
+**Response 200:** `TriggerResponse`
+
+### PATCH /mcp/triggers/{trigger_id}
+**Auth:** Bearer JWT
+**Request body:** `UpdateTriggerRequest` — `action_prompt`, `is_active`
+**Response 200:** `TriggerResponse`
+
+### DELETE /mcp/triggers/{trigger_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+---
+
+## MCP Webhooks — `/mcp/webhooks`
+
+### POST /mcp/webhooks/composio
+**Auth:** none (HMAC `X-Composio-Signature` header)
+**Side effects:** verifies signature, dispatches trigger event to agent via Socket.IO
+
+---
+
+## MCP OAuth Callback — `/mcp/oauth`
+
+### GET /mcp/oauth/callback?state=&connectedAccountId=&status=
+**Auth:** signed `state` JWT
+**Response:** 302 redirect (web) or HTML bridge page (Tauri)
+**Side effects:** background poll of Composio, emits `mcp_connection_completed` Socket.IO event
+
+---
+
+## MCP Telegram — `/mcp/telegram`
+
+### POST /mcp/telegram/connect
+**Auth:** Bearer JWT
+**Response 200:** connection status
+
+### DELETE /mcp/telegram/disconnect
+**Auth:** Bearer JWT
+**Response 204:**
+
+### GET /mcp/telegram/status
+**Auth:** Bearer JWT
+**Response 200:** connection status
+
+---
+
+## Agent Device Control — `/agent`
+
+### POST /agent/action/{device_id}
+**Auth:** Agent Token
+**Request body:** action payload
+**Response 200:** action result
+
+### GET /agent/action/{action_id}/result
+**Auth:** Agent Token
+**Response 200:** `{"status": "pending"|"completed"|"failed", "result": ...}`
+
+### POST /agent/screenshot/{device_id}
+**Auth:** Agent Token
+**Response 200:** `{"screenshot_id", "url"}`
+
+### POST /agent/task/{task_id}/status
+**Auth:** Agent Token
+**Request body:** `{"status": str}`
+**Response 200:** updated task
+
+---
+
+## Agent MCP Tools — `/agent/mcp`
+
+### GET /agent/mcp/tools/{user_id}
+**Auth:** Agent Token
+**Response 200:** `{"tools": List[ToolDef]}`
+
+### POST /agent/mcp/execute/{user_id}
+**Auth:** Agent Token
+**Request body:** `{"tool_name": str, "params": dict}`
+**Response 200:** tool execution result
+
+### GET /agent/mcp/composio/config/{user_id}
+**Auth:** Agent Token
+**Response 200:** Composio MCP config
+
+### POST /agent/mcp/composio/log
+**Auth:** Agent Token
+**Response 200:** `{"logged": true}`
+
+---
+
+## Scheduled Tasks — `/scheduled-tasks`
+
+### POST /scheduled-tasks
+**Auth:** Bearer JWT
+**Request body:** `ScheduledTaskCreate`
+**Response 201:** `ScheduledTaskRead`
+
+### GET /scheduled-tasks
+**Auth:** Bearer JWT
+**Query:** `limit`, `offset`, `is_active`
+**Response 200:** `List[ScheduledTaskRead]`
+
+### GET /scheduled-tasks/{task_id}
+**Auth:** Bearer JWT
+**Response 200:** `ScheduledTaskRead`
+
+### PATCH /scheduled-tasks/{task_id}
+**Auth:** Bearer JWT
+**Response 200:** `ScheduledTaskRead`
+
+### DELETE /scheduled-tasks/{task_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+### PATCH /scheduled-tasks/{task_id}/toggle
+**Auth:** Bearer JWT
+**Request body:** `{"is_active": bool}`
+**Response 200:** `ScheduledTaskRead`
+
+### GET /scheduled-tasks/{task_id}/runs
+**Auth:** Bearer JWT
+**Response 200:** `List[ScheduledTaskRunRead]`
+
+### POST /scheduled-tasks/{task_id}/run-now
+**Auth:** Bearer JWT
+**Response 200:** `{"run_id": str, "status": "queued"}`
+
+---
+
+## Connectors — `/connectors`
+
+### POST /connectors
+**Auth:** Bearer JWT
+**Request body:** `ConnectorCreate`
+**Response 201:** `ConnectorResponse`
+**Side effects:** encrypts config at rest
+
+### GET /connectors
+**Auth:** Bearer JWT
+**Response 200:** `List[ConnectorResponse]`
+
+### PATCH /connectors/{connector_id}
+**Auth:** Bearer JWT
+**Response 200:** `ConnectorResponse`
+
+### DELETE /connectors/{connector_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+### POST /connectors/icon-upload-url
+**Auth:** Bearer JWT
+**Response 200:** `IconPresignedResponse` — S3 presigned PUT URL
+
+---
+
+## Files — `/files`
+
+### POST /files/parse
+**Auth:** Bearer JWT
+**Request:** multipart/form-data — `file: UploadFile`
+**Response 200:** `FileParseResponse` — `content`, `filename`, `file_type`, `pages`
+**Side effects:** uploads to S3, inserts `attachments`, parses content
+
+### POST /files/parse-url
+**Auth:** Bearer JWT
+**Request body:** `{"url": str}`
+**Response 200:** `FileParseResponse`
+
+### GET /files/attachments
+**Auth:** Bearer JWT
+**Response 200:** `AttachmentListResponse`
+
+### GET /files/attachments/{attachment_id}/download
+**Auth:** Bearer JWT
+**Response 200:** file bytes or redirect to presigned URL
+
+---
+
+## Audio — `/audio`
+
+### POST /audio/transcribe
+**Auth:** Bearer JWT
+**Request:** multipart/form-data — `file: UploadFile`, `session_id`, `language`, `model`
+**Response 200:** `TranscriptionResponse` — `transcription_id`, `text`, `detected_language`, `processing_time_seconds`, `cost`, `model`
+**Side effects:** sends to RunPod Whisper, inserts `transcriptions`, deducts tokens
+
+---
+
+## Notifications — `/notifications`
+
+### GET /notifications/unread
+**Auth:** Bearer JWT
+**Query:** `limit` (1-100)
+**Response 200:** `NotificationsListResponse` — `items`, `total`, `unread_count`
+
+### POST /notifications/{notification_id}/read
+**Auth:** Bearer JWT
+**Response 200:** `{"success": true}`
+
+### POST /notifications/read-all
+**Auth:** Bearer JWT
+**Response 200:** `{"success": true, "count": int}`
+
+### GET /notifications/unread-count
+**Auth:** Bearer JWT
+**Response 200:** `UnreadCountResponse`
+
+---
+
+## Helpdesk — `/helpdesk`
+
+### POST /helpdesk/tickets
+**Auth:** Bearer JWT
+**Response 201:** `TicketRead`
+
+### GET /helpdesk/tickets
+**Auth:** Bearer JWT
+**Response 200:** `TicketListResponse`
+
+### GET /helpdesk/tickets/{ticket_id}
+**Auth:** Bearer JWT
+**Response 200:** `TicketDetailRead`
+
+### PATCH /helpdesk/tickets/{ticket_id}
+**Auth:** Bearer JWT
+**Response 200:** `TicketRead`
+
+### DELETE /helpdesk/tickets/{ticket_id}
+**Auth:** Bearer JWT
+**Response 204:**
+
+### POST /helpdesk/tickets/{ticket_id}/messages
+**Auth:** Bearer JWT
+**Response 201:** `MessageRead`
+
+### POST /helpdesk/tickets/{ticket_id}/rate
+**Auth:** Bearer JWT
+**Response 200:** `TicketRead`
+
+### POST /helpdesk/tickets/{ticket_id}/attachments/presigned
+**Auth:** Bearer JWT
+**Response 200:** presigned S3 URL
+
+### GET /helpdesk/kb/articles
+**Auth:** Bearer JWT
+**Response 200:** `KBArticleListResponse`
+
+---
+
+## Action History — `/action-history`
+
+### GET /action-history
+**Auth:** Bearer JWT
+**Response 200:** `ActionHistoryResponse`
+
+---
+
+## Internal — `/internal`
+
+All internal endpoints require `X-Internal-Token` header. Blocked by ALB for external traffic.
+
+### POST /internal/notify-user/{user_id}
+**Auth:** Internal Token
+**Request body:** notification payload
+**Response 200:** emits Socket.IO event to user
+**Used by:** worker process to push agent events to WebApp
+
+### GET /internal/health
+**Auth:** none
+**Response 200:** `{"status": "ok"}`
+
+---
+
+## Library — `/library`
+
+### GET /library/types
+**Auth:** none
+**Response 200:** `LibraryTypesListResponse`
+
+### GET /library/cards?type=
+**Auth:** none
+**Response 200:** `LibraryCardsListResponse`
+
+---
+
+## Pricing — `/pricing`
+
+### GET /pricing/plans
+**Auth:** none
+**Response 200:** `List[PublicPlanResponse]`
+
+### GET /pricing/plans/{plan_id}
+**Auth:** none
+**Response 200:** `PublicPlanResponse`
+
+---
+
+## Analytics — `/analytics`
+
+### POST /analytics/events
+**Auth:** Bearer JWT
+**Response 200:** `AnalyticsEventResponse`
+
+### POST /analytics/crash
+**Auth:** Bearer JWT
+
+### POST /analytics/session/start / /end
+**Auth:** Bearer JWT
+
+---
+
+## Admin — `/admin`
+
+All admin endpoints require Admin JWT (`is_admin=True`).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/admin/users` | Paginated user list with filters |
+| POST | `/admin/users` | Create user manually |
+| PATCH | `/admin/users/{id}` | Update user |
+| PATCH | `/admin/users/{id}/role` | Assign admin role |
+| DELETE | `/admin/users/{id}` | Soft-delete |
+| DELETE | `/admin/users/{id}/permanent` | Hard-delete |
+| POST | `/admin/users/{id}/reset-password` | Force reset |
+| DELETE | `/admin/users/{id}/sessions` | Delete all sessions |
+| GET | `/admin/billing/*` | Billing management |
+| POST | `/admin/billing/grant-tokens` | Manual token grant |
+| GET | `/admin/costs` | API cost metrics |
+| GET | `/admin/dashboard` | Dashboard stats |
+| GET/POST/PATCH/DELETE | `/admin/plans/*` | Subscription plans CRUD |
+| GET/PATCH | `/admin/model-profiles/*` | Model profile configs |
+| GET | `/admin/analytics/*` | Analytics stats |
+| GET/POST | `/admin/system/*` | System health, cache flush |
+| GET/POST/PATCH/DELETE | `/admin/notifications/*` | Push notifications |
+| GET/POST/PATCH/DELETE | `/admin/library/*` | Library categories and cards |
+| GET/PATCH/DELETE | `/admin/helpdesk/*` | Helpdesk management |
+| GET | `/admin/message-ratings` | Message ratings overview |
+| GET | `/admin/session-logs/*` | Loki log proxy |
+| GET/POST | `/admin/invites/*` | Invite codes CRUD |
+| POST | `/admin/auth/token` | Admin SPA login |
+
+---
+
+## Emplogents — `/emplogents` and `/emplogent-templates`
+
+AI persona templates. Used to attach custom system prompts to sessions.
+
+### GET/POST /emplogent-templates
+### GET/PATCH/DELETE /emplogent-templates/{template_id}
+### GET/POST /emplogents
+### GET/PATCH/DELETE /emplogents/{emplogent_id}
+
+**Auth:** Bearer JWT for all. Standard CRUD responses.

@@ -1,0 +1,178 @@
+---
+title: "Schema Inconsistencies"
+description: "Documented mismatches between SQLAlchemy ORM models and Pydantic request/response schemas. Each entry includes the root cause, the observable impact, and recommended fix."
+---
+
+# Schema Inconsistencies
+
+This page documents all confirmed mismatches found between `Backend/app/models/` (SQLAlchemy) and `Backend/app/schemas/` (Pydantic). These are not necessarily bugs in the running system — some are intentional omissions for security or legacy compatibility — but all should be understood before making API or migration decisions.
+
+---
+
+## 1. `DeviceType` — Missing `SESSION_SANDBOX` Variant
+
+**Severity:** High (silent data truncation for Compute V2 flows)
+
+**Location:**
+- Model: `Backend/app/models/devices.py` → `DeviceType` enum
+- Schema: `Backend/app/schemas/devices.py` → `DeviceType` enum
+
+**Discrepancy:**
+
+The ORM model defines three variants:
+
+```python
+# models/devices.py
+class DeviceType(str, Enum):
+    REAL_DEVICE = "real_device"
+    E2B_SANDBOX = "e2b_sandbox"
+    SESSION_SANDBOX = "session_sandbox"   # ← Compute V2 ephemeral sandbox
+```
+
+The Pydantic schema defines only two:
+
+```python
+# schemas/devices.py
+class DeviceType(str, Enum):
+    REAL_DEVICE = "real_device"
+    E2B_SANDBOX = "e2b_sandbox"
+    # SESSION_SANDBOX missing
+```
+
+**Impact:** Any `DeviceRead` response for a `SESSION_SANDBOX` device will fail Pydantic validation on the `device_type` field, surfacing as a 500 Internal Server Error. The field also cannot be passed to `DeviceCreate` to provision a session sandbox via the API.
+
+**Fix:** Add `SESSION_SANDBOX = "session_sandbox"` to `DeviceType` in `schemas/devices.py`.
+
+---
+
+## 2. `TaskRead.Config` — Pydantic v2 Typo
+
+**Severity:** Medium (ORM deserialization silently broken for `TaskRead`)
+
+**Location:**
+- Schema: `Backend/app/schemas/task.py` → `TaskRead.Config`
+
+**Discrepancy:**
+
+```python
+# schemas/task.py
+class TaskRead(BaseModel):
+    ...
+    class Config:
+        from_attribute = True   # ← wrong: singular
+```
+
+The correct Pydantic v2 key is `from_attributes = True` (plural). With the typo, `model_validate(orm_obj)` will raise a `ValidationError` because the Config key is silently ignored and ORM-to-schema conversion is disabled.
+
+**Impact:** All task endpoints that return `TaskRead` (e.g., `GET /tasks`, `POST /tasks`, `GET /tasks/{task_id}`) will 500 if they rely on `model_validate()`. If the service layer manually serializes fields, it may still work — but this is fragile.
+
+**Fix:**
+
+```python
+class Config:
+    from_attributes = True   # Pydantic v2 correct key
+```
+
+---
+
+## 3. `ChatSessionRead` — Missing Compute V2 and Pause Fields
+
+**Severity:** Low (fields exist in DB but are intentionally not surfaced via API)
+
+**Location:**
+- Model: `Backend/app/models/chat_sessions.py` → `ChatSession`
+- Schema: `Backend/app/schemas/chat_session.py` → `ChatSessionRead`
+
+**Discrepancy:**
+
+The ORM model has three columns that do not appear in `ChatSessionRead`:
+
+| Column | Purpose |
+|--------|---------|
+| `task_sandbox_device_id` | Compute V2: SESSION_SANDBOX device slot |
+| `paused_device_id` | Cloud PC resume memo |
+| `deleted_at` | Soft-delete timestamp |
+
+**Impact:** Callers cannot inspect whether a session has an active task sandbox device or whether it is in a paused-Cloud-PC state purely from the session read response. The `deleted_at` omission means soft-deleted sessions returned via admin queries appear identical to active sessions.
+
+**Note:** Excluding `deleted_at` and `paused_device_id` from the public API is defensible. `task_sandbox_device_id` should be exposed when Compute V2 ships.
+
+**Fix (Compute V2):** Add `task_sandbox_device_id: Optional[str] = None` to `ChatSessionRead` behind a feature flag.
+
+---
+
+## 4. `UserRead` — Intentional Omissions (Security Design)
+
+**Severity:** Informational (by design, documented here for completeness)
+
+**Location:**
+- Model: `Backend/app/models/users.py` → `User`
+- Schema: `Backend/app/schemas/security.py` → `UserRead`
+
+**Discrepancy:**
+
+`UserRead` exposes a minimal surface area. The following `User` model fields are deliberately excluded from `GET /users/me` responses:
+
+| Field | Reason for exclusion |
+|-------|---------------------|
+| `password_hash` | Security — never expose |
+| `otp_secret` | Security — TOTP seed |
+| `google_id` | Privacy |
+| `password_changed_at` | Internal JWT revocation |
+| `registration_meta` | Internal UTM data |
+| `inactivity_email_sent_at` | Internal tracking |
+| `last_daily_active_tracked` | Internal tracking |
+| `last_monthly_active_tracked` | Internal tracking |
+| `admin_role_id` | Admin-scope only |
+| `kb_enabled` | Internal feature flag |
+| `safety_level` | Exposed in separate safety endpoint |
+| `preferred_model_profile` | Exposed in `/billing/status` |
+| `first_task_completed_at` | Analytics |
+| `last_active_at` | Analytics |
+
+**Impact:** None. This is intentional. If a client needs `kb_enabled` or `preferred_model_profile`, it should call the appropriate domain endpoints (`/billing/status`, `/billing/model-profile`).
+
+---
+
+## 5. `DeviceUpdate.connection_status` — Non-Optional Default
+
+**Severity:** Low (unexpected default overwrites DB value on partial update)
+
+**Location:**
+- Schema: `Backend/app/schemas/devices.py` → `DeviceUpdate`
+
+**Discrepancy:**
+
+```python
+class DeviceUpdate(BaseModel):
+    device_name: Optional[str] = None
+    platform: Optional[DevicePlatform] = None
+    capabilities: Optional[Dict[str, Any]] = None
+    last_seen: Optional[datetime] = None
+    connection_status: Literal["online", "deleted", "offline"] = "offline"   # ← non-optional with default
+    sandbox_config: Optional[Dict[str, Any]] = None
+```
+
+`connection_status` is not `Optional` — it has a hardcoded default of `"offline"`. A `PATCH /devices/{device_id}` request that omits `connection_status` in the body will silently overwrite the device's current status to `"offline"`.
+
+**Impact:** A client performing a partial update (e.g., only changing `device_name`) will accidentally mark the device as offline if it does not re-send `connection_status`.
+
+**Fix:**
+
+```python
+connection_status: Optional[Literal["online", "deleted", "offline"]] = None
+```
+
+Then in the service layer, only apply the update if the value is not `None`.
+
+---
+
+## Summary Table
+
+| # | Schema | Model | Issue Type | Severity |
+|---|--------|-------|-----------|---------|
+| 1 | `schemas/devices.py` `DeviceType` | `models/devices.py` `DeviceType` | Missing enum variant (`SESSION_SANDBOX`) | High |
+| 2 | `schemas/task.py` `TaskRead.Config` | N/A | Pydantic v2 typo (`from_attribute` vs `from_attributes`) | Medium |
+| 3 | `schemas/chat_session.py` `ChatSessionRead` | `models/chat_sessions.py` `ChatSession` | Missing Compute V2 + pause memo fields | Low |
+| 4 | `schemas/security.py` `UserRead` | `models/users.py` `User` | Intentional omissions (security design) | Informational |
+| 5 | `schemas/devices.py` `DeviceUpdate` | N/A | Non-optional `connection_status` with default `"offline"` | Low |

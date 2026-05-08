@@ -1,0 +1,478 @@
+---
+title: "Real-time Events Reference"
+description: "Complete reference for every Socket.IO event and RabbitMQ message that crosses the Agent ↔ Backend ↔ Frontend boundary."
+---
+
+# Real-time Events
+
+Skygen uses two transport layers for real-time communication:
+
+- **Socket.IO** — bidirectional, low-latency events between the Backend and connected clients (Agent process, Frontend browser/app). Three namespaces: `/agent`, `/device`, `/user`.
+- **RabbitMQ** — durable queue for agent task messages. The Agent publishes results; the Backend worker (`worker/listener.py`) consumes them and fans out to the Frontend via the `/user` Socket.IO namespace.
+
+---
+
+## Socket.IO Namespaces
+
+| Namespace | Clients | Purpose |
+|-----------|---------|---------|
+| `/agent` | Agent process | Agent ↔ Backend lifecycle and control events |
+| `/device` | Desktop App (real device) | Device commands and heartbeats |
+| `/user` | Browser / Desktop App | Frontend notifications: new messages, session state, notifications |
+
+---
+
+## Namespace: `/agent`
+
+### Events Received by Agent (Backend → Agent)
+
+These events are registered in `BrokerAgent/broker.py` via `AgentSocketIOClient.on_event()`.
+
+---
+
+#### `user_followup`
+
+**Direction:** Backend → Agent  
+**When:** User sends a follow-up message to an in-progress session from the web chat.  
+**Handler:** `BrokerAgent._handle_user_followup()`  
+**Effect:** Message is pushed into the active agent's Inbox as `USER_FOLLOWUP`.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "message": "string",
+  "attachments": [
+    {"url": "string", "name": "string", "type": "string"}
+  ]
+}
+```
+
+---
+
+#### `user_cancel`
+
+**Direction:** Backend → Agent  
+**When:** User clicks "Cancel" on an in-progress session.  
+**Handler:** `BrokerAgent._handle_user_cancel()`  
+**Effect:** Sets Redis cancel flag `cancel:{session_id}` + pushes `USER_CANCEL` into Inbox for soft cancellation. The Redis flag is watched by `_run_chat_with_cancel_watch()` for hard cancellation.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string"
+}
+```
+
+---
+
+#### `agent_pause`
+
+**Direction:** Backend → Agent  
+**When:** Admin or system requests a session pause.  
+**Handler:** `BrokerAgent._handle_agent_pause()`  
+**Effect:** Pushes `PAUSE` into the agent's Inbox. Agent exits the ReAct loop with `status=paused` after the current iteration completes.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string"
+}
+```
+
+---
+
+#### `trigger_event`
+
+**Direction:** Backend → Agent  
+**When:** A scheduled or external trigger fires for an active agent session (cron, external webhook).  
+**Handler:** `BrokerAgent._handle_trigger_event()`  
+**Effect:** Constructs a synthetic RabbitMQ-style payload and routes it through the normal worker loop.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "trigger_type": "string",
+  "trigger_data": {}
+}
+```
+
+---
+
+#### `mcp_integration_active_changed`
+
+**Direction:** Backend → Agent  
+**When:** User enables or disables an MCP toolkit integration (e.g., Gmail, GitHub) from the settings UI.  
+**Handler:** `BrokerAgent._handle_mcp_integration_changed()`  
+**Effect:** Calls `MCPToolsAgent.apply_toolkit_toggle_for_user()` on all live `MCPToolsAgent` instances in the `_REMOTE_TOOL_MANAGER_REGISTRY` (WeakSet).
+
+```json
+{
+  "user_id": "string",
+  "integration_key": "string",
+  "enabled": true
+}
+```
+
+---
+
+#### `mcp_connection_completed_for_user`
+
+**Direction:** Backend → Agent  
+**When:** OAuth flow for an MCP provider completes (after `reconcile_pending_connections` fires on the Backend).  
+**Handler:** `BrokerAgent._handle_mcp_connection_completed()`  
+**Effect:** Wakes any hibernated agents waiting on `trigger_type=mcp_connection_ready` for this user. Also emits a `ui_meta_update` resume frame to the Frontend.
+
+```json
+{
+  "user_id": "string",
+  "toolkit_slug": "string",
+  "session_id": "string | null"
+}
+```
+
+---
+
+#### `cloud_pc_session_bound`
+
+**Direction:** Backend → Agent  
+**When:** A Cloud PC device successfully binds to a session after user approval.  
+**Handler:** `BrokerAgent._handle_cloud_pc_session_bound()`  
+**Effect:** Wakes any hibernated agents waiting on `trigger_type=cloud_pc_connected`. Emits a `ui_meta_update` "Resuming task" frame via Socket.IO.
+
+```json
+{
+  "user_id": "string",
+  "session_id": "string",
+  "device_id": "string"
+}
+```
+
+---
+
+### Events Emitted by Agent (Agent → Backend)
+
+Send path: `AgentSocketIOClient.send_event(event_name, data)` (`Services/socketio_client.py`).
+
+---
+
+#### `ui_meta_update`
+
+**Direction:** Agent → Backend  
+**When:** Any time the agent needs to push a UI rendering hint without going through RabbitMQ (latency-sensitive). Typical triggers: mode progress badges, `ask_human` interactive frames, `mode_progress` plaque updates.  
+**Consumed by (Backend):** `app/socketio/agent_namespace.py` → `_persist_ui_meta()` → persists as a `chat_messages` row with `meta.type=ui_meta`.
+
+<Tabs>
+  <Tab title="Generic payload">
+    ```json
+    {
+      "session_id": "string",
+      "user_id": "string",
+      "mode": "ask_human | mode_progress | info | ...",
+      "stage": "input | output | ...",
+      "title": "string | null",
+      "data": {}
+    }
+    ```
+  </Tab>
+  <Tab title="Ask Human frame (ARCH-001)">
+    ```json
+    {
+      "session_id": "string",
+      "user_id": "string",
+      "mode": "ask_human",
+      "stage": "input",
+      "title": "string",
+      "data": {
+        "input_type": "text | choice",
+        "question": "string",
+        "choices": ["string"],
+        "request_id": "string"
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+#### `trigger_step`
+
+**Direction:** Agent → Backend  
+**When:** Agent processes a scheduled trigger and needs to report execution metadata back to the Backend for logging and device unlock sequencing.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "trigger_type": "string",
+  "status": "processing | completed | error",
+  "timestamp": "ISO-8601 string"
+}
+```
+
+---
+
+## RabbitMQ — Agent → Backend Messages
+
+**Send path:** `BrokerAgent.publish_agent_message()` → `_BuildAgentMessageTransport()` → `Transport.Send(AgentMessage)`
+
+**Transport selection:**
+- `agent_response` → `CompositeTransport([WebSocketTransport, RabbitMqTransport])` — WebSocket-first, RabbitMQ fallback
+- All other types → `RabbitMqTransport` directly
+
+**Backend consumer:** `worker/listener.py` → `_process_payload()` → `MESSAGE_HANDLERS[message_type].handle(payload)`
+
+### Worker Handler Registry
+
+`app/worker/handlers/registry.py` maps `message_type` → stateless handler instance:
+
+| `message_type` | Handler class | What it does |
+|----------------|---------------|--------------|
+| `agent_response` | `AgentResponseHandler` | Saves response to DB (idempotency check, 60 s dedup window), processes `emitted_files` attachments, emits `display_message` to user via `/user` Socket.IO, unlocks device + session in `finally` block. |
+| `agent_status` | `AgentStatusHandler` | **Not saved to DB.** Transforms via `DisplayTransformer.transform_agent_status()`, emits `display_message` to user only. |
+| `agent_error` | `AgentErrorHandler` | Saves error content to DB via `ChatMessageHandler`, updates scheduled task run status, emits error notification, unlocks device + session in `finally` block. |
+| `agent_step` | `AgentStepHandler` | Persists step as a `system` role `chat_messages` row for trajectory/audit. **Does NOT emit to frontend** — progress timeline comes from `ui_meta_update` Socket.IO events. On page reload, `DisplayTransformer._build_system_display()` routes stored step rows to non-rendered `STATUS_UPDATE`. |
+| `plan_update` | `PlanUpdateHandler` | Validates plan payload with Pydantic, emits `ui_meta_update` to frontend, persists to DB (supersedes old plans for the session). |
+| `task` | `TaskMessageHandler` | Legacy task message path. Routes by `task_id`. |
+| `chat` | `ChatMessageHandler` | Fallback for unknown types. Saves as `assistant` message. |
+
+**Fallback:** Unknown `message_type` values fall through to `ChatMessageHandler` with a warning log.
+
+**Unlock invariant:** `AgentResponseHandler` and `AgentErrorHandler` both call `device_lock_manager.release()` + `session_lock.clear()` in a `finally` block — so device + session are always released even if DB writes fail.
+
+---
+
+### `agent_response`
+
+**When:** Agent produces a visible text response (final answer, intermediate inform, result delivery).  
+**Terminal flag:** `meta.status = "completed"` marks the terminal response.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "content": "string",
+  "message_type": "agent_response",
+  "meta_data": {
+    "status": "processing | completed",
+    "mode": "planner | llm | deep_research | cua",
+    "final_outcome": "DONE | FAILED | CANCELLED",
+    "content_already_emitted": false
+  }
+}
+```
+
+<Note>
+  `content_already_emitted=true` suppresses the duplicate terminal `agent_response` when `CommunicateTool(to='user', message_type='result')` already delivered content via `WebEndpoint.SendResult`. The Backend's `finalize_agent_response` chain only runs once.
+</Note>
+
+---
+
+### `agent_status`
+
+**When:** Non-content lifecycle state changes — session started, hibernated, cancelled, paused.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "content": "",
+  "message_type": "agent_status",
+  "meta_data": {
+    "status": "started | hibernated | completed | cancelled | error",
+    "worker_id": "string | null",
+    "reason": "string | null"
+  }
+}
+```
+
+---
+
+### `agent_error`
+
+**When:** Unhandled exception or fatal error in session processing.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "content": "string (error message)",
+  "message_type": "agent_error",
+  "meta_data": {
+    "error_type": "string",
+    "traceback": "string | null"
+  }
+}
+```
+
+---
+
+### `agent_step`
+
+**When:** CUA or Planner agent reports a discrete execution step (GUI action, sub-task, research step) for the UI step timeline.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "content": "Step N: <description>",
+  "message_type": "agent_step",
+  "meta_data": {
+    "status": "processing | completed | error",
+    "step_number": 1,
+    "action_type": "string",
+    "action_description": "string",
+    "screenshot_url": "string | null",
+    "reasoning": "string | null",
+    "timestamp": "ISO-8601 string",
+    "trajectory_data": {
+      "events_blob_ref": "string | null",
+      "events_count": 0
+    }
+  }
+}
+```
+
+<Note>
+  Large `trajectory_data.events` arrays (&gt;20 entries) are off-loaded to blob storage; `events_blob_ref` is set and the inline array is removed by `_offload_trajectory_blobs()`.
+</Note>
+
+---
+
+### `plan_update`
+
+**When:** `PlannerAgent`'s `PlanManager` creates or updates the structured execution plan.
+
+```json
+{
+  "session_id": "string",
+  "user_id": "string",
+  "content": "",
+  "message_type": "plan_update",
+  "meta_data": {
+    "steps": [
+      {
+        "id": "string (UUID)",
+        "title": "string",
+        "status": "pending | in_progress | completed | skipped | error",
+        "description": "string | null",
+        "sub_steps": [
+          {"id": "string", "title": "string", "status": "string"}
+        ]
+      }
+    ],
+    "revision": 1
+  }
+}
+```
+
+**Status notes:** `blocked` maps to `error` (red X in UI). `skipped` is assigned by `_finalize_orphan_plan_steps()` to in-flight steps when the session ends.
+
+---
+
+## In-Process Inbox Messages (Agent ↔ Agent)
+
+These are **not** Socket.IO events. They are Python `dict` messages pushed directly into `BaseAgent.inbox` (an `asyncio.Queue`). Processed by `_handle_inbox_messages()` at the start of each ReAct iteration.
+
+<Warning>
+  Inbox messages do not cross process boundaries. They are strictly for orchestrator ↔ sub-agent communication and external interrupt injection within the same Python process.
+</Warning>
+
+| Message type | From | Effect |
+|---|---|---|
+| `STOP` | BrokerAgent cancel handler | Sets `should_cancel=True`; next LLM call returns `status=cancelled` |
+| `INFO` | BrokerAgent trigger handler | Injects a `system` message as background context; does not interrupt iteration |
+| `INFORM` | Parent agent to child | Same as `INFO` but semantically parent-to-child |
+| `CHILD_DONE` | Sub-agent completion callback | Orchestrator receives result; triggers `on_subagent_finish()` |
+| `CHILD_HIBERNATED` | Sub-agent hibernate callback | Orchestrator notified child suspended (e.g., waiting for user reply) |
+| `USER_FOLLOWUP` | BrokerAgent Socket.IO handler | Delivers user follow-up; wakes hibernated agent via BrokerWaker |
+| `PAUSE` | `agent_pause` Socket.IO handler | Agent exits ReAct loop after current iteration, persists state |
+| `FLUSH` | Internal orchestration | Triggers immediate scratchpad flush and plan snapshot publication |
+| `USER_CANCEL` | BrokerAgent cancel handler | Soft cancel — injects cancellation hint as a user message before next LLM call |
+
+### `CHILD_DONE` payload
+
+```python
+{
+  "type": "CHILD_DONE",
+  "agent_id": "string",
+  "summary": "string",
+  "failed": False,
+  "plan_step_id": "string | None"
+}
+```
+
+### `CHILD_HIBERNATED` payload
+
+```python
+{
+  "type": "CHILD_HIBERNATED",
+  "agent_id": "string",
+  "trigger_type": "user_reply | timer | visual_condition | mcp_connection_ready | cloud_pc_connected",
+  "plan_step_id": "string | None"
+}
+```
+
+---
+
+## Internal SharedEventLog Events (`agent.*`)
+
+These events are written to `BaseAgent.event_log` (`SharedEventLog`) via `_emit_agent_state_event()`. They are **not** transmitted over the network — they are used for observability, debugging, and the Telemetry/tracing subsystem.
+
+| Event name | Emitted when | Key payload fields |
+|---|---|---|
+| `agent.terminate` | `_terminal_return()` — normal completion | `status`, `summary_preview`, `blob_ref` |
+| `agent.hibernate` | `_handle_termination()` — HIBERNATE action | `trigger_type`, `params` |
+| `agent.cancel` | Cancellation detected | `reason` |
+| `agent.error` | Unhandled exception in `chat()` | `error`, `traceback` |
+| `agent.budget_alert` | `BudgetAlertManager` fires a rule | `rule_type`, `value`, `threshold` |
+| `agent.guardrail_block` | `SafetyManager` blocks an action | `action`, `rule` |
+
+---
+
+## Session Lifecycle
+
+### State Machine
+
+```
+[QUEUED] → [STARTING] → [RUNNING] → [TERMINATED]
+                                   ↘ [HIBERNATED] → [RUNNING]
+                                   ↘ [PAUSED]    → [RUNNING]
+                                   ↘ [CANCELLED]
+                                   ↘ [ERROR]
+```
+
+### Start sequence
+
+1. Backend publishes message to RabbitMQ worker queue.
+2. `BrokerAgent.worker_loop()` dequeues and calls `process_task()`.
+3. Routes by `agent_mode` → appropriate `_run_*_task()` handler.
+4. Publishes `agent_status { status: "started" }` via RabbitMQ.
+5. `BaseAgent.chat()` enters the ReAct loop.
+
+### Hibernate sequence
+
+1. Agent executes `HibernateTool` (or `RequestConfirmationTool` for ARCH-001).
+2. `SentinelStore` creates a `SentinelTask` keyed by `session_id` with a strategy (`timer` / `visual_condition` / `user_reply`).
+3. Publishes `agent_status { status: "hibernated" }`.
+4. For `ask_human` type: emits `ui_meta_update` with `mode=ask_human` frame via Socket.IO.
+5. Agent state (full message history) is persisted to Redis key `agent_history:{session_id}`.
+
+### Wake sequence
+
+1. `Sentinel` polling loop evaluates `SentinelTask` entries.
+2. Strategy signals ready; `BrokerWaker.Wake()` re-enqueues the payload with wake metadata.
+3. Sub-agent hibernate: `BrokerWaker._WakeSubAgent()` pushes `USER_FOLLOWUP` into the parent's Inbox.
+4. Root agent hibernate: `BrokerWaker._WakeRootAgent()` publishes the synthetic task back to RabbitMQ.
+5. `_process_planner_mode()` detects a restored session (non-empty Redis history) and resumes `agent.chat()`.
+
+### Terminate sequence
+
+1. `CommunicateTool(message_type="result")` or max iterations reached.
+2. `_terminal_return()` emits `agent.terminate` to `SharedEventLog`.
+3. BrokerAgent publishes `agent_status { status: "completed" }` and the terminal `agent_response`.
+4. `_finalize_orphan_plan_steps()` sets remaining `in_progress`/`pending` plan steps to `skipped`.
+5. `DeviceLockManager` releases the device lock.
+6. Backend's `finalize_agent_response()` → `unlock_device()` → session closed.

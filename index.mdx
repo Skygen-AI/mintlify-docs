@@ -1,55 +1,128 @@
 ---
-title: "Introduction"
-description: "Skygen is an AI agent automation platform that runs on real devices, Cloud PCs, and sandboxed environments."
+title: "Welcome to Skygen"
+description: "The multi-platform AI agent automation platform. Run intelligent agents on Cloud PCs, your own device, or in pure software environments."
 ---
 
-Skygen lets you build and run AI agents that control computers. Connect your laptop or spin up a Cloud PC, chat with an agent, and it will click, type, browse, and use apps on your behalf. Integrations with 500+ third-party services (via MCP) let agents read your email, update your CRM, or post to Slack while they work.
+<img
+  className="block dark:hidden"
+  src="/images/hero-light.png"
+  alt="Skygen Platform"
+  noZoom
+/>
+<img
+  className="hidden dark:block"
+  src="/images/hero-dark.png"
+  alt="Skygen Platform"
+  noZoom
+/>
 
-## What you can build
+## What is Skygen?
 
-<Columns cols={2}>
-  <Card title="Automate a desktop workflow" icon="desktop" href="/concepts/agents">
-    An agent on your real device opens Figma, renames 40 layers, exports PNGs, and uploads them to Google Drive.
-  </Card>
-  <Card title="Run a task on a Cloud PC" icon="cloud" href="/concepts/cloud-pc">
-    Launch a persistent virtual machine, paste a URL, and have the agent fill out a form without tying up your laptop.
-  </Card>
-  <Card title="Connect integrations" icon="plug" href="/concepts/mcp-integrations">
-    Let the agent use Gmail, Slack, GitHub, Notion, Linear, and more through a single OAuth consent screen.
-  </Card>
-  <Card title="Schedule recurring tasks" icon="calendar" href="/guides/scheduled-tasks">
-    "Every Monday at 9am, summarize my open PRs and post to #standup."
-  </Card>
-</Columns>
+Skygen is a multi-platform AI agent automation platform that lets you build, connect, and run intelligent agents across real computers, cloud desktops, and software environments. Whether you need an agent to browse the web, fill out forms, write code, send emails, or query APIs — Skygen provides the infrastructure to make it happen reliably at scale.
 
-## Core concepts
+Agents communicate with users in real time over WebSockets, execute multi-step plans across GUI and API surfaces, and can be triggered manually, via API, or on a cron schedule. Every action is logged, every cost is tracked, and every integration is MCP-native — so you can connect Slack, Gmail, GitHub, and dozens of other tools without writing custom glue code.
 
-Start here to understand how Skygen fits together.
+## Three Compute Modes
 
-<CardGroup cols={2}>
-  <Card title="Devices" icon="laptop" href="/concepts/devices">
-    Real machines and virtual sandboxes that agents run on.
+<CardGroup cols={3}>
+  <Card title="Cloud PC" icon="cloud" href="/concepts/cloud-pc">
+    **Fully managed E2B virtual desktop.** The agent gets a persistent VM with a real GUI (1920x1080), Chrome, file system, and more. Zero local setup. Ideal for web automation, GUI workflows, and tasks that need a persistent environment between sessions.
   </Card>
-  <Card title="Chat sessions" icon="comments" href="/concepts/chat-sessions">
-    Conversations that scope the agent's context and memory.
+  <Card title="User Device" icon="desktop" href="/concepts/devices">
+    **Your Mac or Windows machine.** Install the Skygen desktop app and the agent takes control of your actual screen — click, type, drag, screenshot. Ideal for workflows that require access to local apps or files.
   </Card>
-  <Card title="Agents" icon="robot" href="/concepts/agents">
-    Action loop, tool use, and how agents route to devices.
-  </Card>
-  <Card title="Confirmations" icon="shield-check" href="/concepts/confirmations">
-    Approval flow for sensitive actions before they execute.
+  <Card title="Software Agent" icon="code" href="/concepts/agents">
+    **No computer required.** The agent uses code execution, API calls, and MCP integrations to complete pure software tasks: coding, data pipelines, Slack/Gmail/GitHub operations, and more. Fastest and cheapest mode.
   </Card>
 </CardGroup>
 
-## Get started
+## Five-Minute Quickstart
 
 <CardGroup cols={2}>
   <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Register, connect a device, and run your first session in 5 minutes.
+    Authenticate, create a session, and run your first agent task in under five minutes.
   </Card>
-  <Card title="API reference" icon="code" href="/api-reference/introduction">
-    Every endpoint with request, response, and examples.
+  <Card title="Authentication" icon="key" href="/guides/authentication">
+    How JWT auth works, how to get tokens, and how to use them in API calls.
+  </Card>
+  <Card title="LLM Routing" icon="brain" href="/guides/llm-routing">
+    Choose between Claude, Gemini, Cerebras, and Groq models for your agent tasks.
+  </Card>
+  <Card title="Scheduled Tasks" icon="clock" href="/guides/scheduled-tasks">
+    Create recurring agent tasks that run automatically on any cron-compatible schedule.
   </Card>
 </CardGroup>
 
-{/* TODO: add hero screenshot of dashboard once brand assets are finalized */}
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Skygen Platform                         │
+│                                                                 │
+│   WebApp / Mobile App / API client                              │
+│          │                                                      │
+│          ▼  REST + Socket.IO                                    │
+│   ┌─────────────────┐    ┌──────────────┐   ┌──────────────┐   │
+│   │  Backend API    │    │  RabbitMQ    │   │  Redis       │   │
+│   │  (FastAPI)      │───▶│  (task queue)│   │  (pub/sub,   │   │
+│   │  Port 8000      │    └──────┬───────┘   │   sessions)  │   │
+│   └────────┬────────┘           │           └──────────────┘   │
+│            │ JWT auth            ▼                               │
+│            │           ┌─────────────────┐                      │
+│            │           │  Agent Service  │                      │
+│            │           │  (Python 3.12)  │                      │
+│            │           │  Port 8080      │                      │
+│            │           └────────┬────────┘                      │
+│            │                    │                               │
+│            │      ┌─────────────┼─────────────┐                 │
+│            │      ▼             ▼             ▼                 │
+│            │  Cloud PC      User Device   Software              │
+│            │  (E2B VM)      (Mac/Win)     (API/Code)            │
+│            │                                                    │
+│            ▼                                                    │
+│   ┌─────────────────┐   ┌──────────┐   ┌──────────┐            │
+│   │  PostgreSQL      │   │  S3/MinIO│   │  MCP     │            │
+│   │  (data store)    │   │  (files) │   │  tools   │            │
+│   └─────────────────┘   └──────────┘   └──────────┘            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key components:**
+
+- **Backend API** — FastAPI REST server + Socket.IO real-time layer. Handles auth, sessions, billing, device management, and message routing.
+- **Agent Service** — Python 3.12+ multi-agent framework. Receives tasks from RabbitMQ, routes them to the right compute mode, runs the LLM loop, and streams results back over Socket.IO.
+- **Socket.IO namespaces** — `/user` for frontend notifications, `/device` for device commands, `/agent` for agent subscriptions.
+- **Storage** — PostgreSQL (primary data), Redis (session state + pub/sub for horizontal scaling), S3/MinIO (file attachments), RabbitMQ (async task dispatch).
+- **MCP integrations** — Composio-backed connectors for Slack, Gmail, GitHub, Google Calendar, Google Drive, and more.
+
+## MCP Integrations
+
+Connect your agent to the tools it needs without writing integration code. Skygen ships with OAuth-based connectors for:
+
+<CardGroup cols={4}>
+  <Card title="Gmail" icon="envelope" />
+  <Card title="Google Calendar" icon="calendar" />
+  <Card title="Google Drive" icon="folder" />
+  <Card title="Slack" icon="slack" />
+  <Card title="GitHub" icon="github" />
+  <Card title="Notion" icon="book" />
+  <Card title="Linear" icon="chart-line" />
+  <Card title="+ more" icon="plug" />
+</CardGroup>
+
+<Note>
+  All integrations use the Model Context Protocol (MCP), a standard interface for exposing tools to LLM agents. Custom connectors can be built against the same interface.
+</Note>
+
+## Pricing at a Glance
+
+Skygen uses a token-based billing model. Your subscription includes a monthly token allowance, and you can enable overage billing to keep agents running beyond the included amount.
+
+| Plan | Tokens/month | Overage |
+|------|-------------|---------|
+| Standard ($14.99/mo) | 2,000 tokens | $0.0075 / token |
+| Free trial | Limited | — |
+
+Tokens represent a normalized unit of LLM API cost with a 1.5× platform margin. Cloud PC usage is billed separately at $0.1656/hr (2 vCPU, 4 GiB RAM) with a 2.5× markup.
+
+See the [Pricing guide](/guides/pricing) for full details.

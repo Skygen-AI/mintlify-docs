@@ -1,0 +1,1193 @@
+---
+title: "Frontend Components Reference"
+description: "Reusable React components in the Skygen shared UI library — props, usage, and where each component is used."
+---
+
+# Frontend Components Reference
+
+All components live in `ui-shared-tauri/src/components/`. This reference covers components used in two or more places (the most reusable subset). Page-specific leaf components (helpdesk sub-views, message card types, file preview types) are grouped at the end.
+
+---
+
+## Layout
+
+### MainLayout
+
+**File:** `components/layout/MainLayout.tsx`  
+**Purpose:** Root authenticated layout. Renders the sidebar, header, global modals, Cloud Desktop panel, file preview panel, and all layout-level dialogs.
+
+All protected routes are wrapped by `MainLayout` via React Router's `<Outlet />` pattern. It mounts `useMainLayoutInit`, `useCloudPCEvents`, and subscribes to global WebSocket events.
+
+**Used in:** `App.tsx` (wraps all protected routes)
+
+---
+
+### AppHeader
+
+**File:** `components/layout/AppHeader.tsx`  
+**Purpose:** Top navigation bar. A thin wrapper that renders `HeaderAccountControls` with billing-aware token balance and notification count pulled from global hooks.
+
+### Props
+<ParamField path="onNotificationClick" type="() => void">Callback when the notification bell is clicked.</ParamField>
+<ParamField path="onAvatarClick" type="() => void">Callback when the user avatar is clicked.</ParamField>
+<ParamField path="onAvatarRef" type="(ref: HTMLElement | null) => void">Ref callback for dropdown positioning.</ParamField>
+<ParamField path="isDropdownOpen" type="boolean">Whether the profile dropdown is open.</ParamField>
+<ParamField path="className" type="string">Additional CSS classes.</ParamField>
+
+**Used in:** `MainLayout`
+
+---
+
+### HeaderAccountControls
+
+**File:** `components/layout/HeaderAccountControls.tsx`  
+**Purpose:** Composite header widget combining `NotificationButton`, `TokensDisplay`, and `UserAvatar`. Platform-agnostic — all actions are handled via callbacks.
+
+### Props
+<ParamField path="tokens" type="number">Token balance to display.</ParamField>
+<ParamField path="isTokensLoading" type="boolean">Shows a skeleton while balance is fetching.</ParamField>
+<ParamField path="showTokens" type="boolean">Whether to render the token balance widget. Default: `true`.</ParamField>
+<ParamField path="unreadNotifications" type="number">Unread notification count for the bell badge.</ParamField>
+<ParamField path="onNotificationClick" type="() => void">Called when the notification bell is clicked.</ParamField>
+<ParamField path="onAvatarClick" type="() => void">Called when the user avatar is clicked.</ParamField>
+<ParamField path="onAvatarRef" type="(ref: HTMLElement | null) => void">Ref callback for dropdown anchor positioning.</ParamField>
+<ParamField path="isDropdownOpen" type="boolean">Whether the profile dropdown is currently open.</ParamField>
+<ParamField path="className" type="string">Additional CSS classes.</ParamField>
+
+**Used in:** `AppHeader`
+
+---
+
+### AppSidebar
+
+**File:** `components/layout/AppSidebar.tsx`  
+**Purpose:** Left navigation sidebar. Shows the session list, menu items, and user profile bar. Renders a spinner badge on sessions with active agent runs.
+
+### Props (selected)
+<ParamField path="activePath" type="string">Current URL path for active state highlighting.</ParamField>
+<ParamField path="sessions" type="SidebarSession[]">Session list to display.</ParamField>
+<ParamField path="activeSessionId" type="string | null">ID of the currently open session.</ParamField>
+<ParamField path="cloudPcSessionIds" type="Set<string>">Session IDs that own an active Cloud PC — rendered with a "Live" badge.</ParamField>
+<ParamField path="menuItems" type="MenuItemData[]">Navigation items array.</ParamField>
+
+**Used in:** `MainLayout`
+
+---
+
+## Auth
+
+### ProtectedRoute
+
+**File:** `components/auth/ProtectedRoute.tsx`  
+**Purpose:** React Router wrapper that redirects unauthenticated users to `/login`.
+
+**Used in:** `App.tsx` (wraps all protected route groups)
+
+---
+
+### LoadingScreen
+
+**File:** `components/auth/LoadingScreen.tsx`  
+**Purpose:** Full-page spinner shown during session restore and initial auth check.
+
+**Used in:** `App.tsx` (RootPage), `GoogleCallbackPage`
+
+---
+
+### SignInForm
+
+**File:** `components/auth/SignInForm.tsx`  
+**Purpose:** Email + password login form with validation.
+
+**Used in:** `LoginPage`
+
+---
+
+### HeroCard
+
+**File:** `components/auth/HeroCard.tsx`  
+**Purpose:** Marketing hero card displayed on the login/register pages alongside the auth form. Shows platform features and branding. No props — purely presentational.
+
+**Used in:** `LoginPage`, `RegisterPage`
+
+---
+
+### OTPDialog
+
+**File:** `components/modals/OTPDialog.tsx`  
+**Purpose:** 6-digit TOTP verification dialog. Shown after password login when `otp_secret` is set on the user account.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onOpenChange" type="(open: boolean) => void" required>Called when the dialog is dismissed.</ParamField>
+<ParamField path="onSubmit" type="(otpCode: string) => Promise<boolean>" required>Called with the 6-character code. Must return `true` on success, `false` on invalid code.</ParamField>
+<ParamField path="title" type="string">Dialog heading. Default: `"Enter OTP Code"`.</ParamField>
+<ParamField path="description" type="string">Sub-heading. Default: `"Please enter the 6-digit code from your authenticator app"`.</ParamField>
+
+**Used in:** `LoginPage` (shown after successful password auth when 2FA is enabled)
+
+---
+
+### ForgotPasswordModal
+
+**File:** `components/modals/ForgotPasswordModal.tsx`  
+**Purpose:** Email input modal for initiating password reset. Calls `POST /auth/forgot-password`.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onOpenChange" type="(open: boolean) => void" required>Called when dialog is dismissed.</ParamField>
+
+**Used in:** `LoginPage`
+
+---
+
+## UI Primitives
+
+### Button
+
+**File:** `components/ui/Button.tsx`  
+**Purpose:** Base button component with variants and sizes. Extends `React.ButtonHTMLAttributes`.
+
+### Props
+<ParamField path="variant" type="'default' | 'destructive' | 'outline' | 'secondary' | 'ghost' | 'link'">Visual style. Default: `default`.</ParamField>
+<ParamField path="size" type="'default' | 'sm' | 'lg' | 'icon'">Sizing preset. Default: `default`.</ParamField>
+
+### Usage
+```tsx
+<Button variant="outline" size="sm" onClick={handleClick}>
+  Cancel
+</Button>
+```
+
+**Used in:** Throughout — 53+ files reference this component.
+
+---
+
+### Dialog / DialogContent / DialogHeader / DialogTitle / DialogFooter
+
+**File:** `components/ui/Dialog.tsx`  
+**Purpose:** Accessible modal dialog primitives. `Dialog` handles backdrop and close-on-click. `DialogContent` provides the centered card.
+
+### Props (Dialog)
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onOpenChange" type="(open: boolean) => void" required>Called when backdrop is clicked.</ParamField>
+<ParamField path="children" type="ReactNode" required>Dialog content.</ParamField>
+
+### Usage
+```tsx
+<Dialog open={isOpen} onOpenChange={setIsOpen}>
+  <DialogContent>
+    <DialogHeader><DialogTitle>Confirm</DialogTitle></DialogHeader>
+    <p>Are you sure?</p>
+    <DialogFooter><Button onClick={() => setIsOpen(false)}>OK</Button></DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+**Used in:** 27+ files
+
+---
+
+### PlanBadge
+
+**File:** `components/ui/PlanBadge.tsx`  
+**Purpose:** Inline badge showing current plan name (e.g. "Pro", "Free").
+
+### SimpleDropdown
+
+**File:** `components/ui/SimpleDropdown.tsx`  
+**Purpose:** Generic dropdown menu with trigger + item list.
+
+### CalendarPicker / TimePicker
+
+**Files:** `components/ui/CalendarPicker.tsx`, `components/ui/TimePicker.tsx`  
+**Purpose:** Date and time pickers used in scheduled task creation.
+
+**Used in:** `AddScheduledTaskModal`, `ScheduledTasksModal`
+
+---
+
+## Icons
+
+### MaskedIcon
+
+**File:** `components/icons/MaskedIcon.tsx`  
+**Purpose:** Renders an SVG/image icon with CSS mask, inheriting the current text color. Used extensively for sidebar icons and connector logos.
+
+### Props
+<ParamField path="src" type="string" required>Image URL or asset path.</ParamField>
+<ParamField path="size" type="number">Icon size in pixels.</ParamField>
+<ParamField path="className" type="string">Additional CSS classes.</ParamField>
+
+**Used in:** `AppSidebar`, `MenuItem`, `TaskInput`, and 21+ other files.
+
+---
+
+### ConnectorIcon
+
+**File:** `components/shared/ConnectorIcon.tsx`  
+**Purpose:** Renders a connector/integration icon from a URL, with fallback to a generated placeholder.
+
+**Used in:** `ConnectorCard`, `ConnectorsModal`, `TaskInput`, and 13+ files.
+
+---
+
+## Fields / Input
+
+### TaskInput
+
+**File:** `components/fields/TaskInput.tsx`  
+**Purpose:** Main multi-line task entry field. Composed of a textarea, mode toggles (Computer Use, Deep Research, SWE), file attachments, voice input, connector dropdown, and device indicator.
+
+### Props (selected)
+<ParamField path="value" type="string" required>Controlled input value.</ParamField>
+<ParamField path="onChange" type="(value: string) => void" required>Value change handler.</ParamField>
+<ParamField path="onSubmit" type="() => void" required>Called when user submits the task.</ParamField>
+<ParamField path="onConnectApps" type="() => void" required>Opens the connector modal.</ParamField>
+<ParamField path="isComputerUseActive" type="boolean">Whether CUA mode is active.</ParamField>
+<ParamField path="onComputerUseToggle" type="(active: boolean) => void">Toggle CUA mode.</ParamField>
+<ParamField path="isSWEActive" type="boolean">Whether SWE mode is active.</ParamField>
+<ParamField path="isDeepResearchActive" type="boolean">Whether Deep Research mode is active.</ParamField>
+<ParamField path="connectors" type="IntegrationWithActive[]">Connected integrations for the dropdown.</ParamField>
+<ParamField path="devices" type="Device[]">Available devices for CUA selection.</ParamField>
+<ParamField path="selectedDevice" type="Device | null">Currently selected device.</ParamField>
+<ParamField path="triggers" type="Trigger[]">Active automation triggers count.</ParamField>
+
+**Used in:** `HomeUpdated`, `InputPanel` (ChatPage)
+
+---
+
+### VoiceInput
+
+**File:** `components/fields/VoiceInput.tsx`  
+**Purpose:** Voice recording waveform display and controls. Renders amplitude bars from `useAudioAnalyser`.
+
+**Used in:** `TaskInput`
+
+---
+
+### FileAttachment
+
+**File:** `components/fields/FileAttachment.tsx`  
+**Purpose:** Displays an attached file chip with upload progress and remove button.
+
+### Props
+<ParamField path="file" type="AttachedFile" required>File object with name, type, size, status, and optional parseResponse.</ParamField>
+<ParamField path="onRemove" type="() => void" required>Called when the remove (×) button is clicked.</ParamField>
+
+**Used in:** `TaskInput`, `InputPanel`, `HelpdeskPage` (7+ files)
+
+---
+
+### SearchInput
+
+**File:** `components/fields/SearchInput.tsx`  
+**Purpose:** Debounced search input with clear button.
+
+**Used in:** `ConnectorsModal`, `LibraryPage`, `HelpdeskPage`
+
+---
+
+## Tabs
+
+### TabGroup + Tab
+
+**Files:** `components/tabs/TabGroup.tsx`, `components/tabs/Tab.tsx`  
+**Purpose:** Accessible tab container and individual tab buttons. Manages active state internally or via controlled `activeTab` prop.
+
+### Usage
+```tsx
+<TabGroup activeTab="all" onChange={setActiveTab}>
+  <Tab id="all" label="All" />
+  <Tab id="alerts" label="Alerts" />
+</TabGroup>
+```
+
+**Used in:** `LibraryPage`, `NotificationsPage`, `HelpdeskPage`, `ConnectorsModal`, and 10+ files.
+
+---
+
+### SegmentedControl
+
+**File:** `components/tabs/SegmentedControl.tsx`  
+**Purpose:** Pill-style segmented toggle for 2–4 options. Used for binary/ternary mode selectors.
+
+**Used in:** 4 files
+
+---
+
+### PillToggle
+
+**File:** `components/tabs/PillToggle.tsx`  
+**Purpose:** Single toggle pill (on/off). Used within `SegmentedControl` or standalone.
+
+### PricingToggle
+
+**File:** `components/tabs/PricingToggle.tsx`  
+**Purpose:** Monthly/Annual billing toggle on PricingPage.
+
+---
+
+## Cards
+
+### ToolkitCard
+
+**File:** `components/cards/ToolkitCard.tsx`  
+**Purpose:** Integration/toolkit card showing name, icon, connection status, and connect/manage account buttons.
+
+### Props
+<ParamField path="toolkit" type="Toolkit" required>Toolkit object from the connectors API.</ParamField>
+<ParamField path="onConnect" type="(slug: string) => void" required>Called when user clicks Connect.</ParamField>
+<ParamField path="onManageAccounts" type="(slug: string) => void">Called when user opens the manage accounts panel.</ParamField>
+<ParamField path="onToggleActive" type="(slug: string, newState: boolean) => void">Called when user toggles the toolkit's active/inactive state.</ParamField>
+<ParamField path="isConnecting" type="boolean">Shows loading state on the connect button.</ParamField>
+<ParamField path="className" type="string">Additional CSS classes.</ParamField>
+
+**Used in:** `ConnectorsModal` (9+ files)
+
+---
+
+### ConnectorCard
+
+**File:** `components/cards/ConnectorCard.tsx`  
+**Purpose:** Legacy connector card (Telegram, custom APIs). Shows connection status badge and action buttons.
+
+**Used in:** `ConnectorsModal`, settings tabs (3+ files)
+
+---
+
+### PlanCard
+
+**File:** `components/cards/PlanCard.tsx`  
+**Purpose:** Subscription plan feature list card used in settings.
+
+**Used in:** `BillingSection`, `SettingsModal`
+
+---
+
+### PricingCard
+
+**File:** `components/cards/PricingCard.tsx`  
+**Purpose:** Full pricing plan card with price, feature list, and subscribe CTA. Used on `PricingPage`.
+
+**Used in:** `PricingPage`
+
+---
+
+### InfoCard
+
+**File:** `components/cards/InfoCard.tsx`  
+**Purpose:** Generic info/stat card with label and value. Used in dashboards and billing sections.
+
+**Used in:** `InsightsSection`, `BillingSection`
+
+---
+
+### UseCaseCard
+
+**File:** `components/cards/UseCaseCard.tsx`  
+**Purpose:** Library use-case card with title, category badge, and launch button.
+
+**Used in:** `LibraryPage`
+
+---
+
+### UserProfileBar
+
+**File:** `components/cards/UserProfileBar.tsx`  
+**Purpose:** User avatar + name row displayed at the bottom of the sidebar.
+
+**Used in:** `AppSidebar`
+
+---
+
+## List Items
+
+### MenuItem
+
+**File:** `components/list-items/MenuItem.tsx`  
+**Purpose:** Sidebar navigation item with icon, label, and active state.
+
+### Props
+<ParamField path="label" type="string" required>Display label.</ParamField>
+<ParamField path="iconPath" type="string" required>Path to the icon asset.</ParamField>
+<ParamField path="href" type="string">Navigation target. When provided, renders as a router link with automatic active detection via `useLocation()`.</ParamField>
+<ParamField path="isActive" type="boolean">Override for active state (bypasses URL-based detection).</ParamField>
+<ParamField path="collapsed" type="boolean">Sidebar collapsed mode — hides the label and renders only the icon. Default: `false`.</ParamField>
+<ParamField path="onClick" type="() => void">Click handler for non-link menu items.</ParamField>
+<ParamField path="borderRadius" type="number">Corner radius override. Default: `10`.</ParamField>
+
+**Used in:** `AppSidebar`, `SidebarMenu`, `MainLayout` (13+ files)
+
+---
+
+### TaskList
+
+**File:** `components/list-items/TaskList.tsx`  
+**Purpose:** Renders the session list in the sidebar with title truncation and agent-running spinner.
+
+**Used in:** `AppSidebar`
+
+---
+
+### SuggestionItem
+
+**File:** `components/list-items/SuggestionItem.tsx`  
+**Purpose:** Clickable suggestion pill that pre-fills the task input.
+
+### Props
+<ParamField path="label" type="string" required>Suggestion text.</ParamField>
+<ParamField path="onClick" type="() => void" required>Called when clicked.</ParamField>
+
+**Used in:** `HomeUpdated` (4 files)
+
+---
+
+## Buttons
+
+### ChipButton
+
+**File:** `components/buttons/ChipButton.tsx`  
+**Purpose:** Small category filter chip (e.g. Productivity, Research).
+
+### Props
+<ParamField path="label" type="string" required>Button label.</ParamField>
+<ParamField path="iconSrc" type="string">Optional icon asset path.</ParamField>
+<ParamField path="isActive" type="boolean">Whether this chip is the selected filter.</ParamField>
+<ParamField path="onClick" type="() => void">Click handler.</ParamField>
+
+**Used in:** `HomeUpdated`, `ConnectorsModal`
+
+---
+
+### ConnectToolsCta
+
+**File:** `components/buttons/ConnectToolsCta.tsx`  
+**Purpose:** "Connect your tools" call-to-action shown when no integrations are connected.
+
+**Used in:** `HomeUpdated`, `ChatPage` (InputPanel area)
+
+---
+
+### NotificationButton
+
+**File:** `components/buttons/NotificationButton.tsx`  
+**Purpose:** Bell icon button with unread badge count.
+
+**Used in:** `HeaderAccountControls`
+
+---
+
+### UpgradeButton
+
+**File:** `components/buttons/UpgradeButton.tsx`  
+**Purpose:** "Upgrade" CTA that opens the paywall modal.
+
+### UserAvatar
+
+**File:** `components/buttons/UserAvatar.tsx`  
+**Purpose:** Circular avatar with initials fallback and online indicator.
+
+**Used in:** `AppHeader`, `ProfileDropdown` (4 files)
+
+---
+
+### DownloadButton
+
+**File:** `components/buttons/DownloadButton.tsx`  
+**Purpose:** OS-aware download button for the desktop app (auto-detects macOS/Windows).
+
+**Used in:** `WelcomePage`, `HomeUpdated`
+
+---
+
+## Modals (key ones)
+
+### SettingsModal
+
+**File:** `components/modals/SettingsModal.tsx`  
+**Purpose:** Full-screen settings dialog with tabs: Account, Security, Billing, Cloud PC Management, Insights.
+
+**Used in:** `MainLayout` (mounted globally)
+
+---
+
+### ConnectorsModal
+
+**File:** `components/modals/ConnectorsModal.tsx`  
+**Purpose:** Integration management drawer. Tabs: Apps (Composio toolkits), Automations (triggers), Telegram, Custom API/MCP.
+
+**Used in:** `HomeUpdated`, `ChatModals` (7 files)
+
+---
+
+### ConfirmationDialog
+
+**File:** `components/modals/ConfirmationDialog.tsx`  
+**Purpose:** Generic yes/no confirmation dialog with configurable title, description, confirm/cancel labels, and optional loading state.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on cancel or backdrop click.</ParamField>
+<ParamField path="onConfirm" type="() => void | Promise<void>" required>Called on confirm. May be async.</ParamField>
+<ParamField path="title" type="string" required>Dialog heading.</ParamField>
+<ParamField path="description" type="string" required>Body text.</ParamField>
+<ParamField path="confirmLabel" type="string" required>Confirm button label.</ParamField>
+<ParamField path="cancelLabel" type="string">Cancel button label.</ParamField>
+<ParamField path="loading" type="boolean">Shows a spinner on the confirm button.</ParamField>
+<ParamField path="width" type="number">Dialog width override in pixels.</ParamField>
+<ParamField path="variant" type='"default" | "danger"'>Visual style. Use `"danger"` for destructive actions (red confirm button).</ParamField>
+<ParamField path="confirmIcon" type="ReactNode">Optional icon rendered inside the confirm button.</ParamField>
+
+**Used in:** `MainLayout` (Cloud PC busy dialog), `CloudDesktopPanel`, `ResetContextDialog`, and 6 files.
+
+---
+
+### ChooseDeviceModal
+
+**File:** `components/modals/ChooseDeviceModal.tsx`  
+**Purpose:** Device picker for CUA tasks. Lists physical devices plus Cloud PC options (create/resume/select existing).
+
+**Used in:** `HomeUpdated`, `ChatModals`
+
+---
+
+### AddDeviceModal
+
+**File:** `components/modals/AddDeviceModal.tsx`  
+**Purpose:** Form to register a new physical device (name, platform, device ID).
+
+**Used in:** `HomeUpdated`, `ChatModals`
+
+---
+
+### PaywallModal
+
+**File:** `components/modals/PaywallModal.tsx`  
+**Purpose:** Subscription upgrade prompt. Triggered by free tier limits or feature access gates.
+
+**Used in:** `MainLayout` (mounted globally, triggered via `uiSlice.openPaywall()`)
+
+---
+
+### ScheduledTasksModal + AddScheduledTaskModal
+
+**Files:** `components/modals/ScheduledTasksModal.tsx`, `components/modals/AddScheduledTaskModal.tsx`  
+**Purpose:** View/manage scheduled tasks and create new ones.
+
+**Used in:** `MainLayout` (globally mounted)
+
+---
+
+### UpgradeRequiredModal
+
+**File:** `components/modals/UpgradeRequiredModal.tsx`  
+**Purpose:** Feature upgrade gate dialog with plan comparison.
+
+**Used in:** `MainLayout`, `CloudPCManagementSection`
+
+---
+
+### Onboarding
+
+**File:** `components/modals/Onboarding.tsx`  
+**Purpose:** Post-registration onboarding slideshow with feature highlights. Mounted in `MainLayout` and shown when the user has never seen it.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on backdrop click or skip.</ParamField>
+<ParamField path="onFinish" type="() => void">Called when the user completes all slides.</ParamField>
+
+**Used in:** `MainLayout` (replaces the retired `WelcomePage`)
+
+---
+
+### OAuthSuccessModal
+
+**File:** `components/modals/OAuthSuccessModal.tsx`  
+**Purpose:** Auto-closing success confirmation shown after a Composio OAuth connection completes. Auto-dismisses after 7 seconds.
+
+### Props
+<ParamField path="provider" type="string | null" required>Provider name (e.g. `"GitHub"`, `"Slack"`). Shown in the success message.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on close or auto-dismiss.</ParamField>
+
+**Used in:** `OAuthCallbackPage`
+
+---
+
+### AddCardModal
+
+**File:** `components/modals/AddCardModal.tsx`  
+**Purpose:** Stripe Elements card input modal for first-time payment method entry. Calls `POST /billing/setup-card` to get a client secret and confirms the setup intent.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on dismiss.</ParamField>
+<ParamField path="onSuccess" type="() => void">Called when card is successfully saved.</ParamField>
+<ParamField path="planId" type="string">Plan UUID to associate with the setup intent.</ParamField>
+<ParamField path="planName" type="string">Plan display name shown in the modal header.</ParamField>
+<ParamField path="planPrice" type="string">Price string (e.g. `"$14.99"`).</ParamField>
+<ParamField path="planTokens" type="string">Token count label (e.g. `"2,000"`).</ParamField>
+
+**Used in:** `PricingPage`
+
+---
+
+### ConfirmUpgradeModal
+
+**File:** `components/modals/ConfirmUpgradeModal.tsx`  
+**Purpose:** Plan change confirmation dialog. Shows current and target plan side-by-side before charging.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on cancel.</ParamField>
+<ParamField path="onConfirm" type="() => void" required>Called when user confirms upgrade.</ParamField>
+<ParamField path="planName" type="string" required>Target plan name.</ParamField>
+<ParamField path="planPrice" type="string" required>Target plan price.</ParamField>
+<ParamField path="planTokens" type="string" required>Target plan token count.</ParamField>
+<ParamField path="currentPlanName" type="string">Current plan name (optional; omitted for new subscribers).</ParamField>
+<ParamField path="isLoading" type="boolean">Shows spinner on confirm button during API call.</ParamField>
+
+**Used in:** `PricingPage`
+
+---
+
+### ConnectMcpModal
+
+**File:** `components/modals/ConnectMcpModal.tsx`  
+**Purpose:** OAuth/setup flow modal for connecting a Composio integration. Shows provider info (name, logo, privacy policy) and a Connect button.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on dismiss.</ParamField>
+<ParamField path="connector" type="Connector" required>Connector metadata: `{ id, name, description?, connectorType?, author?, uuid?, websiteUrl?, privacyPolicyUrl? }`.</ParamField>
+<ParamField path="connectorLogoSrc" type="string" required>Connector (integration) logo URL.</ParamField>
+<ParamField path="appLogoSrc" type="string" required>Skygen app logo URL (for "app connecting to service" branding).</ParamField>
+<ParamField path="onConnect" type="(connectorId: string) => void | Promise<void>">Called when user clicks Connect.</ParamField>
+<ParamField path="onCopyUuid" type="(uuid: string) => void | Promise<void>">Called when user copies the connector UUID.</ParamField>
+<ParamField path="onOpenUrl" type="(url: string) => void | Promise<void>">Called when user opens an external URL.</ParamField>
+<ParamField path="loading" type="boolean">Shows loading state on the Connect button.</ParamField>
+<ParamField path="connectLabel" type="string">Override for the Connect button label.</ParamField>
+<ParamField path="headerTitle" type="string">Override for the dialog header title.</ParamField>
+
+**Used in:** `HomeUpdated`, `ChatModals`
+
+---
+
+### Disable2FADialog
+
+**File:** `components/modals/Disable2FADialog.tsx`  
+**Purpose:** Confirmation dialog before disabling 2FA. Wraps `ConfirmationDialog` with a `variant="danger"` confirm button.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on cancel.</ParamField>
+<ParamField path="onConfirm" type="() => void | Promise<void>" required>Called on confirm. May be async.</ParamField>
+<ParamField path="loading" type="boolean">Shows spinner on confirm button.</ParamField>
+
+**Used in:** `SecuritySection` (SettingsModal)
+
+---
+
+### LogoutDialog
+
+**File:** `components/modals/LogoutDialog.tsx`  
+**Purpose:** Logout confirmation dialog showing the user's email.
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="userEmail" type="string" required>Displayed to confirm the user's identity.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on cancel.</ParamField>
+<ParamField path="onConfirmLogout" type="() => void | Promise<void>" required>Called on confirm.</ParamField>
+<ParamField path="loading" type="boolean">Shows spinner on confirm button.</ParamField>
+<ParamField path="title" type="string">Dialog heading. Default: `"Are you sure to log out?"`.</ParamField>
+<ParamField path="description" type="string">Body text override.</ParamField>
+
+**Used in:** `ProfileDropdown` (header)
+
+---
+
+### ResetContextDialog
+
+**File:** `components/modals/ResetContextDialog.tsx`  
+**Purpose:** Confirmation dialog before resetting the agent's conversation context (clears technical, social, or all memory).
+
+### Props
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on cancel.</ParamField>
+<ParamField path="onConfirm" type="() => void | Promise<void>" required>Called on confirm.</ParamField>
+<ParamField path="loading" type="boolean">Shows spinner on confirm button.</ParamField>
+<ParamField path="contextType" type='"technical" | "social" | "all"'>Type of context to reset. Controls dialog title text. Default: `"all"`.</ParamField>
+
+**Used in:** Chat context menu
+
+---
+
+### PopupModal
+
+**File:** `components/modals/PopupModal.tsx`  
+**Purpose:** Generic flexible modal shell with optional title, description, children slot, and primary/secondary action buttons. Replaces ad-hoc `Dialog` usage for confirmations and simple flows.
+
+### Props (key)
+<ParamField path="open" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on backdrop click or close button.</ParamField>
+<ParamField path="title" type="string">Modal heading.</ParamField>
+<ParamField path="description" type="string">Sub-heading text.</ParamField>
+<ParamField path="children" type="ReactNode">Custom body content.</ParamField>
+<ParamField path="footer" type="ReactNode">Custom footer override (replaces primary/secondary buttons).</ParamField>
+<ParamField path="primaryLabel" type="string">Primary button label.</ParamField>
+<ParamField path="secondaryLabel" type="string">Secondary button label.</ParamField>
+<ParamField path="onPrimary" type="() => void | Promise<void>">Primary button handler.</ParamField>
+<ParamField path="onSecondary" type="() => void | Promise<void>">Secondary button handler.</ParamField>
+<ParamField path="loading" type="boolean">Shows spinner on the loading button.</ParamField>
+<ParamField path="loadingButton" type='"primary" | "secondary"'>Which button shows the spinner. Default: `"primary"`.</ParamField>
+<ParamField path="primaryVariant" type='"default" | "danger"'>Visual style of the primary button.</ParamField>
+<ParamField path="closeOnBackdrop" type="boolean">Close on backdrop click. Default: `true`.</ParamField>
+<ParamField path="closeOnEsc" type="boolean">Close on Escape key. Default: `true`.</ParamField>
+<ParamField path="width" type="number | string">Dialog width override.</ParamField>
+
+**Used in:** 8+ files across settings and modals
+
+---
+
+### DisconnectModal
+
+**File:** `components/modals/DisconnectModal.tsx`  
+**Purpose:** Confirmation dialog before disconnecting/removing an MCP integration or connected account.
+
+**Used in:** `ConnectorsModal`
+
+---
+
+## Status Components
+
+### AgentStepsProgress
+
+**File:** `components/status/AgentStepsProgress.tsx`  
+**Purpose:** Renders the live agent step list with step icons, labels, and status indicators.
+
+**Used in:** `ChatLiveProgress`
+
+---
+
+### CuaProgress
+
+**File:** `components/status/CuaProgress.tsx`  
+**Purpose:** Computer Use Agent progress display with screenshot thumbnails.
+
+**Used in:** `ChatLiveProgress`
+
+---
+
+### PlanProgress
+
+**File:** `components/status/PlanProgress.tsx`  
+**Purpose:** Multi-step plan execution progress with sub-steps.
+
+**Used in:** `ChatLiveProgress`
+
+---
+
+### ThinkingStatus
+
+**File:** `components/status/ThinkingStatus.tsx`  
+**Purpose:** "Thinking…" animated indicator shown while the agent is processing.
+
+**Used in:** `ChatLiveProgress`
+
+---
+
+### DeviceIndicator
+
+**File:** `components/status/DeviceIndicator.tsx`  
+**Purpose:** Small chip showing active device name and connection status.
+
+**Used in:** `TaskInput`
+
+---
+
+### TokensDisplay
+
+**File:** `components/status/TokensDisplay.tsx`  
+**Purpose:** Token balance pill in the header.
+
+**Used in:** `HeaderAccountControls`
+
+---
+
+### EmptyState
+
+**File:** `components/status/EmptyState.tsx`  
+**Purpose:** Generic empty list/section placeholder with optional icon and CTA.
+
+**Used in:** `NotificationsPage`, `LibraryPage`, chat session list
+
+---
+
+## Cloud PC
+
+### CloudDesktopPanel
+
+**File:** `components/cloud-pc/CloudDesktopPanel.tsx`  
+**Purpose:** The VNC/RDP remote desktop panel. Renders the stream iframe, toolbar, file manager, and PiP controls.
+
+**Used in:** `MainLayout` (globally mounted)
+
+---
+
+### CloudPCCard
+
+**File:** `components/cloud-pc/CloudPCCard.tsx`  
+**Purpose:** Card displaying a Cloud PC instance with status, name, and action buttons (connect, delete).
+
+**Used in:** `ChooseDeviceModal`, `CloudPCManagementSection`
+
+---
+
+### CloudDesktopToolbar
+
+**File:** `components/cloud-pc/CloudDesktopToolbar.tsx`  
+**Purpose:** Toolbar overlay on the Cloud Desktop panel with Take Control / Resume AI / File Manager toggles.
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### DataIsolationBanner
+
+**File:** `components/cloud-pc/DataIsolationBanner.tsx`  
+**Purpose:** Security banner displayed inside the Cloud Desktop panel explaining data isolation.
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### CloudDesktopPiP
+
+**File:** `components/cloud-pc/CloudDesktopPiP.tsx`  
+**Purpose:** Picture-in-Picture (PiP) widget for the Cloud Desktop. Shows a compact status tile when the full panel is hidden. Displays stream status, controller badge (User/AI), current action, and error state with a Reconnect button.
+
+### Props
+<ParamField path="isConnecting" type="boolean" required>True while the stream connection is initializing.</ParamField>
+<ParamField path="isStreamReady" type="boolean" required>True when the VNC/RDP stream is live.</ParamField>
+<ParamField path="controller" type="CloudPCController" required>`'user'`, `'agent'`, or `null`.</ParamField>
+<ParamField path="currentAction" type="string">Last agent action label for display.</ParamField>
+<ParamField path="connectError" type="string | null">Error message (e.g. sandbox lost). Shows Reconnect button when set.</ParamField>
+<ParamField path="connectErrorStatus" type="number | null">HTTP status code of the connect error (e.g. `402` for payment required).</ParamField>
+<ParamField path="isBlockedByOtherSession" type="boolean">When true, replaces the "Live" badge with "Busy" — sandbox is running for another session.</ParamField>
+<ParamField path="name" type="string | null">User-set Cloud PC name. Defaults to `"Cloud Desktop"`.</ParamField>
+<ParamField path="onExpand" type="() => void" required>Expand to full panel.</ParamField>
+<ParamField path="onClose" type="() => void" required>Hide the PiP widget.</ParamField>
+<ParamField path="onReconnect" type="() => void">Called when Reconnect button is clicked.</ParamField>
+<ParamField path="isReconnecting" type="boolean">Shows loading state on Reconnect button.</ParamField>
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### CloudDesktopFileManager
+
+**File:** `components/cloud-pc/CloudDesktopFileManager.tsx`  
+**Purpose:** File manager tab inside the Cloud Desktop panel for uploading/downloading files to/from the remote sandbox.
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### CloudDesktopHistory
+
+**File:** `components/cloud-pc/CloudDesktopHistory.tsx`  
+**Purpose:** Screenshot history/timeline panel inside the Cloud Desktop, showing agent action steps with thumbnails.
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### CloudPCStartingBanner
+
+**File:** `components/cloud-pc/CloudPCStartingBanner.tsx`  
+**Purpose:** Full-width informational banner shown while a Cloud PC sandbox is initializing (status `creating` / `restoring`). No props — reads state directly from `useComputerUse()`.
+
+**Used in:** `CloudDesktopPanel`
+
+---
+
+### ConcurrentLimitDialog
+
+**File:** `components/cloud-pc/ConcurrentLimitDialog.tsx`  
+**Purpose:** Dialog shown when the user exceeds the concurrent Cloud PC limit for their plan. No props — reads billing state directly.
+
+**Used in:** `CloudDesktopPanel`, `ChooseDeviceModal`
+
+---
+
+## Chat Components
+
+### InputPanel
+
+**File:** `components/chat/InputPanel.tsx`  
+**Purpose:** The full chat input area including the task input field, attached files, ask-human mode, and stop button.
+
+**Used in:** `ChatPage`
+
+---
+
+### ChatLiveProgress
+
+**File:** `components/chat/ChatLiveProgress.tsx`  
+**Purpose:** Live agent progress indicator. Shows thinking status, plan progress, agent steps, and CUA screenshots while a task is running.
+
+**Used in:** `ChatPage`
+
+---
+
+### ChatModals
+
+**File:** `components/chat/ChatModals.tsx`  
+**Purpose:** Chat-scoped modal container. Mounts `ConnectorsModal`, `ConnectMcpModal`, `AddDeviceModal`, `ChooseDeviceModal`, and `ComposioTrustModal` so they access the chat's connector/device state.
+
+**Used in:** `ChatPage`
+
+---
+
+## Messages (leaf)
+
+| Component | Purpose |
+|---|---|
+| `MessageItem` | Dispatcher that renders the correct message type |
+| `UserMessage` | User chat bubble |
+| `AssistantMessageNew` | Assistant reply with markdown rendering |
+| `AskHumanMessage` | Ask-human form with inline text input or quick-reply buttons |
+| `AskHumanQuickReply` | Quick reply button set for ask-human messages |
+| `ErrorMessage` | Error/failure state message |
+| `CancelledMessage` | Task-cancelled message |
+| `PausedMessage` | Task-paused message |
+| `QuestionCard` | Confirmation/question card |
+| `ResultCard` | Task result summary card |
+| `TableCard` | Markdown table rendered as a styled card |
+| `CodeCard` | Code block with syntax highlighting and copy button |
+| `ImageCard` | Image attachment display |
+| `ChartCard` | Chart visualization card |
+| `MermaidCard` | Mermaid diagram renderer |
+| `McpConnectPrompt` | Inline prompt to connect a missing integration |
+| `StartCloudPcPrompt` | Inline prompt to connect Cloud PC |
+| `MessageRating` | Thumbs up/down rating on assistant messages |
+| `MessageHoverActions` | Copy/edit actions on message hover |
+| `DeepResearchProgress` | Deep research multi-phase progress |
+
+---
+
+## Notifications
+
+### NotificationBell
+
+**File:** `components/notifications/NotificationBell.tsx`  
+**Purpose:** Bell icon with unread count badge.
+
+### NotificationCard
+
+**File:** `components/notifications/NotificationCard.tsx`  
+**Purpose:** Single notification item card with timestamp, category, and read indicator.
+
+**Used in:** `NotificationsPage`, `NotificationsOverlay`
+
+### NotificationsOverlay
+
+**File:** `components/notifications/NotificationsOverlay.tsx`  
+**Purpose:** Popover notification tray accessible from the header bell.
+
+**Used in:** `MainLayout`
+
+---
+
+### NotificationListItem
+
+**File:** `components/notifications/NotificationListItem.tsx`  
+**Purpose:** Row-style notification item used inside `NotificationsOverlay` popover.
+
+**Used in:** `NotificationsOverlay`
+
+---
+
+### NotificationPopup
+
+**File:** `components/notifications/NotificationPopup.tsx`  
+**Purpose:** Transient toast-style popup for new real-time notifications received over Socket.IO.
+
+**Used in:** `MainLayout`
+
+---
+
+### NotificationIcon
+
+**File:** `components/notifications/NotificationIcon.tsx`  
+**Purpose:** Icon selector for notification items, mapping `NotificationIconType` to the correct SVG.
+
+**Used in:** `NotificationCard`, `NotificationListItem`
+
+---
+
+## Files
+
+### FilePreviewPanel
+
+**File:** `components/files/FilePreviewPanel.tsx`  
+**Purpose:** Side panel showing files created by the agent during a session. Supports code, image, markdown, and binary previews.
+
+**Used in:** `MainLayout` (globally mounted, toggled by `isFileManagerOpen`)
+
+### CreatedFilesCard
+
+**File:** `components/files/CreatedFilesCard.tsx`  
+**Purpose:** Inline card in the chat showing files the agent emitted during a task.
+
+### SessionFilesList
+
+**File:** `components/files/SessionFilesList.tsx`  
+**Purpose:** List of all files from a chat session shown in `FilePreviewPanel`.
+
+---
+
+## Shared
+
+### HealthDot
+
+**File:** `components/shared/HealthDot.tsx`  
+**Purpose:** Colored dot indicating connection health (active/paused/error).
+
+**Used in:** `DeviceIndicator`, `CloudPCCard`, `ConnectorCard` (4 files)
+
+---
+
+### ToggleSwitch
+
+**File:** `components/shared/ToggleSwitch.tsx`  
+**Purpose:** Accessible iOS-style toggle switch.
+
+**Used in:** Settings modals, connector active toggles (4 files)
+
+---
+
+## Misc
+
+### ErrorBoundary
+
+**File:** `components/ErrorBoundary.tsx`  
+**Purpose:** React error boundary that catches render errors and shows a fallback. Wraps the entire app in `App.tsx`.
+
+### UpdateNotification
+
+**File:** `components/UpdateNotification.tsx`  
+**Purpose:** Desktop-only auto-update banner. Shown when `useUpdater` detects a new version.
+
+**Used in:** `App.tsx` (desktop only, via `PlatformDesktop`)
+
+### ModelProfileSelector
+
+**File:** `components/ModelProfileSelector.tsx`  
+**Purpose:** Dropdown to switch between available LLM model profiles (e.g. Speed, Quality). Only shown when `allowedModelProfiles` has multiple entries.
+
+**Used in:** `MainLayout` (header area)
+
+---
+
+## Overlays
+
+### DropOverlay / FullPageDropOverlay
+
+**Files:** `components/overlays/DropOverlay.tsx`, `components/overlays/FullPageDropOverlay.tsx`  
+**Purpose:** Full-page drag-and-drop overlay for file uploads.
+
+**Used in:** `HomeUpdated`, `ChatPage`
+
+---
+
+## Backgrounds
+
+### Squares
+
+**File:** `components/backgrounds/Squares.tsx`  
+**Purpose:** Animated grid background for auth pages.
+
+**Used in:** `LoginPage`, `RegisterPage`, `WelcomePage`
+
+### PolkaDotBackground
+
+**File:** `components/backgrounds/PolkaDotBackground.tsx`  
+**Purpose:** Static polka-dot background variant.
+
+---
+
+## Admin Panel
+
+Password-protected developer panel for inspecting live traffic logs. Activated by a keyboard shortcut or a hidden UI affordance.
+
+### AdminPanel
+
+**File:** `components/admin/AdminPanel.tsx`  
+**Purpose:** Full admin panel modal. Renders tabbed log viewers (HTTP, WebSocket, Agent, and desktop-only Rust/Tauri/Overlay/System).
+
+### Props
+Matches `AdminPanelProps` from `types/admin.ts`:
+<ParamField path="isOpen" type="boolean" required>Controls visibility.</ParamField>
+<ParamField path="onClose" type="() => void" required>Called on dismiss.</ParamField>
+<ParamField path="logs" type="LogEntry[]" required>Web-layer log entries (HTTP + WS + Agent).</ParamField>
+<ParamField path="onClearLogs" type="() => void">Called when the clear button is clicked.</ParamField>
+<ParamField path="rustLogs" type="LogEntry[]">Desktop-only Rust WebSocket logs.</ParamField>
+<ParamField path="overlayLogs" type="LogEntry[]">Desktop-only overlay logs.</ParamField>
+<ParamField path="systemEvents" type="LogEntry[]">Desktop-only system event logs.</ParamField>
+
+**Used in:** `App.tsx` (desktop) and `MainLayout` (web)
+
+---
+
+### AdminPasswordDialog
+
+**File:** `components/admin/AdminPasswordDialog.tsx`  
+**Purpose:** Password gate dialog shown before opening the admin panel.
+
+**Used in:** `AdminPanel` (via `useAdminPanel` hook)
+
+---
+
+### LogsViewer
+
+**File:** `components/admin/LogsViewer.tsx`  
+**Purpose:** Scrollable list of `LogEntry` items with search filter and clear button. Used inside each admin panel tab.
+
+**Used in:** `AdminPanel`
+
+---
+
+### LogEntry (component)
+
+**File:** `components/admin/LogEntry.tsx`  
+**Purpose:** Single log entry row with expand-on-click for full raw body.
+
+**Used in:** `LogsViewer`
+
+---
+
+## Helpdesk
+
+Page-scoped sub-components used inside `HelpdeskPage`. Not used elsewhere.
+
+| Component | File | Purpose |
+|---|---|---|
+| `TicketList` | `helpdesk/TicketList.tsx` | Paginated list of support tickets |
+| `TicketCard` | `helpdesk/TicketCard.tsx` | Summary card for a single ticket with status badge |
+| `TicketDetail` | `helpdesk/TicketDetail.tsx` | Full ticket view with message thread and status changes |
+| `TicketCreateModal` | `helpdesk/TicketCreateModal.tsx` | Modal form for submitting a new ticket |
+| `TicketFilters` | `helpdesk/TicketFilters.tsx` | Category/status filter controls |
+| `MessageThread` | `helpdesk/MessageThread.tsx` | Scrollable message thread inside a ticket |
+| `MessageBubble` | `helpdesk/MessageBubble.tsx` | Single message bubble with author avatar and timestamp |
+| `MessageInput` | `helpdesk/MessageInput.tsx` | Reply input with file attachment support |
+| `StatusBadge` | `helpdesk/StatusBadge.tsx` | Colored badge for ticket status values |
+| `PriorityBadge` | `helpdesk/PriorityBadge.tsx` | Colored badge for ticket priority values |
+| `StatusTimeline` | `helpdesk/StatusTimeline.tsx` | Audit trail timeline for status changes |
+| `SatisfactionRating` | `helpdesk/SatisfactionRating.tsx` | 1–5 star satisfaction rating widget |
+| `KBArticleList` | `helpdesk/KBArticleList.tsx` | Searchable Knowledge Base article list |
+| `KBArticleView` | `helpdesk/KBArticleView.tsx` | Full KB article renderer with markdown |
+| `KBSuggestions` | `helpdesk/KBSuggestions.tsx` | Inline KB article suggestions while typing a ticket |
+| `AttachmentPreview` | `helpdesk/AttachmentPreview.tsx` | Inline preview for helpdesk attachments |
+| `EmptyState` | `helpdesk/EmptyState.tsx` | Empty list placeholder for tickets and KB views |

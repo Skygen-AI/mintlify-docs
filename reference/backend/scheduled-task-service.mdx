@@ -1,0 +1,244 @@
+---
+title: "Scheduled Task Service"
+description: "DST-aware cron scheduling, distributed Redis locking, device/Cloud PC validation, and two-phase execution dispatch."
+---
+
+## Overview
+
+`app/services/scheduled_task_service.py` (944 lines) is a **module-level function library** — no class, no singleton. It handles three concerns:
+
+1. **`calculate_next_run()`** — DST-aware computation of the next execution instant in UTC.
+2. **`execute_scheduled_task()`** — full dispatch pipeline: validation → billing check → Cloud PC provision → session/message creation → RabbitMQ publish.
+3. **`scheduler_loop()`** — background poller with Redis distributed lock that runs periodically to find and dispatch due tasks.
+
+**Entry point:** `scheduler_loop()` is started as an `asyncio.create_task()` during FastAPI startup. It runs every poll cycle (triggered by `lifespan` in `app/main.py`).
+
+---
+
+## Redis Locks
+
+| Key | TTL | Purpose |
+|---|---|---|
+| `scheduled_tasks:scheduler_lock:{env}` | 120s (renewed every 30s) | Singleton scheduler — only one pod polls |
+| `sched_task:exec:{task.id}` | 300s | Per-task dedup — prevents scheduler + manual trigger overlap |
+
+The scheduler lock includes `_ENVIRONMENT` to isolate dev/prod namespaces even when they share one Redis cluster.
+
+---
+
+## calculate_next_run()
+
+```python
+def calculate_next_run(
+    frequency: str,
+    time_of_day: str,      # "HH:MM"
+    tz: str,               # IANA timezone e.g. "Europe/Moscow"
+    day_of_week: Optional[int] = None,    # 0=Monday … 6=Sunday
+    day_of_month: Optional[int] = None,   # 1–31
+    after: Optional[datetime] = None,
+) -> Optional[datetime]
+```
+
+Returns the next execution instant as a **timezone-aware UTC datetime**. All intermediate calculations are done in the user's local timezone via `zoneinfo.ZoneInfo`, so DST transitions are handled correctly (a daily 9:00 AM task stays at 9:00 AM local time after clock changes).
+
+<ResponseField name="frequency" type="str" required>
+One of: `once` | `hourly` | `daily` | `weekly` | `monthly`
+</ResponseField>
+
+<ResponseField name="time_of_day" type="str" required>
+Wall-clock time in `"HH:MM"` format (24h). For `hourly`, only the minute component is used.
+</ResponseField>
+
+<ResponseField name="tz" type="str" required>
+IANA timezone string. Passed directly to `zoneinfo.ZoneInfo(tz)`.
+</ResponseField>
+
+<ResponseField name="after" type="datetime">
+Search anchor. If `None`, uses `datetime.now(user_tz)`. For recurring tasks, pass the task's `next_run_at` to advance to the next occurrence.
+</ResponseField>
+
+**Returns:** UTC datetime on success. **Returns `None`** for `frequency="once"` when `after is not None` — indicates the task has already run and should not be scheduled again.
+
+**Frequency behaviors:**
+
+| Frequency | Logic |
+|---|---|
+| `once` | First call (no `after`): today if time is still in the future, else tomorrow. Subsequent calls (`after` set): returns `None`. |
+| `hourly` | Next `:MM` past the current hour. |
+| `daily` | Next occurrence of `HH:MM` local time (tomorrow if today's time already passed). |
+| `weekly` | Next occurrence of the target weekday at `HH:MM`. If today is the target weekday and time already passed, waits 7 days. |
+| `monthly` | Next occurrence of `day_of_month` at `HH:MM`. Clamps to last day of month for months with fewer days (e.g. Feb 31 → Feb 28). |
+
+**Note:** This is a sync function — no `await`, no I/O.
+
+---
+
+## execute_scheduled_task()
+
+```python
+async def execute_scheduled_task(
+    db: AsyncSession,
+    task,                              # ScheduledTask ORM row
+    scheduled_for: Optional[datetime] = None,
+) -> Optional[ScheduledTaskRun]        # run row on success, None on skip/fail
+```
+
+Dispatches a single scheduled task through the full execution pipeline. Each call runs inside its own DB transaction.
+
+### Execution Pipeline
+
+**Step 1 — Concurrency guard:**
+Counts active runs for the task. If `active >= task.max_concurrent_runs`, creates a `skipped` run record and returns `None`.
+
+**Step 2 — Per-task execution lock:**
+Sets Redis key `sched_task:exec:{task.id}` with `NX=True, EX=300`. If the key already exists (scheduler + manual trigger overlap), returns `None` immediately without creating a run record. Logs `scheduled_task_exec_locked`. The lock is released in `finally`.
+
+**Step 3 — Device/Cloud PC validation:**
+
+| Scenario | Behavior |
+|---|---|
+| `computer_use=True`, no device_id | Auto-find or create Cloud PC (`DeviceType.E2B_SANDBOX`) device row |
+| Cloud PC device bound to task | `_ensure_cloud_pc_running()` — provision if not running |
+| Real device, offline | Create `failed` run + notify user via Socket.IO `scheduled_task_failed` |
+| Device deleted | Downgrade to chat-only (device_id = None) |
+
+**Step 4 — Billing check:**
+Calls `billing_service.can_user_access()`. If denied, creates `failed` run + notifies user. Skipped when `BILLING_ENABLED=False`.
+
+**Step 5 — Session and message creation:**
+Creates `ChatSession` with `meta_data.is_scheduled_run=True` and a `user` message with variable substitution applied (`{{var_name}}` → `task.variables[var_name]`).
+
+**Step 6 — Run record creation (before publish):**
+Creates `ScheduledTaskRun(status=running)` **before** publishing to RabbitMQ. This prevents a race condition where the agent completes before the run record exists.
+
+**Step 7 — Socket.IO + persistent notification:**
+Emits `scheduled_session_created` event to the frontend (triggers session list reload). Creates a persistent `AdminNotification + UserNotification` row. Uses DB savepoint to prevent notification failures from corrupting the main transaction.
+
+**Step 8 — Device + session lock:**
+Acquires Redis device lock (`lock_device`) and session lock (`lock_session`) before publishing. If device lock fails for a device-bound task, marks run as `skipped` and returns.
+
+**Step 9 — RabbitMQ publish:**
+Builds agent payload via `get_payload_for_agent()`, serializes to JSON, publishes to the appropriate queue via `resolve_queue_name(device_id)`.
+
+**Step 10 — Lock release on failure:**
+If publish fails, releases locks immediately (agent won't run to unlock them). Uses `CloudPCAccessManager.release()` for device-bound tasks, `unlock_session()` for chat-only.
+
+### Failure modes
+
+All exceptions are caught in the outer `try/except`. Failed tasks emit `scheduled_task_failed` Socket.IO notification to the user. The per-task exec lock is always released in `finally`.
+
+<ResponseField name="scheduled_for" type="datetime">
+The nominal scheduled time for this run. Stored on the run record. If `None`, uses `datetime.now(UTC)`.
+</ResponseField>
+
+---
+
+## scheduler_loop()
+
+```python
+async def scheduler_loop() -> None
+```
+
+Background task that polls for due tasks and dispatches them. Should be started once at application startup via `asyncio.create_task()`.
+
+### Distributed Lock Acquisition
+
+```python
+acquired = await redis_client.set(
+    "scheduled_tasks:scheduler_lock:{env}",
+    "1", nx=True, ex=120
+)
+```
+
+If the lock is not acquired (another pod holds it), the function returns immediately — no work is done.
+
+A background renewal task (`_renew_scheduler_lock`) refreshes the TTL every 30 seconds while processing is ongoing. The lock is deleted in `finally` regardless of outcome.
+
+### Poll Cycle
+
+1. **Stale run cleanup:** `fail_stale_runs(timeout=s.STALE_RUN_TIMEOUT_MINUTES)` — marks stuck `running` runs as `failed` before processing new ones.
+2. **Fetch due tasks:** `get_due_tasks(now)` — tasks where `next_run_at <= now AND is_enabled=True`.
+3. **Snapshot task metadata** in the poll session, then close it. Each task is processed in its own isolated session.
+4. **For each task:**
+   - **If missed by > `_MAX_LATE_SECONDS` (3600s):** skip, advance `next_run_at` to the next natural occurrence, create `skipped` run record.
+   - **Otherwise:** two-phase execution:
+     - **Phase 1:** `execute_scheduled_task()` — returns the run row on success, `None` on skip/fail.
+     - **Phase 2:** Advance `next_run_at` only if Phase 1 returned non-None. On skip/fail, still advance schedule to prevent infinite retry.
+
+### Two-Phase Guarantee
+
+`next_run_at` is advanced **only after successful dispatch**. This means:
+- If the scheduler pod crashes mid-execution, `next_run_at` is not advanced and the task will be retried on the next poll cycle.
+- If execution fails (skipped/failed), `next_run_at` is advanced to the next natural occurrence to prevent tight retry loops. Most failures are non-transient (device offline, billing) so retrying immediately is counterproductive.
+
+### `once` Frequency Handling
+
+| Scenario | Action |
+|---|---|
+| Successful execution | Set `is_enabled=False`, `next_run_at=None` |
+| Skipped (late, or skipped concurrent) | Set `is_enabled=False`, `next_run_at=None` |
+| Execution error | Set `is_enabled=False`, `next_run_at=None` |
+
+Once tasks are always disabled after first attempt regardless of outcome.
+
+---
+
+## Internal Helpers
+
+### _ensure_cloud_pc_running()
+
+```python
+async def _ensure_cloud_pc_running(db: AsyncSession, user) -> bool
+```
+
+Checks if the user has a Cloud PC in an `_ALIVE_STATUSES` state. If found, reconnects to it. If not found, calls `CloudPCService.connect()` to provision a new one. Returns `True` if the Cloud PC is ready, `False` on any failure.
+
+Also checks `billing_service.can_user_access()` before provisioning to avoid starting a Cloud PC for a user who has exhausted their budget.
+
+---
+
+### _notify_user_task_failed()
+
+```python
+async def _notify_user_task_failed(
+    user_id: str,
+    task,
+    message: str,
+) -> None
+```
+
+Fire-and-forget Socket.IO `scheduled_task_failed` event. Never raises.
+
+---
+
+## Configuration Constants
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `_SCHEDULER_LOCK_TTL` | 120s | Scheduler lock lifetime |
+| `_SCHEDULER_LOCK_RENEWAL_INTERVAL` | 30s | How often the lock is refreshed |
+| `_MAX_LATE_SECONDS` | 3600s (1h) | Max allowed tardiness before a run is skipped |
+| `_RETRY_DELAY_MINUTES` | 5 | Retry cooldown (used for logging, not actively enforced in the loop) |
+| `s.STALE_RUN_TIMEOUT_MINUTES` | Configurable | Minutes before a stuck `running` run is marked `failed` |
+
+---
+
+## Socket.IO Events Emitted
+
+| Event | Namespace | When | Payload |
+|---|---|---|---|
+| `scheduled_session_created` | `/user` | Task dispatched | `{session_id, task_id, task_name, run_id}` |
+| `scheduled_task_failed` | `/user` | Execution failed | `{scheduled_task_id, scheduled_task_name, message, timestamp}` |
+
+---
+
+## Related
+
+| Component | Location | Role |
+|---|---|---|
+| `ScheduledTask` model | `app/models/scheduled_tasks.py` | ORM: task config, `next_run_at`, `is_enabled`, `variables` |
+| `ScheduledTaskRun` model | same | ORM: per-execution run record with status, `started_at`, `completed_at` |
+| `scheduled_task_repo` | `app/repositories/scheduled_task_repo.py` | `get_due_tasks`, `create_run`, `update_run`, `fail_stale_runs`, `count_active_runs` |
+| Scheduled task router | `app/routers/task/scheduled_task_router.py` | REST CRUD for task management |
+| `CloudPCService` | `app/services/cloud_pc/` | `connect()` used by `_ensure_cloud_pc_running` |
+| `finalize_agent_response` | `app/services/session_cleanup.py` | Called by the worker after task completion to update the run status |

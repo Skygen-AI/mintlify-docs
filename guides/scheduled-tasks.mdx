@@ -1,117 +1,280 @@
 ---
-title: "Scheduled tasks"
-description: "Cron-like recurring agent runs — daily digests, periodic checks, weekly reports."
+title: "Scheduled Tasks"
+description: "Create recurring agent tasks that run automatically on any schedule — hourly, daily, weekly, or one-time."
 ---
 
-Scheduled tasks fire agent runs on a schedule you define. Daily summaries, Monday standup reports, "every 15 minutes check the site", "once at 9 AM Friday". Skygen runs the scheduler inline in the backend with a distributed lock, so horizontal scaling is safe.
+Scheduled tasks let you run an agent prompt on a recurring schedule without manual intervention. The scheduler evaluates all enabled tasks every minute and dispatches any that are due to the agent via RabbitMQ, exactly like a manual message.
 
-## Schedule model
+## Frequency Options
 
-No raw cron expression — Skygen uses a declarative model:
+| Frequency | Description | Required fields |
+|-----------|-------------|-----------------|
+| `once` | Runs once at a specific datetime | `scheduled_at` |
+| `hourly` | Runs every hour at the specified minute | `time_of_day` (HH:MM — minute used) |
+| `daily` | Runs every day at a specific time | `time_of_day` |
+| `weekly` | Runs once a week | `time_of_day`, `day_of_week` (0=Mon, 6=Sun) |
+| `monthly` | Runs once a month | `time_of_day`, `day_of_month` (1–31) |
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `frequency` | `once` \| `hourly` \| `daily` \| `weekly` \| `monthly` | Recurrence mode |
-| `time_of_day` | `HH:MM` | Anchor time (in user's timezone) |
-| `timezone` | IANA name (e.g. `America/New_York`) | Validated against `zoneinfo.ZoneInfo` |
-| `day_of_week` | 0–6 (Monday=0) | For weekly frequency |
-| `day_of_month` | 1–31 | For monthly frequency (clamped to last day of short months) |
-| `next_run_at` | UTC datetime, indexed | Next computed fire time |
-| `last_run_at` | UTC datetime | Most recent execution |
-| `is_enabled` | bool | Skip without deleting |
-| `expires_at` | UTC datetime \| null | Optional auto-disable cutoff |
-| `run_count` | int | Total dispatches |
-| `max_concurrent_runs` | int (default 1) | Concurrency gate |
-| `device_id` | FK \| null | Which device runs the task |
-| `computer_use` | bool | Auto-provision E2B if true |
-| `playbook_data` | JSONB | Pre-built automation plan `{ command_name, description, variables, tasks }` |
-| `variables` | JSON | Template params substituted into the prompt |
+All times are interpreted in the `timezone` you specify (default: UTC).
 
-## Timezones and DST
+## Creating a Scheduled Task
 
-Skygen computes next-fire times in the **user's local timezone** via `zoneinfo.ZoneInfo`, then stores UTC in `next_run_at`. `zoneinfo` handles DST transitions transparently — no explicit rule in code.
+<CodeGroup>
+```bash curl (daily task)
+curl -s -X POST https://api.skygen.ai/scheduled-tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Morning briefing",
+    "prompt": "Check my Gmail inbox and Slack messages. Summarize anything important from the last 24 hours.",
+    "frequency": "daily",
+    "time_of_day": "08:00",
+    "timezone": "America/New_York"
+  }'
+```
 
-Frequency rules:
+```bash curl (weekly task)
+curl -s -X POST https://api.skygen.ai/scheduled-tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Weekly report",
+    "prompt": "Pull this week'\''s GitHub PRs merged to main. Write a brief changelog.",
+    "frequency": "weekly",
+    "time_of_day": "09:00",
+    "day_of_week": 0,
+    "timezone": "UTC"
+  }'
+```
 
-- **`once`** — today at `time_of_day` if still in the future, else tomorrow.
-- **`hourly`** — next full hour at `:MM` (minute from `time_of_day`).
-- **`daily`** — next occurrence of `HH:MM`.
-- **`weekly`** — next occurrence of `day_of_week` at `HH:MM`.
-- **`monthly`** — `day_of_month` clamped via `calendar.monthrange()` (e.g. 31 in February becomes 28 or 29).
+```bash curl (one-time task)
+curl -s -X POST https://api.skygen.ai/scheduled-tasks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Conference prep",
+    "prompt": "Research speakers at PyCon 2026 and prepare a schedule.",
+    "frequency": "once",
+    "time_of_day": "10:00",
+    "timezone": "UTC",
+    "scheduled_at": "2026-06-01T10:00:00Z"
+  }'
+```
 
-## Execution
+```python Python
+import httpx
 
-<Note>
-**Inline scheduler, not a separate worker.** The scheduler runs in the main backend process, gated by a **distributed Redis lock** (`SETNX` with 120s TTL, renewed every 30s). Only one pod runs scheduler iterations at a time. When a task fires, the scheduler creates a session, saves a user message, publishes to RabbitMQ, and returns — the agent worker handles the actual agent loop.
-</Note>
+BASE_URL = "https://api.skygen.ai"
+headers = {"Authorization": f"Bearer {TOKEN}"}
 
-Each task also has an execution lock: `sched_task:exec:{task.id}` with 300s TTL, preventing overlap between the scheduler and manual `POST /scheduled-tasks/{id}/run` triggers.
+resp = httpx.post(f"{BASE_URL}/scheduled-tasks", headers=headers, json={
+    "name": "Morning briefing",
+    "prompt": "Check my Gmail and Slack. Summarize anything important from last 24 hours.",
+    "frequency": "daily",
+    "time_of_day": "08:00",
+    "timezone": "America/New_York",
+})
+task = resp.json()
+print("Task ID:", task["id"])
+print("Next run:", task["next_run_at"])
+```
+</CodeGroup>
 
-## Catch-up policy
+**Full request schema:**
 
-<Warning>
-**Late runs are skipped, not caught up.** If a task was supposed to fire 2 hours ago (> `_MAX_LATE_SECONDS=3600`), the scheduler logs `scheduled_task_skipped_too_late`, creates a `ScheduledTaskRun` record with status=`skipped`, and advances `next_run_at` to the next natural occurrence. Daily task missed at 9 AM because the backend was down? It fires tomorrow at 9, not late today.
-</Warning>
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Human-readable name |
+| `prompt` | string | Yes | The instruction sent to the agent |
+| `frequency` | string | Yes | `once`, `hourly`, `daily`, `weekly`, `monthly` |
+| `time_of_day` | string | Yes | `HH:MM` in 24-hour format |
+| `timezone` | string | Yes | IANA timezone name (e.g. `America/New_York`) |
+| `day_of_week` | int | For weekly | 0=Monday, 6=Sunday |
+| `day_of_month` | int | For monthly | 1–31 |
+| `scheduled_at` | datetime | For once | ISO 8601 UTC datetime |
+| `device_id` | UUID | No | Attach to a specific device for GUI tasks |
+| `computer_use` | bool | No | Enable GUI/screenshot capabilities |
+| `connectors` | array | No | MCP connector links (see below) |
+| `expires_at` | datetime | No | Stop running after this date |
+| `max_concurrent_runs` | int | No | Default 1 — prevent overlapping runs |
 
-`once` tasks that are skipped or fail are **disabled** (`is_enabled=false`, `next_run_at=null`) so they do not hang around. Recurring tasks advance to the next occurrence regardless of outcome.
+**Response:**
+```json
+{
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "name": "Morning briefing",
+  "frequency": "daily",
+  "time_of_day": "08:00",
+  "timezone": "America/New_York",
+  "is_enabled": true,
+  "next_run_at": "2026-05-09T12:00:00Z",
+  "last_run_at": null,
+  "run_count": 0,
+  "created_at": "2026-05-08T10:00:00Z"
+}
+```
 
-## Endpoints
+## Attaching MCP Connectors
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/scheduled-tasks` | Create. Validates device ownership and parses `time_of_day`. Initial `next_run_at` computed immediately. |
-| `GET` | `/scheduled-tasks` | List. `?is_enabled`, `?limit`, `?offset`. |
-| `GET` | `/scheduled-tasks/{id}` | Fetch one with connector metadata. |
-| `PATCH` | `/scheduled-tasks/{id}` | Update. Recomputes `next_run_at` if schedule params changed. |
-| `PATCH` | `/scheduled-tasks/{id}/toggle` | Enable/disable. Preserves future `next_run_at` if still valid. |
-| `POST` | `/scheduled-tasks/{id}/run` | **Manual trigger** — bypasses scheduler, hits concurrency check. |
-| `DELETE` | `/scheduled-tasks/{id}` | Soft-delete. |
-| `GET` | `/scheduled-tasks/{id}/runs` | Execution history for this task. |
-| `GET` | `/scheduled-tasks/runs/completed` | Completed runs across all your tasks (UI dashboard). |
-| `POST` | `/scheduled-tasks/extract-playbook` | Extract a reusable automation from a past session. |
+Link connectors that the agent should use during execution:
 
-## Working example
+```json
+{
+  "name": "Slack digest",
+  "prompt": "Summarize the #general channel from today.",
+  "frequency": "daily",
+  "time_of_day": "18:00",
+  "timezone": "UTC",
+  "connectors": [
+    {
+      "connector_type": "slack",
+      "connector_id": "<your-slack-connector-id>"
+    }
+  ]
+}
+```
+
+## Listing Tasks
 
 ```bash
-# Monday 9 AM America/New_York
-curl -X POST https://api.skygen.ai/scheduled-tasks \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{
-    "name": "Monday standup summary",
-    "frequency": "weekly",
-    "day_of_week": 0,
-    "time_of_day": "09:00",
-    "timezone": "America/New_York",
-    "prompt": "Summarize my open GitHub PRs and post to Slack #standup.",
-    "device_id": "dev_123"
-  }'
-
-# Toggle off temporarily
-curl -X PATCH https://api.skygen.ai/scheduled-tasks/$TASK_ID/toggle \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"is_enabled": false}'
-
-# Manual fire now
-curl -X POST https://api.skygen.ai/scheduled-tasks/$TASK_ID/run \
+# All tasks
+curl https://api.skygen.ai/scheduled-tasks \
   -H "Authorization: Bearer $TOKEN"
 
-# Inspect runs
-curl https://api.skygen.ai/scheduled-tasks/$TASK_ID/runs \
+# Only enabled tasks
+curl "https://api.skygen.ai/scheduled-tasks?is_enabled=true" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-## Gotchas
+Supports `limit` (max 100) and `offset` for pagination.
+
+## Enabling / Disabling a Task
+
+Toggle a task without deleting it:
+
+```bash
+curl -X PATCH "https://api.skygen.ai/scheduled-tasks/$TASK_ID/toggle" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "is_enabled": false }'
+```
+
+When disabled, `next_run_at` is preserved for display purposes. The scheduler skips disabled tasks.
+
+## Updating a Task
+
+Update any field including schedule and prompt:
+
+```bash
+curl -X PATCH "https://api.skygen.ai/scheduled-tasks/$TASK_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "time_of_day": "09:30",
+    "timezone": "Europe/London"
+  }'
+```
+
+When schedule fields change, `next_run_at` is automatically recalculated.
+
+## Running a Task Manually
+
+Trigger an immediate run outside the normal schedule:
+
+```bash
+curl -s -X POST "https://api.skygen.ai/scheduled-tasks/$TASK_ID/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Returns a `ScheduledTaskRun` object immediately. The agent executes asynchronously.
 
 <Note>
-**Billing per fire.** Each execution consumes tokens like any agent run. Use event [Triggers](/guides/triggers) for sparse, event-driven automations to avoid burning tokens on polls.
+  Manual runs respect `max_concurrent_runs`. If a previous run is still in progress, you'll receive HTTP 409 `Previous run still in progress`.
 </Note>
 
-<Note>
-**Playbooks, not cron strings.** If you are used to `0 9 * * 1`, translate to `frequency=weekly`, `day_of_week=0`, `time_of_day=09:00`. There is no cron expression field to paste.
-</Note>
+## Viewing Execution History
 
-## See also
+### All runs for a specific task
 
-- [Triggers](/guides/triggers) — event-driven alternative
-- [Devices](/concepts/devices) — the target device for each task
-- [Billing](/concepts/billing) — per-run token cost
+```bash
+curl "https://api.skygen.ai/scheduled-tasks/$TASK_ID/runs?limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### All completed runs across all tasks
+
+```bash
+curl "https://api.skygen.ai/scheduled-tasks/runs/completed?limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Run object fields:**
+
+| Field | Description |
+|-------|-------------|
+| `id` | Run UUID |
+| `task_id` | Parent task UUID |
+| `status` | `pending`, `running`, `completed`, `error` |
+| `started_at` | When the agent began processing |
+| `completed_at` | When the agent finished |
+| `error_message` | Error details if status is `error` |
+| `session_id` | The chat session created for this run |
+
+## Extracting a Playbook from a Session
+
+After completing a successful manual session, you can extract a reusable automation playbook:
+
+```bash
+curl -s -X POST https://api.skygen.ai/scheduled-tasks/extract-playbook \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "session_id": "<completed-session-id>" }'
+```
+
+The Agent analyzes the session trajectory and returns:
+
+```json
+{
+  "command_name": "morning_briefing",
+  "description": "Checks Gmail and Slack for important messages",
+  "variables": ["days_back", "channels"],
+  "tasks": [...]
+}
+```
+
+Use this as the basis for a new scheduled task prompt.
+
+## Deleting a Task
+
+Soft-deletes the task (and its future runs). Historical run data is preserved.
+
+```bash
+curl -X DELETE "https://api.skygen.ai/scheduled-tasks/$TASK_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Returns HTTP 204 on success.
+
+## Real-Time Events
+
+Scheduled task lifecycle events are broadcast over Socket.IO to all connected clients of the user:
+
+| Event | Trigger |
+|-------|---------|
+| `scheduled_task_created` | Task created via API |
+| `scheduled_task_updated` | Task updated or toggled |
+| `scheduled_task_deleted` | Task deleted |
+
+Listen on the `/user` namespace after authenticating with your user ID.
+
+## Error Reference
+
+| HTTP Status | Detail | Cause |
+|------------|--------|-------|
+| 404 | `Scheduled task not found` | Task ID does not exist or belongs to another user |
+| 404 | `Device not found` | `device_id` not found or belongs to another user |
+| 409 | `Previous run still in progress` | `max_concurrent_runs` limit reached |
+| 422 | `scheduled_at must be in the future` | One-time task with past datetime |
+| 422 | `Invalid time_of_day format` | Expected `HH:MM` |
+| 422 | `Task could not be executed` | Agent dispatch failed |
+| 503 | `Agent service unavailable` | Playbook extraction: agent unreachable |

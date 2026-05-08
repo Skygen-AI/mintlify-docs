@@ -1,0 +1,1074 @@
+---
+title: "Backend Services Reference"
+description: "Complete catalog of every service module in Backend/app/services/. Detailed reference for the four most important services is in dedicated pages."
+---
+
+## Overview
+
+All business logic lives in `Backend/app/services/`. Services are consumed by routers via FastAPI `Depends()`, by Socket.IO handlers, and by the RabbitMQ worker. The architecture follows **Clean Architecture**: routers call services, services call repositories, repositories call ORM models.
+
+**Dedicated deep-dive pages:**
+
+| Service | File | Reference |
+|---|---|---|
+| BillingService | `billing_service.py` + `billing/` | [billing-service](/reference/backend/billing-service) |
+| CloudPCService | `cloud_pc/` | [cloud-pc-service](/reference/backend/cloud-pc-service) |
+| ComposioService | `composio_service.py` | [mcp-tools-service](/reference/backend/mcp-tools-service) |
+| Session lifecycle | `session_cleanup.py` | [session-service](/reference/backend/session-service) |
+| KB Service | `kb_service.py` | [kb-service](/reference/backend/kb-service) |
+| StripeService | `stripe_service.py` | [stripe-service](/reference/backend/stripe-service) |
+| ScheduledTaskService | `scheduled_task_service.py` | [scheduled-task-service](/reference/backend/scheduled-task-service) |
+
+---
+
+## Core Infrastructure Services
+
+### ActivityTracker (`activity_tracker.py`)
+
+Throttled `User.last_active_at` updates via Redis SETNX (60-second TTL per user).
+
+**Key functions:**
+
+```python
+async def touch_user_activity(user_id: str) -> None
+def fire_and_forget_touch(user_id: str) -> None
+```
+
+`fire_and_forget_touch` wraps `touch_user_activity` in `asyncio.create_task()` for use in synchronous middleware. On Redis failure, falls through to DB write.
+
+---
+
+### SessionCleanupService (`session_cleanup.py`)
+
+Unified finalization after agent terminal responses. Extracted to eliminate ~80 LOC duplication between the Socket.IO and Worker paths.
+
+**Key functions:**
+
+```python
+async def finalize_agent_response(
+    session_id, user_id, device_id, message_id, content, meta_data,
+    is_scheduled=False, notify_via="socketio"
+) -> None
+async def process_emitted_attachments(meta_data, user_id, session_id, message_id) -> list
+```
+
+Steps: unlock session → unlock device → update scheduled task run → release Cloud PC control → notify device.
+
+**Called by:** `socketio/agent_handlers/message_handlers.py`, `worker/handlers/agent_response_handler.py`
+
+---
+
+### DeviceLockManager (`device_lock_manager.py`)
+
+Redis-based device and session locking via Lua atomic scripts.
+
+**Key functions:**
+
+```python
+async def lock_device(redis_client, device_id, session_id, user_id) -> bool
+async def unlock_device(redis_client, device_id, session_id) -> bool
+async def lock_session(redis_client, session_id) -> bool
+async def unlock_session(redis_client, session_id) -> None
+async def bind_cloud_pc_session(redis_client, user_id, session_id) -> None
+async def unbind_cloud_pc_session(redis_client, user_id) -> None
+```
+
+**Class:**
+
+```python
+class CloudPCAccessManager:
+    async def acquire(session_id, cpc_id) -> bool
+    async def release(session_id, force=False) -> bool
+```
+
+`CloudPCAccessManager` is the high-level facade used by the cloud-pc router for unified lock cleanup on session deletion.
+
+**Lua scripts:**
+- `_LOCK_OR_REACQUIRE_LUA` — returns 1 (new), 2 (same-session re-acquire), 0 (contested). Same-session re-acquire bumps TTL only, preserving `locked_at` to surface staleness.
+
+---
+
+### SystemSettingsService (`system_settings_service.py`)
+
+Dynamic settings stored in Redis with fallback to `settings.py` defaults.
+
+```python
+class SystemSettingsService:
+    async def get_setting(key: str) -> Any
+    async def set_setting(key: str, value: Any) -> bool
+    async def get_all_settings() -> dict
+    async def get_file_parse_max_size_mb() -> int
+```
+
+Redis key format: `system_settings:{key}`. Currently manages: `file_parse_max_size_mb`.
+
+**Singleton:** `system_settings = SystemSettingsService()`
+
+---
+
+## Billing Services
+
+### BillingService (`billing_service.py`)
+
+See [billing-service](/reference/backend/billing-service) for full reference.
+
+**Quick summary:** Token deduction with fractional accumulation, subscription lifecycle, Cloud PC per-minute billing, Stripe checkout/portal/webhook, free plan renewal, trial management. `TIER_STRATEGIES` registry maps `SubscriptionTier` → `TierAccessStrategy`. `WEBHOOK_HANDLERS` registry maps Stripe event types → handlers.
+
+---
+
+### StripeService (`stripe_service.py`)
+
+Low-level Stripe API wrapper. 1865 lines. Called exclusively by `BillingService`.
+
+See [stripe-service](/reference/backend/stripe-service) for full reference.
+
+**Key capabilities:**
+- `create_checkout_session()` — Stripe-hosted checkout for new subscriptions
+- `create_setup_intent()` — save card without immediate charge
+- `confirm_card_setup()` — complete SetupIntent after Stripe.js
+- `create_subscription()` — create subscription from saved payment method
+- `change_plan()` — prorate plan change mid-cycle
+- `cancel_subscription()` — cancel at period end or immediately
+- `create_early_renewal()` — immediately renew subscription and charge
+- `enable_overage()` / `disable_overage()` — toggle Stripe Meters for token overage
+- `create_customer_portal_session()` — Stripe Customer Portal URL
+- `handle_webhook_event()` — route Stripe events to `WEBHOOK_HANDLERS`
+- `get_transactions()` — list charges and payments for a customer
+
+---
+
+### PlanAccessService (`plan_access_service.py`)
+
+Feature gate layer over `SubscriptionPlan.features_config` JSON.
+
+```python
+class PlanAccessService:
+    async def get_user_plan(db, user_id) -> Optional[SubscriptionPlan]
+    async def require_feature(db, user_id, feature_key) -> None  # raises 403
+    async def can_use_feature(db, user_id, feature_key) -> bool
+    async def get_feature_limit(db, user_id, limit_key) -> Optional[Any]
+    async def get_features_config(db, user_id) -> dict
+    async def get_plan_config(db, user_id, user_preferred_profile=None) -> PlanConfig
+```
+
+Returns `PlanConfig` dataclass with: `plan_id`, `plan_type`, `plan_name`, `model_profile`, `custom_system_prompt`, `features`.
+
+**Note:** Does NOT handle billing balance or token deduction — those remain in `BillingService`.
+
+**FastAPI dependency helpers (`plan_access_deps.py`):**
+```python
+async def require_cloud_pc(current_user, db) -> None
+def require_feature(feature_key: str) -> Depends  # factory
+```
+
+**Singleton:** `plan_access_service = PlanAccessService()`
+
+---
+
+## Cloud PC Services
+
+### CloudPCService (`cloud_pc/`)
+
+See [cloud-pc-service](/reference/backend/cloud-pc-service) for full reference.
+
+**Quick summary:** E2B sandbox lifecycle with LifecycleMixin (connect/disconnect/heartbeat), LockingMixin (Redis distributed locks with Lua CAS), RecoveryMixin (S3 backup/restore), MaintenanceMixin (auto-pause sweep). Multi-parallel CPC support behind `MULTI_PARALLEL_CLOUD_PC_ENABLED` feature flag.
+
+---
+
+### CloudPCControlService (`cloud_pc_control_service.py`)
+
+Manages manual vs AI input control over the Cloud PC (take-control / resume-AI flow). Singleton via `get_cloud_pc_control_service()`.
+
+```python
+@dataclass
+class TakeControlResult:
+    status: str          # "paused", "no_active_agent"
+    controller: str
+    session_id: Optional[str] = None
+
+@dataclass
+class ResumeAIResult:
+    status: str          # "resumed", "no_paused_agent", "device_conflict"
+    controller: str
+    queued_messages_count: int = 0
+
+@dataclass
+class RenewControlResult:
+    status: str          # "renewed", "no_active_session"
+    ttl: int = 120
+
+class CloudPCControlService:
+    async def take_control(db, user_id, session_id) -> TakeControlResult
+    async def resume_ai(db, user_id, session_id, current_user, device_id=None) -> ResumeAIResult
+    async def renew_control(db, user_id) -> RenewControlResult
+```
+
+**`take_control` steps:** validate session ownership → check agent is active (`is_session_active`) → pause session in Redis (`pause_session`) → send pause signal via Socket.IO (`send_agent_pause`) → save system "paused" message to DB → acquire user control via `CloudPCService.acquire_control`.
+
+**`resume_ai` steps:** validate session → check session is paused → verify agent saved state (`agent_history:{session_id}` Redis key with `status=PAUSED`) → drain queued pause-period messages → acquire session lock (force=True) → unpause session → refresh device lock → build wake-reason prompt with queued messages → publish to RabbitMQ → release user control. **Rollback on failure:** re-pause, re-queue messages, release device lock via `CloudPCAccessManager.release`.
+
+**`renew_control`:** calls `CloudPCService.renew_control(user_id, "user")` to bump the controller TTL.
+
+---
+
+### CloudPCFileManager (`cloud_pc_file_manager.py`)
+
+File operations on the Cloud PC sandbox (list, upload, download, delete, mkdir, publish to S3).
+
+```python
+class CloudPCFileManager:
+    async def list_files(sandbox, user_id, path) -> Dict[str, Any]
+    async def download_file(sandbox, user_id, file_path) -> Dict[str, Any]
+    async def download_file_from_cache(user_id, file_path) -> Dict[str, Any]
+    async def publish_output_files(sandbox, user_id, session_id) -> list[Dict[str, Any]]
+    async def publish_specific_files(sandbox, user_id, session_id, file_paths) -> list[Dict[str, Any]]
+    async def get_upload_url(user_id, dest_path, filename) -> Dict[str, Any]
+    async def upload_callback(sandbox, user_id, s3_key, dest_path) -> None
+    async def delete_file(sandbox, file_path) -> None
+    async def create_directory(sandbox, dir_path) -> None
+    async def get_published_file_url(s3_key) -> Dict[str, Any]
+    async def delete_s3_object(s3_key) -> None
+```
+
+Path validation is a two-step process: `validate_path_basic` (sync, no sandbox) and `validate_path` (async, sandbox-backed existence check).
+
+---
+
+### E2BSandboxManager (`cloud_pc_sandbox_manager.py`)
+
+Manages the mapping from `CloudPC` DB rows to E2B sandbox IDs, including sandbox lifecycle (create/reconnect/pause/timeout-extension). In-process cache maps `cloud_pc_id → sandbox` for reuse without DB lookups.
+
+```python
+class E2BSandboxManager:
+    def is_available(self) -> bool
+    def get_timeout(self) -> int
+    async def create(user_id) -> Any
+    async def reconnect(sandbox_id) -> Any
+    async def pause(sandbox) -> None
+    async def start_stream(sandbox) -> Tuple[str, str]
+    async def extend_timeout(sandbox, max_retries=3) -> None
+    async def get_active(user_id, db=None, cloud_pc_id=None) -> Any
+    def cache_sandbox(cloud_pc_id, sandbox) -> None
+    def remove_from_cache(cloud_pc_id) -> None
+    def get_cached_ids() -> list
+```
+
+---
+
+### CloudPCCompletion (`cloud_pc_completion.py`)
+
+Background poller for Cloud PC provisioning completion. Polls E2B for sandbox readiness and emits Socket.IO events when ready or failed.
+
+---
+
+### AttachmentPipeline (`attachment_pipeline.py`)
+
+Orchestrates attachment processing: `emitted_files` from agent → S3 publish → DB persist → WS serialize.
+
+```python
+class AttachmentPipeline:
+    async def process(meta_data, user_id, session_id, message_id) -> list
+```
+
+Delegates to `CloudPCAttachmentProcessor`. Emits `ATTACHMENT_PIPELINE_TOTAL` Prometheus metric.
+
+---
+
+### AttachmentProcessor (`attachment_processor.py`)
+
+Low-level attachment processing: copies files from Cloud PC to S3, creates `Attachment` DB rows, returns serialized dicts.
+
+```python
+class CloudPCAttachmentProcessor:
+    async def process(emitted_files, user_id, session_id, message_id, db) -> list[str]
+```
+
+---
+
+### AttachmentStorageService (`attachment_storage_service.py`)
+
+S3/MinIO operations for attachment blobs: upload, download, presigned URL generation, deletion.
+
+---
+
+## MCP / Composio Services
+
+### ComposioService (`composio_service.py`)
+
+See [mcp-tools-service](/reference/backend/mcp-tools-service) for full reference.
+
+**Quick summary:** 500+ toolkit search/discovery, OAuth connection management, MCP config generation for agent, trigger CRUD, semantic tool search. Dependency Inversion via `ComposioPort` protocol → `ComposioAdapter`.
+
+**Bug note:** `list_user_composio_connections` has `@composio_enabled_guard` applied twice (lines 92–93 of source) — a no-op duplicate. No functional impact.
+
+---
+
+### ComposioAdapter (`composio_adapter.py`)
+
+Concrete implementation of `ComposioPort` wrapping the Composio Python SDK. All external HTTP calls go through here. `ComposioUnavailableError` is raised when the SDK fails or the API key is absent.
+
+---
+
+### ComposioCircuit (`composio_circuit.py`)
+
+Circuit breaker wrapper around Composio calls. Prevents cascading failures when Composio is slow or down.
+
+---
+
+### ComposioTypes (`composio_types.py`)
+
+Shared types and protocols for the Composio integration:
+- `ComposioPort` — protocol (interface) for all SDK operations
+- `NON_COMPOSIO_PROVIDERS` — set of provider names managed outside Composio (e.g. `"telegram"`)
+- `composio_enabled_guard` — decorator that raises `ComposioUnavailableError` when `COMPOSIO_API_KEY` is not set
+- `ToolkitInfo`, `ToolkitDetails`, `ToolkitCategoryInfo`, `MCPConfig`, `ToolInfo`, `TriggerInfo`, `TriggerCreateResult`, `TriggerTypeInfo`, `AuthResult`, `ConnectionInfo`
+
+---
+
+### ComposioUtils (`composio_utils.py`)
+
+Utility functions for Composio data normalization (toolkit slug cleaning, connection status mapping).
+
+---
+
+### TriggerService (`trigger_service.py`)
+
+Event-driven trigger orchestration: HMAC webhook verification, payload normalization, agent dispatch.
+
+**Key classes:**
+
+```python
+class WebhookVerifier:
+    def verify(payload: bytes, signature: Optional[str]) -> bool
+    # Raises WebhookVerificationError on invalid/missing signature.
+    # Returns True on success; False when Composio is unavailable.
+    # Reads the HMAC-SHA256 secret from settings (not passed as arg).
+
+class WebhookEventParser:
+    def parse(raw: dict) -> WebhookEvent
+    # Maps Composio webhook dict → WebhookEvent(event_type, user_id,
+    # toolkit, trigger_id, payload, action_prompt, trigger_event_id).
+
+class TriggerDispatcher:
+    async def dispatch(
+        event: WebhookEvent,
+        action_prompt: Optional[str],
+        trigger_event_id: Optional[str],
+    ) -> bool
+    # Publishes trigger event to active user sessions via Socket.IO
+    # /agent namespace. Returns True if at least one session was notified.
+
+class TriggerService:
+    async def handle_webhook(payload: bytes, signature: Optional[str]) -> Dict[str, Any]
+    # Returns {"status": "ok", "trigger_id": str} or {"status": "ignored", ...}.
+    # Verifies HMAC, parses payload, dispatches event.
+
+    # --- CRUD (all require ComposioService internally) ---
+    async def create_trigger(db, user_id, toolkit, trigger_name, config) -> TriggerConfig
+    async def list_triggers(db, user_id) -> List[TriggerConfig]
+    async def delete_trigger(db, user_id, trigger_id) -> bool
+    async def update_trigger_config(db, user_id, trigger_id, config) -> TriggerConfig
+
+    # --- Event log ---
+    async def get_trigger_events(db, user_id, trigger_id=None, limit=50) -> List[TriggerEvent]
+    async def get_trigger_runs(db, user_id, trigger_id=None, limit=50) -> List[TriggerRun]
+    async def update_trigger_execution(db, event_id, status, result=None) -> TriggerEvent
+
+    # --- Discovery ---
+    async def list_trigger_types(toolkit=None) -> List[TriggerTypeInfo]
+    async def list_trigger_app_counts() -> List[Dict[str, Any]]
+```
+
+Composio sends three event types: `trigger_fired`, `connection_updated`, `connection_error`. Only `trigger_fired` routes through `TriggerDispatcher`; the other two update connection state.
+
+---
+
+### MCPConnectionCompletion (`mcp_connection_completion.py`)
+
+Background OAuth completion poller. After the user completes Composio OAuth, polls `connected_accounts.get(id)` every 1.5s for up to 60s.
+
+```python
+async def wait_active_and_emit(user_id, toolkit, connected_account_id) -> None
+```
+
+Emits Socket.IO events:
+- `mcp_connection_completed` → `/user` (persist=True) — flips UI card to "Connected"
+- `mcp_connection_completed_for_user` → `/agent` — wakes hibernating agent sessions
+- `mcp_connection_failed` / `mcp_connection_timeout` → `/user` (persist=False)
+
+Designed to be launched via `asyncio.create_task()` from the OAuth callback. Never re-raises.
+
+---
+
+### MCPProbeService (`mcp_probe_service.py`)
+
+Probes a user-supplied MCP server URL to discover available tools and validate connectivity. Used during custom connector setup.
+
+---
+
+### MCPTokenStore (`mcp_token_store.py`)
+
+Encrypted OAuth token storage for custom MCP integrations. Stores in DB, decrypts on demand for agent use.
+
+---
+
+### OAuthState (`oauth_state.py`)
+
+Short-lived Redis state for OAuth flows. Stores state parameters during redirect, validates on callback. TTL: ~10 minutes.
+
+---
+
+### MCP Integration Builder (`mcp_integration_builder/`)
+
+Low-level MCP server construction subsystem:
+
+| Module | Class | Purpose |
+|---|---|---|
+| `builder.py` | `MCPIntegrationBuilder` | Top-level coordinator |
+| `client_pool.py` | `MCPClientPool` | Manages persistent MCP client connections |
+| `generator.py` | `MCPCodeGenerator` | Generates MCP server code stubs |
+| `introspector.py` | `MCPIntrospector` | Discovers tools/schemas from a running MCP server |
+| `launcher.py` | `MCPServerLauncher` | Starts and monitors MCP server subprocess |
+| `schemas.py` | — | Pydantic schemas for MCP config |
+
+---
+
+## Knowledge Base Services
+
+### KB Service (`kb_service.py`)
+
+Module-level async functions (no class) for knowledge base operations. Backed by **Gemini Developer API** (`generativelanguage.googleapis.com/v1beta/.../batchEmbedContents`, keyed by `GEMINI_API_KEY`). Produces 768-dimensional vectors stored in pgvector with cosine-similarity search.
+
+See [kb-service](/reference/backend/kb-service) for full reference.
+
+- **3-level Copy-on-Write** — global insights (`user_id='global'`) → user-level overrides → emplogent-level overrides (`agent_type='character:<id>'`)
+- **Tombstone deletes** — creates a CoW tombstone row rather than deleting global insights; cosine dedup threshold `0.08`
+- **Embeddings** — `get_embeddings(texts)` calls Gemini Developer API directly. `get_embeddings_openrouter` exists as a separate function but is **not** called from any CRUD path
+
+```python
+async def get_embeddings(texts: List[str]) -> Optional[List[List[float]]]
+# Calls Gemini Developer API. Returns None on failure.
+
+async def save_knowledge(
+    db, agent_type, insight_type, global_insight_type,
+    user_id, content, key, metadata, timestamp, is_user_visible=True
+) -> Dict[str, Any]
+
+async def update_knowledge(
+    db, insight_id, user_id=None, agent_type=None, insight_type=None,
+    global_insight_type=None, content=None, key=None, metadata=None,
+    timestamp=None, is_user_visible=None
+) -> Dict[str, Any]
+
+async def delete_knowledge(
+    db, insight_id, user_id, agent_type=None
+) -> Dict[str, Any]
+
+async def retrieve_relevant_knowledge(
+    db, query, agent_type, user_id, insight_type, num_insights
+) -> Optional[Dict[str, Any]]
+
+async def save_task_evaluation(
+    db, task_id, user_id, agent_type, trajectory, evaluation_results=None
+) -> bool
+```
+
+Note: `INTERNAL_INSIGHT_TYPES = {"trajectory_plan"}` — always sets `is_user_visible=False` regardless of caller argument.
+
+---
+
+## Scheduling Services
+
+### ScheduledTaskService (`scheduled_task_service.py`)
+
+DST-aware cron scheduler with Redis distributed lock.
+
+See [scheduled-task-service](/reference/backend/scheduled-task-service) for full reference.
+
+```python
+async def calculate_next_run(
+    frequency: str,          # once | daily | weekly | monthly | hourly
+    time_of_day: str,        # "HH:MM"
+    tz: str,                 # IANA timezone string e.g. "Europe/Moscow"
+    day_of_week: Optional[int] = None,    # 0=Mon..6=Sun
+    day_of_month: Optional[int] = None,
+    after: Optional[datetime] = None,
+) -> Optional[datetime]
+# Returns None for frequency='once' after the task has already run.
+
+async def execute_scheduled_task(db, task, scheduled_for=None) -> ScheduledTaskRun
+# 6 steps: per-task exec lock → billing check → Cloud PC auto-provision
+# → variable substitution → create run row → publish to RabbitMQ.
+
+async def scheduler_loop() -> None
+# Runs as a background task. Acquires
+# "scheduled_tasks:scheduler_lock:{env}" (SETNX, 120s TTL) so only
+# one pod acts as scheduler. Renews lock every 30s.
+# Two-phase pattern: execute first, advance next_run_at only on success.
+# Fails stale runs older than MAX_LATE_SECONDS (3600) via fail_stale_runs.
+```
+
+**Redis locks used:**
+- `scheduled_tasks:scheduler_lock:{env}` — singleton scheduler, 120s TTL, renewal every 30s
+- `sched_task:exec:{task.id}` — per-task execution dedup, 300s TTL
+
+---
+
+## Email Services
+
+### EmailService (`email_service.py`)
+
+Amazon SESv2 async transport with exponential-backoff retry.
+
+```python
+async def send_email(
+    *,                         # kwargs-only
+    to: str,
+    subject: str,
+    html: str,
+    text: Optional[str] = None,
+    tags: Optional[List[dict]] = None,       # SES message tags [{Name, Value}]
+    unsubscribe_url: Optional[str] = None,   # sets List-Unsubscribe header
+    reply_to: Optional[str] = None,
+) -> bool
+```
+
+Never raises. Returns `True` on success, `False` on failure. Permanent errors (MessageRejected, domain not verified, account suspended) are never retried. Transient errors retry up to 3× with exponential backoff + jitter (`base_delay=0.5s`). Short-circuited when `MAIL_ENABLED=False`.
+
+---
+
+## Monitoring Infrastructure
+
+Enabled only when `ENABLE_METRICS=true` in the ConfigMap (controls `prometheus-fastapi-instrumentator` registration at startup in `app/main.py`). The `/metrics` endpoint is served by the instrumentator. All metrics carry an `environment` label.
+
+### MetricsCollector (`app/monitoring/metrics.py`)
+
+Periodic background collector that scrapes DB, Redis, and RabbitMQ to update Prometheus Gauge metrics. Wraps the module-level metric objects defined in the same file.
+
+**Global instance management:**
+```python
+init_metrics_collector(environment: str = "development") → MetricsCollector
+get_metrics_collector() → Optional[MetricsCollector]
+```
+
+**Constructor:**
+```python
+MetricsCollector(environment: str = "development")
+```
+Sets `APP_INFO.info({"environment": environment, "service": "skygen-backend"})` immediately.
+
+**Lifecycle:**
+| Method | Description |
+|---|---|
+| `start_collection(interval_seconds=30)` | Create asyncio Task for `_collection_loop`; attaches `log_task_exception` callback; no-op if already running |
+| `stop_collection()` | Cancel the task; await `CancelledError` |
+| `collect_all_metrics()` | Run all 5 sub-collectors via `asyncio.gather(return_exceptions=True)` |
+
+**Sub-collectors:**
+| Method | Source | Metrics updated |
+|---|---|---|
+| `_collect_user_metrics` | PostgreSQL | `skygen_users_total`, `skygen_users_active` |
+| `_collect_websocket_metrics` | Local Socket.IO memory | `skygen_websocket_connections[device/agent]`, `skygen_devices_connected`, `skygen_users_online` |
+| `_collect_session_metrics` | PostgreSQL | `skygen_chat_sessions_total`, `skygen_chat_messages_total[user/assistant/system]` |
+| `_collect_queue_metrics` | RabbitMQ (`passive=True` declare) | `skygen_queue_messages`, `skygen_queue_consumers` — skipped if `QUEUE_METRICS_ENABLED=False` |
+| `_collect_engagement_metrics` | PostgreSQL | `skygen_users_dau/wau/mau`, `skygen_users_new_today`, `skygen_messages_sent_today[user/assistant]` |
+
+---
+
+### Prometheus Metrics Catalog
+
+All metrics are defined as module-level objects in `app/monitoring/metrics.py`.
+
+#### Application Info
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_app` | Info | — | Environment and service name |
+
+#### User Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_users_total` | Gauge | `environment` | Total registered users |
+| `skygen_users_active` | Gauge | `environment` | Users with `is_active=True` |
+| `skygen_users_online` | Gauge | `environment` | Users with active Socket.IO connections |
+| `skygen_devices_connected` | Gauge | `environment` | Currently connected devices |
+| `skygen_users_dau` | Gauge | `environment` | Daily active users (last 24h) |
+| `skygen_users_wau` | Gauge | `environment` | Weekly active users (last 7d) |
+| `skygen_users_mau` | Gauge | `environment` | Monthly active users (last 30d) |
+| `skygen_users_new_today` | Gauge | `environment` | Users registered today |
+
+#### Agent Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_agent_requests_total` | Counter | `environment`, `status` | Total requests sent to agent |
+| `skygen_agent_request_duration_seconds` | Histogram | `environment` | Agent request duration; buckets: 0.1s – 300s |
+
+#### Error Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_http_errors_total` | Counter | `environment`, `status_code`, `method`, `path` | HTTP 4xx/5xx errors |
+| `skygen_worker_errors_total` | Counter | `environment`, `error_type`, `message_type` | RabbitMQ worker errors |
+| `skygen_worker_messages_processed_total` | Counter | `environment`, `message_type`, `status` | Messages processed by worker |
+
+#### Queue Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_queue_messages` | Gauge | `environment`, `queue_name` | Messages currently in RabbitMQ queue |
+| `skygen_queue_consumers` | Gauge | `environment`, `queue_name` | Active queue consumers |
+
+#### WebSocket / Socket.IO Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_websocket_connections` | Gauge | `environment`, `connection_type` | Active connections (`device`, `agent`) |
+| `skygen_websocket_messages_sent_total` | Counter | `environment`, `connection_type`, `message_type` | Messages sent via Socket.IO |
+| `skygen_websocket_messages_received_total` | Counter | `environment`, `connection_type`, `message_type` | Messages received via Socket.IO |
+
+#### Pending Commands
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_pending_commands_flushed_total` | Counter | `environment`, `trigger` | Pending commands delivered on reconnect; `trigger`: `on_connect` or `heartbeat` |
+| `skygen_pending_commands_expired_total` | Counter | `environment` | Pending commands that expired before delivery |
+
+#### Session Metrics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_chat_sessions_total` | Gauge | `environment` | Total chat sessions |
+| `skygen_chat_messages_total` | Gauge | `environment`, `role` | Total chat messages by role |
+| `skygen_messages_sent_today` | Gauge | `environment`, `role` | Messages sent today |
+
+#### HTTP Request Analytics
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_http_requests_by_type_total` | Counter | `environment`, `caller_type`, `method` | Requests by caller: `user`, `internal`, `anonymous` |
+| `skygen_http_requests_by_category_total` | Counter | `environment`, `category` | Requests by functional category |
+| `skygen_http_request_latency_by_category_seconds` | Histogram | `environment`, `category` | Latency by category; buckets: 10ms – 10s |
+
+**Categories** (`categorize_path(path)`): `chat` (`/sessions`, `/messages`), `auth` (`/auth`, `/users`, `/token`), `devices`, `agent`, `admin` (`/admin`, `/monitoring`), `billing` (`/billing`, `/stripe`), `files` (`/files`, `/screenshots`), `analytics`, `knowledge` (`/knowledge`, `/kb`), `mcp`, `other`.
+
+#### Message Flow
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_message_to_queue_seconds` | Histogram | `environment` | Time from message receipt to RabbitMQ publish; buckets: 10ms – 5s |
+| `skygen_message_response_latency_seconds` | Histogram | `environment`, `agent_mode` | End-to-end user wait (message sent → agent response); buckets: 1s – 1800s |
+
+#### Billing & Device
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `skygen_billing_checks_total` | Counter | `environment`, `result` | Billing checks; `result`: `allowed`, `insufficient_tokens`, `error` |
+| `skygen_device_lock_total` | Counter | `environment`, `result` | Device lock operations; `result`: `locked`, `already_locked`, `unlocked` |
+| `skygen_cloud_pc_state_mismatch_total` | Counter | `environment`, `reason` | Cloud PC sandbox unreachable despite device being online; reasons: `sandbox_creating`, `creation_failed`, `sandbox_paused`, `sandbox_terminated`, `reconnect_failed`, `ping_failed` |
+
+#### Attachment Pipeline
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `attachment_pipeline_total` | Counter | `status`, `environment` | Attachment pipeline executions |
+| `attachment_s3_upload_seconds` | Histogram | `environment` | S3 upload latency; buckets: 0.1s – 30s |
+| `attachment_file_size_bytes` | Histogram | `environment` | File size distribution; buckets: 1KB – 100MB |
+
+---
+
+### Module-level helper functions
+
+These are the wiring points — called from middleware, routers, and workers to increment counters without importing metric objects directly.
+
+| Function | Increments | Called from |
+|---|---|---|
+| `record_agent_request(environment, status)` | `AGENT_REQUESTS_TOTAL` | `routers/message/message_router.py` |
+| `record_http_error(environment, status_code, method, path)` | `HTTP_ERRORS_TOTAL` | `middleware/logging_middleware.py` |
+| `record_worker_error(environment, error_type, message_type)` | `WORKER_ERRORS_TOTAL` | `worker/listener.py` |
+| `record_worker_message(environment, message_type, status)` | `WORKER_MESSAGES_PROCESSED` | `worker/listener.py` |
+| `record_websocket_message_sent(environment, connection_type, message_type)` | `WEBSOCKET_MESSAGES_SENT` | Socket.IO namespaces |
+| `record_websocket_message_received(environment, connection_type, message_type)` | `WEBSOCKET_MESSAGES_RECEIVED` | Socket.IO namespaces |
+| `record_http_request_by_type(environment, caller_type, method)` | `HTTP_REQUESTS_BY_TYPE` | `middleware/logging_middleware.py` |
+| `record_http_request_by_category(environment, category, latency_seconds=0)` | `HTTP_REQUESTS_BY_CATEGORY`, `HTTP_REQUEST_LATENCY_BY_CATEGORY` | `middleware/logging_middleware.py` |
+| `record_message_to_queue(environment, duration_seconds)` | `MESSAGE_TO_QUEUE_DURATION` | `routers/message/service.py` |
+| `record_message_response_latency(environment, agent_mode, latency_seconds)` | `MESSAGE_RESPONSE_LATENCY` | `worker/listener.py` |
+| `record_billing_check(environment, result)` | `BILLING_CHECKS_TOTAL` | `routers/message/message_router.py` |
+| `record_device_lock(environment, result)` | `DEVICE_LOCK_TOTAL` | Device lock logic |
+| `record_cloud_pc_state_mismatch(reason)` | `CLOUD_PC_STATE_MISMATCH_TOTAL` | Cloud PC service |
+
+---
+
+### EmailTemplates (`email_templates.py`)
+
+HTML email template renderers for: verification, password reset, welcome, inactivity, app uninstall, helpdesk notifications.
+
+---
+
+### EmailSegmentsService (`email_segments_service.py`)
+
+Batch email sending to user segments (inactive users, trial expiry reminders). Reads user lists from DB and dispatches via `EmailService`.
+
+---
+
+### HelpdeskEmailService (`helpdesk_email_service.py`)
+
+Email notifications specific to helpdesk: new ticket confirmations, reply notifications, SLA breach alerts.
+
+---
+
+### HelpDeskService (`helpdesk_service.py`)
+
+Helpdesk business logic: ticket CRUD, message threading, SLA tracking, S3 attachment management, AI auto-response.
+
+Key functions:
+```python
+async def create_ticket(db, user, title, category, priority, content) -> HelpdeskTicket
+async def add_message(db, ticket_id, sender_id, content, is_admin) -> HelpdeskMessage
+async def update_ticket(db, ticket_id, **kwargs) -> HelpdeskTicket
+async def get_attachment_download_url(db, ticket_id, attachment_id) -> str
+async def generate_ai_response(db, ticket) -> Optional[str]
+```
+
+Sends Telegram alerts for new tickets and admin replies via `_send_helpdesk_telegram_alert`.
+
+---
+
+## E2B Sandbox Services
+
+### E2BSandboxService (`e2b_sandbox_service.py`)
+
+E2B Desktop SDK wrapper. All synchronous SDK calls run via `asyncio.to_thread`.
+
+```python
+class E2BSandboxService:
+    def is_available(self) -> bool
+    async def create_sandbox(
+        user_id: UUID,
+        device_id: UUID,
+        template_id: str = "desktop",
+        resolution: Tuple[int, int] = (1920, 1080),
+        timeout: int = 3600,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]
+    def get_sandbox(sandbox_id) -> Optional[Any]
+    def get_sandbox_owner(sandbox_id) -> Optional[str]
+    def verify_sandbox_ownership(sandbox_id, user_id) -> Optional[bool]
+    def register_ownership(sandbox_id, user_id) -> None
+    def get_user_sandboxes(user_id) -> Dict[str, Any]
+    async def execute_action(sandbox_id, action) -> ActionResult
+    async def take_screenshot(sandbox_id) -> bytes
+    async def terminate_sandbox(sandbox_id) -> None
+    async def cleanup_expired() -> None
+    def get_active_sandboxes() -> Dict[str, Any]
+```
+
+**Note on `create_sandbox`:** `device_id` is required (associates the sandbox with a device row). `template_id` replaces the earlier `template` parameter name. Returns a plain `Dict[str, Any]` (not a `SandboxInfo` schema), containing `sandbox_id`, `status`, `resolution`, and connection metadata.
+
+**Supported actions in `execute_action`:** `click`, `double_click`, `right_click`, `type`, `key`, `move_mouse`, `screenshot`, `launch`, `command`, `scroll`, `get_screen_size`, `drag`, `hover`, `mouse_down`, `mouse_up`.
+
+**`cleanup_expired` health-check:** Uses `get_screen_size` action to verify sandbox responsiveness, not just expiry time.
+
+All synchronous E2B SDK calls run via `asyncio.to_thread`. Singleton via `get_e2b_service()`.
+
+---
+
+### E2BTypeHelper (`e2b_type_helper.py`)
+
+Converts action payloads from Skygen's schema to E2B SDK method calls. Type-dispatch on `action_type`.
+
+---
+
+## File Processing Services
+
+### FileParserService (`file_parser_service.py`)
+
+Multi-format file parser preserving reading order (text blocks + images interleaved by Y-coordinate).
+
+```python
+class FileParserService:
+    async def parse_pdf(file_content, filename) -> Tuple[str, int, List[dict]]
+    async def parse_docx(file_content, filename) -> Tuple[str, int, List[dict]]
+    async def parse_pptx(file_content, filename) -> Tuple[str, int, List[dict]]
+    async def parse_xlsx(file_content, filename) -> Tuple[str, int, List[dict]]
+    async def parse_csv(file_content, filename) -> Tuple[str, 0, List[dict]]
+    async def parse_image(file_content, filename) -> Tuple[str, 1, List[dict]]
+```
+
+Returns `(markdown_text, page_count, images)`. Uses PyMuPDF (fitz) for PDF, python-docx for DOCX, python-pptx for PPTX, pandas for Excel/CSV.
+
+---
+
+### ScreenshotService (`screenshot_service.py`)
+
+Screenshot storage via S3/MinIO. Bucket existence check is cached (300-second TTL) to avoid latency on hot paths.
+
+```python
+class ScreenshotService:
+    async def generate_presigned_upload_url(
+        user_id, session_id=None, task_id=None,
+        step_number=0, expires_in=300, max_size=10MB
+    ) -> dict   # {upload_url, screenshot_id, object_key, expires_at, max_size}
+
+    async def generate_presigned_get_url(
+        object_key, expires_in=300
+    ) -> Optional[str]
+
+    async def upload_screenshot_async(
+        screenshot_bytes, user_id, session_id=None,
+        task_id=None, step_number=0, content_type="image/png"
+    ) -> dict   # fire-and-forget background upload
+
+    async def upload_screenshot_streaming(
+        screenshot_bytes, user_id, session_id=None,
+        task_id=None, step_number=0, content_type="image/png"
+    ) -> dict
+```
+
+S3 key patterns: `screenshots/agent/{session_id}/step_{N:04d}_{screenshot_id}.png` (agent sessions) or `screenshots/{user_id}/{screenshot_id}.png` (user uploads).
+
+---
+
+## Analytics Services
+
+### AnalyticsService (`analytics_service.py`)
+
+Multi-provider analytics fanout (GA4 + Yandex Metrica + Amplitude). Singleton via `get_analytics_service()`.
+
+```python
+class AnalyticsService:
+    async def track_event(
+        event_name: str,
+        user_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        properties: Optional[dict] = None,
+        user_properties: Optional[dict] = None,
+        skip_ga4: bool = False,
+    ) -> bool
+
+    async def track_batch_events(events: List[dict]) -> None
+
+    async def send_ga4_batch(
+        user_id: str,
+        client_id: str,
+        events: List[dict],
+        timestamp_micros: Optional[int] = None,
+    ) -> bool
+```
+
+Internal per-provider helpers: `_send_to_ga4`, `_send_to_yandex`, `_send_to_amplitude`. Each helper is called independently — a failure in one provider never blocks others. Providers are enabled by presence of their API keys (`GA4_API_SECRET`, `YANDEX_METRICA_KEY`, `AMPLITUDE_API_KEY`).
+
+---
+
+### AnalyticsTracker (`analytics_tracker.py`)
+
+Thin wrapper used in middleware that buffers analytics calls and dispatches them as background tasks.
+
+---
+
+### InactiveUsersJob (`inactive_users_job.py`)
+
+Batch job that identifies users inactive for N days, sends re-engagement emails, and updates analytics. Invoked via `POST /analytics/admin/jobs/inactive-users`.
+
+---
+
+## Safety Services
+
+### SafetyService (`safety_service.py`)
+
+Safety policy violation logging.
+
+```python
+async def log_safety_violation(
+    db,
+    verdict: str,
+    reason: str,
+    user_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    device_id: Optional[str] = None,
+    triggered_by: Optional[str] = None,  # "agent" | "user" | "system"
+    user_input: Optional[str] = None,
+    agent_output: Optional[str] = None,
+) -> str  # returns violation_id (UUID str)
+
+async def update_violation_user_response(
+    db,
+    violation_id: str,
+    approved: bool,
+) -> bool  # True if updated, False if not found
+```
+
+**Only two public functions.** `update_violation_user_response` is the Agent ARCH-001 hibernate acknowledgment path — records the user's approve/reject decision on a pending violation. There is no `get_violations_for_user` or `get_violation_stats` — those queries are done directly in the admin router.
+
+---
+
+## Emplogent Services
+
+### EmplogentService (`emplogent_service.py`)
+
+Business logic for Emplogent Templates (AI persona templates) and Emplogents (instantiated personas).
+
+**Exceptions:** `EmplogentForbidden`, `EmplogentNotFound`, `EmplogentNameConflict`.
+
+```python
+# Templates
+async def list_templates(db, user_id) -> List[EmplogentTemplate]
+async def create_template(db, user_id, name, prompt) -> EmplogentTemplate
+async def get_template_owned(db, template_id, user_id) -> EmplogentTemplate
+async def delete_template(db, template_id, user_id) -> None
+
+# Emplogents
+async def list_emplogents(db, user_id) -> List[Emplogent]
+async def get_emplogent_owned(db, emplogent_id, user_id) -> Emplogent
+async def create_emplogent(db, user_id, name, prompt, template_id=None) -> Emplogent
+async def update_emplogent(db, emplogent_id, user_id, **kwargs) -> Emplogent
+async def delete_emplogent(db, emplogent_id, user_id) -> None
+async def spawn_from_template(db, template_id, user_id, name=None, prompt=None) -> Emplogent
+```
+
+Name uniqueness: case-insensitive + whitespace-trimmed (`uq_emplogents_user_name_ci_trim` DB index).
+
+---
+
+## Cryptography & Security Services
+
+### ConnectorsCrypto (`connectors_crypto.py`)
+
+Encryption/decryption/redaction utilities for custom connector configs and MCP token payloads. Module-level functions backed by a module-level `TokenCipher` (keyed from `s.MCP_CRYPTO_KEY`). Handles both legacy plain-dict storage and new encrypted-string storage transparently.
+
+```python
+def encrypt_config(config: Dict[str, Any]) -> str
+def decrypt_config(encrypted: Any) -> Dict[str, Any]    # accepts dict (legacy) or encrypted str
+def redact_config(config: Dict[str, Any]) -> Dict[str, Any]
+```
+
+`redact_config` masks values whose keys end with `_key`, `_secret`, `_token`, `password`, or `api_key` — shows only the last 4 characters (`****xxxx`).
+
+---
+
+## Device & Cache Services
+
+### DeviceCache (`device_cache.py`)
+
+Redis-backed device metadata cache. Reduces DB reads for the device KID lookup hot path during message processing.
+
+```python
+async def get_cached_device(device_id) -> Optional[DeviceCacheEntry]
+async def set_device_cache(device_id, device_data, ttl=300) -> None
+async def invalidate_device(device_id) -> None
+```
+
+---
+
+## Display & Transformation Services
+
+### DisplayTransformer (`display_transformer.py`)
+
+Pure transformation layer — no I/O, no async, no DB, no Redis. Maps the agent's internal wire protocol into `DisplayMessage` envelopes consumed by the frontend over WebSocket. 872 lines.
+
+**DisplayMessage envelope** (`app/schemas/display_message.py`):
+
+```python
+class DisplayMessage(BaseModel):
+    display_type: DisplayType      # see enum below
+    session_id: str
+    message_id: Optional[str]
+    timestamp: str                 # ISO 8601
+    render_data: Dict              # typed per display_type
+    is_terminal: bool = False
+    is_persistent: bool = True
+    tokens_remaining: Optional[float]
+    agent_mode: Optional[str]      # auto | cua | deep_research | mcp | swe | llm
+    notification_id: Optional[str]
+```
+
+**`DisplayType` enum values:**
+
+| Value | Persisted? | `render_data` model | When emitted |
+|---|---|---|---|
+| `user_message` | Yes | `UserMessageData` | User sends a message |
+| `assistant_message` | Yes | `AssistantMessageData` | Agent terminal response |
+| `ask_human_message` | Yes | `AskHumanMessageData` | Agent needs user input (ARCH-001) |
+| `status_update` | No | `StatusUpdateData` | Transient progress (started, thinking, planning, executing, hibernated, paused) |
+| `plan_update` | No | `PlanUpdateData` | Step list update |
+| `mode_progress` | No | `ModeProgressData` | Per-mode progress (cua, deep_research, mcp, swe, ask_human) |
+| `attachment_ready` | No | `AttachmentReadyData` | File published to S3 |
+| `billing_notice` | No | `BillingNoticeData` | Limit reached / trial expiring |
+
+**`_INTERNAL_FIELDS`** stripped from all outbound `render_data`:
+`worker_id`, `sub_agent_count`, `sleep_seconds`, `error`, `reasoning`, `condition`, `type`
+
+**Public transform methods:**
+
+```python
+class DisplayTransformer:
+    def transform_agent_response(meta_data: dict, content: str, session_id: str,
+                                  message_id: str) -> DisplayMessage
+    # communicate_kind="inform" → non-terminal ASSISTANT_MESSAGE.
+    # billing_limit detection → sets billing_limit=True on render_data.
+
+    def transform_agent_status(status: str, session_id: str,
+                                message_id: Optional[str] = None,
+                                content: Optional[str] = None) -> DisplayMessage
+    # → STATUS_UPDATE (is_persistent=False, is_terminal=False)
+
+    def transform_agent_error(meta_data: dict, content: str, session_id: str,
+                               message_id: str) -> DisplayMessage
+    # → ASSISTANT_MESSAGE with status="error" (is_terminal=True)
+
+    def transform_agent_step(meta_data: dict, session_id: str,
+                              message_id: str) -> DisplayMessage
+    # → MODE_PROGRESS (is_persistent=False)
+
+    def transform_plan_update(meta_data: dict, session_id: str,
+                               message_id: str) -> DisplayMessage
+    # → PLAN_UPDATE (is_persistent=False)
+
+    def transform_ui_meta(meta_data: dict, session_id: str,
+                           message_id: str) -> DisplayMessage
+    # Dispatch on meta_data["mode"]:
+    #   "ask_human" + stage="input" → ASK_HUMAN_MESSAGE
+    #     validates action_id as UUID; raises ValueError for non-UUID
+    #   "mcp_connect_prompt" → ASK_HUMAN_MESSAGE with McpConnectBundle
+    #   "start_cloud_pc_prompt" → ASK_HUMAN_MESSAGE with StartCloudPcPrompt
+    #   anything else → MODE_PROGRESS
+
+    def transform_attachments(attachments: list, session_id: str,
+                               message_id: str) -> DisplayMessage
+    # → ATTACHMENT_READY (is_persistent=False)
+
+    def from_stored_message(db_message: dict, session_id: str) -> Optional[DisplayMessage]
+    # Rehydrates persisted DB rows on page reload.
+    # ask_human rows → ASK_HUMAN_MESSAGE (re-validates action_id)
+    # agent_step rows → STATUS_UPDATE(status="trajectory"), is_persistent=False
+    # Returns None for rows that should not be replayed to the client.
+```
+
+---
+
+## Ask-Human State (`ask_human_state.py`)
+
+Redis state store for the agent's ask-human (ARCH-001 hibernate/wake) flow. Tracks pending confirmation requests with correlation IDs.
+
+```python
+async def store_ask_human_state(session_id, correlation_id, question, options) -> None
+async def get_ask_human_state(session_id) -> Optional[AskHumanState]
+async def resolve_ask_human_state(session_id, correlation_id, response) -> bool
+async def clear_ask_human_state(session_id) -> None
+```
+
+---
+
+## Utility Services
+
+### RunpodClient (`runpod_client.py`)
+
+Async HTTP client for RunPod Whisper transcription. Sends audio bytes, returns transcript text. Used by `POST /audio/transcribe`.
+
+---
+
+### TerminalSignalGuard (`terminal_signal_guard.py`)
+
+Installs SIGTERM/SIGINT handlers for graceful shutdown. Ensures in-flight requests complete before the process exits.
+
+---
+
+### URLValidation (`url_validation.py`)
+
+URL allow-list validation for MCP server endpoints. Prevents SSRF by enforcing domain allowlists and blocking private IP ranges.
+
+---
+
+### ZapierGmail (`zapier_gmail.py`)
+
+Legacy Zapier + Gmail webhook handler for automated email workflows. Receives Zapier triggers and dispatches them to the agent as task events.
+

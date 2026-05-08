@@ -1,153 +1,371 @@
 ---
-title: "State management"
-description: "Zustand slice pattern — 10 slices composed into one store, with hydration, selectors, and persistence rules."
+title: "State Management"
+description: "Zustand store architecture — 11 slices, composition pattern, cross-slice calls, and how WebSocket events drive state updates."
 ---
 
-Skygen uses **Zustand** with a **slice pattern**. Each domain gets its own `createXSlice()` that returns partial state + actions. All slices compose into one `useStore()` hook.
+# State Management
 
-## Store composition
+The frontend uses a single **Zustand** store composed of 11 domain slices. All slices are merged at creation time; every component accesses the same store via `useStore()`.
 
-**`ui-shared-tauri/src/store/useStore.ts`**:
+---
+
+## Store Composition
 
 ```typescript
-export type Store = AuthSlice & SessionSlice & MessageSlice & DeviceSlice
-  & BillingSlice & UISlice & NotificationsSlice & HelpdeskSlice
-  & CloudPcSlice & ScheduledTasksSlice;
-
+// store/useStore.ts
 export const useStore = create<Store>()(
   devtools(
     (...a) => ({
       ...createAuthSlice(...a),
       ...createSessionSlice(...a),
       ...createMessageSlice(...a),
-      // 7 more slices...
+      ...createLiveStateSlice(...a),
+      ...createDeviceSlice(...a),
+      ...createBillingSlice(...a),
+      ...createUISlice(...a),
+      ...createNotificationsSlice(...a),
+      ...createHelpdeskSlice(...a),
+      ...createCloudPcSlice(...a),
+      ...createScheduledTasksSlice(...a),
     }),
-    { name: "SkygenStore" },
-  ),
+    { name: 'SkygenStore' }
+  )
 );
 ```
 
-Each slice is a `StateCreator`: `(set, get) => ({ state, actions })`. Order in composition matters for slices that read each other at init time.
+`devtools` middleware is always active — the store is inspectable in Redux DevTools under the name `SkygenStore`.
 
-## The 10 slices
-
-### AuthSlice — `store/slices/authSlice.ts`
-
-State: `user`, `isAuthenticated`, `isLoading`, `needsOTPSetup`, `_isLoggingOut`.
-
-Actions: `login(email, password)`, `signup(...)`, `logout()`, `refreshUser()`, `restoreSession()`.
-
-**Startup hydration**: `isAuthenticated` is initialized by a synchronous read of `auth_token` in storage, so the UI doesn't flash to `/login` before session restore completes.
-
-### SessionSlice — `store/slices/sessionSlice.ts`
-
-State: `sessions`, `currentSessionId`, `isCreatingSession`, `sessionTitle`.
-
-Actions: `loadSessions()`, `createSession(deviceId?, title)`, `setCurrentSession(id)`, `deleteSession(id)`.
-
-### MessageSlice — `store/slices/messageSlice.ts` (800+ lines, biggest)
-
-State keyed by `sessionId`:
-
-```typescript
-messagesBySession: Record<string, Message[]>
-typingBySession: Record<string, boolean>
-taskStatusBySession: Record<string, TaskStatus>
-agentStepsBySession: Record<string, AgentStep[]>
-planBySession: Record<string, PlanPayload | null>
-uiMetaBySession: Record<string, UiMetaUpdatePayload>
-mcpConnectPromptBySession: Record<string, McpConnectPromptData>
-_sendingSessionIds: Set<string>
-```
-
-Actions: `loadMessages(sessionId)`, `sendMessage(...)`, `cancelTask(...)`, `addAgentStep(...)`, `setPlan(...)`, `setUiMeta(...)`.
-
-**Why keyed by sessionId?** Users open multiple tabs/windows with different sessions. Reading `messagesBySession[currentSessionId]` is cheaper than filtering a global list.
-
-### DeviceSlice — `store/slices/deviceSlice.ts`
-
-State: `devices`, `selectedDeviceId`, `isLoadingDevices`.
-Actions: `loadDevices()`, `setSelectedDevice(id)`.
-
-### BillingSlice — `store/slices/billingSlice.ts`
-
-State: `plan`, `upcomingInvoice`, `paymentMethods`, `isLoadingBilling`, `paywallTrigger`.
-Actions: `loadBillingInfo()`, `createPaymentIntent(planId)`, `setPaywallTrigger(...)`.
-
-`paywallTrigger: 'login' | 'signup' | 'limit_reached' | null` signals `MainLayout` to render `PaywallModal`.
-
-### UISlice — `store/slices/uiSlice.ts`
-
-State: `theme`, `sidebarOpen`, `sidebarCollapsed`, `selectedConnector`, `showAudioSettings`.
-Actions: `setTheme(theme)`, `setSidebarOpen(open)`.
-
-### NotificationsSlice — `store/slices/notificationsSlice.ts`
-
-State: `notifications` (toasts), `unreadCount` (bell icon).
-Actions: `addNotification(...)`, `removeNotification(id)`, `loadUnreadNotifications()`.
-
-### HelpdeskSlice — `store/slices/helpdeskSlice.ts`
-
-State: `tickets`, `currentTicketId`, `isLoadingTickets`.
-Actions: `loadTickets()`, `createTicket(...)`, `replyToTicket(...)`.
-
-Real-time: Socket.IO `ticket_created` and `ticket_reply` events update the list and thread live.
-
-### CloudPcSlice — `store/slices/cloudPcSlice.ts` (1000+ lines)
-
-State: `cloudPCs`, `displayStatus`, `controllers`.
-Actions: `startCloudPc(id)`, `stopCloudPc(id)`, `mapToDisplayStatus(internal)`.
-
-### ScheduledTasksSlice — `store/slices/scheduledTasksSlice.ts`
-
-State: `tasks`, `isLoadingScheduledTasks`.
-Actions: `loadScheduledTasks()`, `createScheduledTask(config)`, `deleteScheduledTask(id)`.
-
-## Persistence strategy
-
-**Persisted** (via `IPlatformAdapter.storage`):
-- `auth_token`
-- `refresh_token`
-
-**Not persisted**: everything else. Sessions, messages, devices, billing are **rebuilt from API** on every app load.
-
-The backend is the truth. Local state is a cache. Reload = refresh.
-
-## Selectors
-
-Zustand re-renders any component subscribed to state that changed. Don't subscribe to the whole store — slice what you need.
-
-Good:
-
-```typescript
-const { messages, isTyping, sendMessage } = useStore((s) => ({
-  messages: s.messagesBySession[sessionId] || [],
-  isTyping: s.typingBySession[sessionId] || false,
-  sendMessage: s.sendMessage,
-}));
-```
-
-Bad (re-renders on every store change):
-
-```typescript
-const store = useStore();  // Don't do this
-```
-
-## DevTools
-
-Zustand is wired to the Redux DevTools extension. Open browser DevTools → "Redux" tab to time-travel debug, see action names, diff state.
-
-## Gotchas
+Each slice is a `StateCreator` function that receives `(set, get)` and returns its initial state + actions. Slices that need to call actions from other slices cast `get()` to the combined `FullStore` type.
 
 <Warning>
-**Token refresh is not in AuthSlice.** If an access token expires mid-session, auth actions do not auto-refresh. The HTTP client catches 401s and triggers refresh. AuthSlice only runs on explicit login/logout.
+Two dead slice files exist in `store/slices/` but are **not** registered in `useStore.ts`: `messageStreamSlice.ts` and `messagePlanSlice.ts`. Their functionality was merged into `liveStateSlice.ts`. Do not import from these files.
 </Warning>
 
-<Note>
-**Slice composition order matters.** If a slice reads another slice's state at init time, the declaring order in `useStore` determines what's available. Keep initializations side-effect-free if possible.
-</Note>
+---
 
-## See also
+## Slice Reference
 
-- [API client](/webapp/api-client) — where store actions call the backend
-- [Pages](/webapp/pages) — which components read which slices
+### authSlice (`store/slices/authSlice.ts`)
+
+**State:**
+```typescript
+user: User | null
+isLoading: boolean
+isAuthenticated: boolean        // Optimistically true if auth_token in localStorage
+needsOTPSetup: boolean
+_isLoggingOut: boolean          // Guards restoreSession() against concurrent logout
+```
+
+**Key actions:**
+
+| Action | Description |
+|---|---|
+| `login(email, password)` | POST /auth/token → sets user, connects wsClient + device WS |
+| `signup(email, password, displayName?, meta?)` | POST /auth/register → atomic login |
+| `logout()` | Disconnects wsClient, POSTs /auth/logout, resets all user state across all slices |
+| `restoreSession()` | Called on app mount. Upgrades legacy token to cookie, then GET /users/me. Reconnects wsClient. |
+| `refreshUser()` | Re-fetches /users/me. Called when user profile may be stale. |
+
+<Warning>
+`logout()` spreads `...initialCloudPcState` to reset the Cloud PC slice. Any new per-user fields added to any slice must also be reset in `logout()` — otherwise state leaks across user sessions.
+</Warning>
+
+**Token check at module load time:**
+```typescript
+// Sync check before React renders — prevents login flash on reload
+const tokenExists = hasAuthToken(); // reads localStorage.getItem('auth_token')
+// isAuthenticated is initialized to tokenExists (not false)
+```
+
+---
+
+### sessionSlice (`store/slices/sessionSlice.ts`)
+
+**State:**
+```typescript
+sessions: Session[]
+activeSessionId: string | null
+isSessionsLoading: boolean
+sessionsLoaded: boolean         // Idempotency guard — prevents duplicate loads
+```
+
+**Key actions:**
+
+| Action | Description |
+|---|---|
+| `loadSessions()` | GET /sessions — skips if `sessionsLoaded || isSessionsLoading` |
+| `reloadSessions()` | Force-resets `sessionsLoaded`, then loads |
+| `createSession(deviceId, title)` | POST /sessions — prepends to list, sets active |
+| `deleteSession(sessionId)` | DELETE /sessions/{id} — removes from list, clears active if needed |
+| `updateSession(sessionId, updates)` | Optimistic update + PATCH /sessions/{id}. Reverts on failure. |
+| `getActiveSession()` | Derived getter — finds session by `activeSessionId` |
+
+---
+
+### messageSlice (`store/slices/messageSlice.ts`)
+
+**State:**
+```typescript
+messagesBySession: Record<string, Message[]>   // Per-session message arrays
+isLoadingMessages: boolean
+_sendingSessionIds: Set<string>                // In-flight guard per session
+```
+
+**Key actions:**
+
+#### `loadMessages(sessionId)`
+- Race-safe via per-session monotonic counter — newer calls supersede older ones
+- Merges server messages with local-only messages (ask_human prompts not yet persisted, pending optimistic messages)
+- Preserves `display_type` and `render_data` from store when server omits them
+- After loading: fetches plan via `sessionApi.getPlan()` unless task is active
+- Clears live plan/steps if the session has a frozen terminal plan (page reload after task completion)
+
+#### `sendMessage(sessionId, content, ...)`
+- Guards double-submission via `_sendingSessionIds`
+- Creates an optimistic `temp-{timestamp}` message immediately
+- On success: replaces the temp message with the real server message
+- On payment_required + free_limit_reached: injects a `billing_notification` system message and triggers paywall
+- Pushes GTM events: `task_created`, `message_sent`
+
+#### `addMessage(sessionId, message)`
+Deduplication logic (in order):
+1. Skip if `message.id` already in session messages
+2. Skip recent assistant duplicates by content (within 60s window)
+3. Replace matching `temp-{id}` user message (preserves `files` metadata)
+4. Replace optimistic `cancelled-` assistant message with real response
+
+#### `cancelTask(sessionId, deviceId?, reason?)`
+- POST /agent/task/cancel
+- Finalizes live state (typing, task status, agent steps, uiMeta)
+- Clears `waiting_for_input` on the session
+- Inserts an optimistic "Task was cancelled" assistant message
+
+---
+
+### liveStateSlice (`store/slices/liveStateSlice.ts`)
+
+Manages all ephemeral real-time state that is driven by WebSocket events and does not persist across page reloads.
+
+**State:**
+```typescript
+typingBySession: Record<string, boolean>
+taskStatusBySession: Record<string, TaskStatus>
+taskStartedAtBySession: Record<string, number>     // epoch ms, for elapsed timer
+uiMetaBySession: Record<string, UiMetaUpdatePayload | null>
+agentStepsBySession: Record<string, AgentStep[]>
+agentStepsByPlanStep: Record<string, Record<string, AgentStep[]>>  // indexed for fast lookup
+planBySession: Record<string, PlanPayload | null>
+frozenPlanByMessageId: Record<string, FrozenPlanSnapshot>  // snapshots at task completion
+```
+
+**Session seal concept:**
+
+A session is "sealed" when `taskStatus.isActive === false` AND the status is a terminal value (`completed`, `error`, `cancelled`, `paused`, `stopped`, `idle`, `done`, `finished`). Sealed sessions reject stale in-flight WebSocket events that arrive after the task ended.
+
+```typescript
+// Check before setting typing/status from WS events
+if (sealed(sessionId)) return;  // Drop stale event
+```
+
+**`setTaskStatus(sessionId, status)`:**
+- Auto-manages `taskStartedAtBySession` on `isActive` transitions
+- Starting a task: sets `taskStartedAtBySession[sid] = Date.now()` (if not already set)
+- Stopping a task: deletes `taskStartedAtBySession[sid]`
+
+**`addAgentStep(sessionId, payload, timestamp)`:**
+- Step deduplication via `step_id` field (in-place update)
+- Legacy MCP dedup by `(tool, status)` pair
+- Auto-correlates steps to plan steps via `plan_step_id` or nearest active plan step
+
+**`freezePlanForMessage(sessionId, messageId)`:**
+Captures a snapshot of `{ plan, agentSteps, agentStepsByPlanStep }` and stores it in `frozenPlanByMessageId[messageId]`. Called when a task terminal event arrives. The frozen snapshot is rendered inline on the assistant message bubble, while the live plan/steps are cleared.
+
+---
+
+### deviceSlice (`store/slices/deviceSlice.ts`)
+
+**State:**
+```typescript
+devices: Device[]
+selectedDeviceId: string | null
+isDevicesLoading: boolean
+devicesLoaded: boolean
+```
+
+**`updateDeviceStatus(deviceId, status)`:**
+If the device is unknown (registered from another client), resets `devicesLoaded` and triggers `loadDevices()` to re-fetch the full list.
+
+---
+
+### billingSlice (`store/slices/billingSlice.ts`)
+
+**State:**
+```typescript
+status: BillingStatus | null
+pricing: PricingInfo | null
+plans: Plan[]
+isStatusLoading / isPricingLoading / isPlansLoading: boolean
+onboardingDone: boolean        // Persisted in platform.storage
+```
+
+Plans are sorted by `sort_order` then `price_usd` after loading.
+
+**`canAccess()`** — Derived getter: `status?.can_access ?? false`. Used to gate message sending.
+
+**Paywall trigger flow:**
+1. `authSlice.login()` → `setPaywallTrigger('login')`
+2. `MainLayout` evaluates when billing status loads
+3. `openPaywall(reason)` → `showPaywall = true` in `uiSlice`
+
+---
+
+### cloudPcSlice (`store/slices/cloudPcSlice.ts`)
+
+Manages per-session Cloud PC bindings. Each session can be bound to one Cloud PC; the same user can have multiple sessions with different Cloud PCs.
+
+**State:**
+```typescript
+cloudPcBySession: Record<string, PerSessionCloudPcState>
+// Each entry: { cloudPcId, streamUrl, streamAuthKey, sandboxId, linkedDeviceId, status, controller, viewMode }
+
+// Backward-compatible flat getters (computed from active session's entry):
+cloudPCStatus: CloudPCStatus
+activeCloudPcId: string | null
+streamUrl: string | null
+// ...
+```
+
+**Heartbeat + control renewal** are managed by `store/cloudPcHeartbeat.ts` — external timers that call Cloud PC API endpoints. All timers are stopped by `stopAllCloudPcSideEffects()` on logout.
+
+**`mapToDisplayStatus(status, isPro, isCurrentSession)`:**
+Converts `CloudPCStatus` to `CloudDesktopDisplayStatus` for the UI. `pausing` is treated as `available` because the backend `connect()` handles stale PAUSING states.
+
+---
+
+### uiSlice (`store/slices/uiSlice.ts`)
+
+Manages UI state that doesn't belong to any domain slice.
+
+**State:**
+```typescript
+theme: 'light' | 'dark'         // Persisted in localStorage
+sidebarOpen: boolean             // Persisted in localStorage (sync read on init)
+activeModal: string | null
+confirmations: ConfirmationRequest[]
+processingConfirmationId: string | null
+showPaywall: boolean
+paywallReason: 'post_registration' | 'post_login' | 'tokens_exhausted' | null
+paywallTrigger: 'login' | 'signup' | null
+pendingVoiceTranscriptions: Record<string, string>
+chooseDeviceRequested: boolean
+chooseDeviceExpandOnSelect: boolean
+```
+
+**`addConfirmation(confirmation)` / `removeConfirmation(id)`:**
+Manages the queue of pending agent confirmation requests surfaced in the confirmation modal.
+
+---
+
+## Cross-Slice Calls
+
+Slices that need to invoke another slice's actions cast `get()` to the combined type:
+
+```typescript
+// In messageSlice:
+const store = get() as unknown as FullMessageStore;
+store.setTyping(sessionId, true);        // liveStateSlice
+store.setTaskStatus(sessionId, {...});   // liveStateSlice
+store.clearAgentSteps(sessionId);        // liveStateSlice
+store.openPaywall('tokens_exhausted');   // uiSlice (indirect)
+```
+
+The `FullMessageStore` intersection type is defined locally in the slice file to avoid circular imports.
+
+---
+
+## WebSocket → Store Data Flow
+
+```
+Socket.IO event
+    │
+    ▼
+wsClient.on('<event>', handler)       // api/websocket/wsClient.ts
+    │  (internal pub/sub, singleton)
+    ▼
+useChatWebSocket hook handlers        // hooks/useChatWebSocket.ts
+    │  reads useStore.getState() to avoid stale closures
+    ▼
+Store action (e.g. addMessage, setTaskStatus)
+    │
+    ▼
+Zustand state update → React re-render
+```
+
+<Info>
+WebSocket handlers use `useStore.getState()` instead of closed-over state values. This pattern avoids the React stale closure problem — the handler always reads the current store state at the time of the event, not the state captured when the `useEffect` ran.
+</Info>
+
+---
+
+## Loading Sequences
+
+### App startup (after bootstrap)
+
+```
+App mounts → ProtectedRoute checks isAuthenticated
+  │
+  ├─ true  → MainLayout mounts
+  │            │
+  │            └─ useMainLayoutInit()
+  │                 loadSessions()
+  │                 loadDevices()
+  │                 billingSlice.loadStatus()
+  │                 notificationsSlice.load()
+  │
+  └─ false → authSlice.restoreSession() (App-level effect)
+               authApi.upgradeSession()     ← cookie migration
+               authApi.getCurrentUser()
+               wsClient.connect(userId, token)
+               platform.desktop?.startDeviceWebSocket()
+```
+
+### Chat session load
+
+```
+setActiveSession(sessionId)
+    │
+    └─ useEffect in ChatPage
+         messageSlice.loadMessages(sessionId)
+           │
+           ├─ sessionApi.getMessages(sessionId)
+           ├─ sessionApi.getPlan(sessionId)
+           └─ Clears stale live plan if terminal frozen plan found
+```
+
+---
+
+## Patterns and Pitfalls
+
+<AccordionGroup>
+  <Accordion title="Idempotency guards">
+    `loadSessions()` and `loadDevices()` check `sessionsLoaded || isSessionsLoading` before making a network call. This prevents duplicate fetches when multiple components mount simultaneously. Use `reloadSessions()` to force a refresh.
+  </Accordion>
+
+  <Accordion title="Optimistic updates">
+    `sendMessage()` adds a `temp-{timestamp}` message to the store immediately, then replaces it with the real server response. If the send fails, the temp message is updated with `status: 'error'`.
+
+    `updateSession()` applies changes locally before the PATCH request. If the request fails, it reloads the full session list to revert.
+  </Accordion>
+
+  <Accordion title="Session-sealed guard">
+    Before updating `typingBySession` or `taskStatusBySession` from a WebSocket event, the hook checks `isSessionSealed()`. Sealed sessions are in a terminal state — stale late-arriving events are dropped. The seal is broken when `sendMessage()` sets `isActive: true` for the next user message.
+  </Accordion>
+
+  <Accordion title="Plan deduplication">
+    `setPlan()` rejects payloads with a lower `plan_version` than the currently stored plan. This prevents stale plan snapshots from overwriting live updates during reconnects.
+  </Accordion>
+
+  <Accordion title="Message deduplication">
+    `addMessage()` runs three dedup checks: by `id`, by `(role, content, timestamp)` for recent assistant messages, and temp-message replacement by `(role, content)`. The `new_message` WS event also checks `displayHandledIdsRef` to skip messages already handled by `display_message`.
+  </Accordion>
+</AccordionGroup>

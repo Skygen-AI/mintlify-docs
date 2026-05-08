@@ -1,0 +1,319 @@
+---
+title: "LLM Routing Reference"
+description: "ModelRouter selection algorithm, RoutingParams, ModelRouteDecision, ModelCatalog, BaseProvider, and provider configuration."
+---
+
+# LLM Routing
+
+The LLM routing layer (`Agent/Utilities/ModelRouter.py` and `Agent/Utilities/LLM_Providers/`) selects the best available model for each LLM call and provides a uniform async HTTP interface to all supported providers.
+
+---
+
+## ModelRouter
+
+**File:** `Agent/Utilities/ModelRouter.py`
+
+`ModelRouter` is a singleton. The module-level function `choose_model_route()` is the public interface used by `LLMManager`.
+
+### `choose_model_route()`
+
+```python
+def choose_model_route(
+    payload: dict,
+    routing_params: RoutingParams,
+    config: AgentConfig,
+    agent_name: str = "",
+) -> ModelRouteDecision
+```
+
+Shim over the singleton `ModelRouter` instance. Equivalent to `ModelRouter.Choose(payload, routing_params, config, agent_name)`.
+
+### `ModelRouter.Choose()`
+
+```python
+def Choose(
+    self,
+    payload: dict,
+    routing_params: RoutingParams,
+    config: object,
+    agent_name: str = "",
+) -> ModelRouteDecision
+```
+
+`Choose()` is an **instance method**, not a classmethod. The module-level `choose_model_route()` function calls it on a singleton instance.
+
+Selection algorithm:
+
+1. If `routing_params["force_model"]` or `payload["model"]` is set, return that model immediately (`_ForcedDecision`).
+2. Estimate context size from `payload["messages"]` (4 characters per token).
+3. Build candidate order by evaluating heuristics:
+   - `long_context` — fires if `context_tokens > 200_000` OR `routing_params["requires_long_context"]` is `True`. Appends `_LongContextStrategy` candidates.
+   - `prefer_economy` — fires if `routing_params["priority"] in {"low", "batch"}`. Appends `_EconomyStrategy` candidates.
+   - `heavy_reasoning` — fires if `routing_params["requires_heavy_reasoning"]` is `True` OR `routing_params["complexity"] == "high"`. Appends `_HeavyReasoningStrategy` candidates.
+   - Config models (`config.cua_orchestrator_model`, `config.default_model`) always lead the candidate list.
+   - `_COMMON_FALLBACK_CANDIDATES` are appended last.
+4. Iterate candidates. For each, apply hard filters: skip if in `skip_models`, skip if `requires_vision` and model does not support vision, skip if provider circuit breaker is open, skip if `context_tokens > model.max_context_tokens`.
+5. Additionally skip premium-tier models when `stats["premium_calls"] >= MODEL_ROUTER_PREMIUM_LIMIT` and `heavy_reasoning` is not required.
+6. Return the first candidate that passes all filters as `ModelRouteDecision`.
+7. If no candidate passes, fall back to an exhaustive scan of the full catalog before raising `RuntimeError`.
+
+### `RoutingParams`
+
+```python
+class RoutingParams(TypedDict, total=False):
+    force_model: str                    # Skip all selection logic; use this model
+    requires_vision: bool               # Must support image inputs
+    requires_long_context: bool         # Context > 200K tokens
+    requires_heavy_reasoning: bool      # Complex multi-step reasoning
+    complexity: Literal["low", "medium", "high"]
+    priority: Literal["speed", "quality", "cost"]
+    skip_models: list[str]              # Circuit-broken models to exclude
+    session_id: str
+    user_id: str
+    _route_stats: dict                  # Internal; premium call counter per session
+```
+
+### `ModelRouteDecision`
+
+```python
+@dataclass
+class ModelRouteDecision:
+    model: str          # Full model name, e.g. "google/gemini-2.5-flash"
+    provider: str       # Provider key, e.g. "gemini", "openrouter", "groq", "cerebras"
+    reason: str         # Human-readable explanation logged at DEBUG level
+    context_tokens: int # Estimated context size used in selection
+    tier: str           # "premium", "balanced", or "economy"
+```
+
+### Candidate Strategies
+
+| Strategy | Trigger | Candidate models |
+|---|---|---|
+| `_LongContextStrategy` | `context_tokens > 200_000` OR `requires_long_context=True` | `claude-sonnet-4.6:nitro`, `gemini-2.5-flash`, `qwen3-vl-235b-thinking`, `gemini-2.5-flash-lite` |
+| `_HeavyReasoningStrategy` | `requires_heavy_reasoning=True` OR `complexity="high"` | `claude-sonnet-4.6:nitro`, `qwen3-vl-235b-thinking`, `groq/gpt-oss-120b`, `qwen-3-235b-2507`, `qwen3-vl-235b-instruct` |
+| `_EconomyStrategy` | `priority in {"low", "batch"}` | `gemini-2.5-flash-lite`, `groq/qwen-3-32b`, `gemini-2.5-flash` |
+
+Multiple strategies can be relevant simultaneously; only one fires (priority: `long_context` > `prefer_economy` > `heavy_reasoning`). Config models (`cua_orchestrator_model`, `default_model`) always precede strategy candidates.
+
+### Fallback Candidates
+
+```python
+_COMMON_FALLBACK_CANDIDATES = [
+    "qwen/qwen3-vl-235b-a22b-instruct",
+    "google/gemini-2.5-flash",
+    "google/gemini-2.5-flash-lite",
+    "groq/qwen-3-32b",
+]
+```
+
+Fallbacks are tried in order. The first model not in `skip_models` and registered in `ModelCatalog` is used.
+
+### `MODEL_ROUTER_PREMIUM_LIMIT`
+
+Environment variable. Default: `3`. Maximum number of premium-tier LLM calls per session before the router demotes to balanced/economy. Prevents cost overruns when a task spawns many sub-agents that all trigger heavy-reasoning routing.
+
+---
+
+## ModelCatalog
+
+**File:** `Agent/Utilities/LLM_Providers/ModelRegistry.py`
+
+`ModelCatalog` is a global registry of available models. Models are registered at import time via `ModelCatalog.Register()`.
+
+### `ModelDescriptor`
+
+```python
+@dataclass
+class ModelDescriptor:
+    name: str                   # Full model identifier used in API calls
+    provider: str               # Provider key for BaseProvider lookup
+    max_context_tokens: int     # Maximum context window in tokens
+    tier: str                   # "premium", "balanced", or "economy"
+    supports_vision: bool       # Accepts image_url content blocks
+```
+
+### `ModelCatalog` API
+
+```python
+ModelCatalog.Register(descriptor: ModelDescriptor) -> None
+```
+```python
+ModelCatalog.Get(name: str) -> Optional[ModelDescriptor]
+```
+```python
+ModelCatalog.Names() -> list[str]
+```
+```python
+ModelCatalog.MaxContextTokens(name: str) -> int
+```
+```python
+ModelCatalog.SupportsVision(name: str) -> bool
+```
+```python
+ModelCatalog.AsDict() -> dict[str, ModelDescriptor]
+```
+
+### Built-in Models
+
+| Model | Provider | Context | Tier | Vision |
+|---|---|---|---|---|
+| `anthropic/claude-sonnet-4.6:nitro` | `openrouter` | 1,000,000 | premium | Yes |
+| `google/gemini-2.5-flash` | `gemini` | 1,048,576 | balanced | Yes |
+| `google/gemini-3-flash-preview` | `gemini` | 1,048,576 | balanced | Yes |
+| `google/gemini-2.5-flash-lite` | `gemini` | 1,048,576 | economy | Yes |
+| `groq/qwen-3-32b` | `groq` | 131,072 | economy | No |
+| `groq/gpt-oss-120b` | `groq` | 131,072 | premium | No |
+| `qwen-3-235b-a22b-instruct-2507` | `cerebras` | 131,072 | premium | No |
+| `llama-3.3-70b` | `cerebras` | 65,536 | balanced | No |
+| `qwen/qwen3-vl-235b-a22b-thinking` | `openrouter` | 262,144 | premium | Yes |
+| `qwen/qwen3-vl-235b-a22b-instruct` | `openrouter` | 262,144 | balanced | Yes |
+
+Source: `Agent/Utilities/LLM_Providers/ModelRegistry.py` — `BuildDefaultCatalog()`.
+
+---
+
+## Model Profiles
+
+**File:** `Agent/model_profiles.yaml`
+
+A YAML file that maps a profile name to a set of model assignments and per-specialist settings. The active profile is selected by the `MODEL_PROFILE` environment variable (default: `"default"`).
+
+```yaml
+# Excerpt — actual file may differ
+default:
+  models:
+    default_model: google/gemini-2.5-flash
+    cua_orchestrator_model: qwen/qwen3-vl-235b-a22b-instruct
+    safety_light_classifier_model: google/gemini-2.5-flash-lite
+    safety_heavy_classifier_model: anthropic/claude-sonnet-4.6:nitro
+    evaluation_model: google/gemini-2.5-flash
+    vlm_model: qwen/qwen3-vl-235b-a22b-instruct
+    grounding_strategy: qwen_computer_use
+    data_siphon_model: google/gemini-2.5-flash-lite
+
+  specialist_agent_settings:
+    mcp_tools_agent:
+      max_iter: 30
+      model: google/gemini-2.5-flash
+      model_low: google/gemini-2.5-flash-lite
+    data_fetcher:
+      max_iter: 20
+      model: google/gemini-2.5-flash
+    software_engineer:
+      max_iter: 50
+      model: anthropic/claude-sonnet-4.6:nitro
+    cua_orchestrator:
+      max_iter: 100
+      model: qwen/qwen3-vl-235b-a22b-instruct
+
+  digital_worker:
+    boost_intellect_steps: 3
+    boost_intellect_cooldown_steps: 15
+    boost_intellect_model: anthropic/claude-sonnet-4.6:nitro
+    worker_model_low: google/gemini-2.5-flash-lite
+```
+
+Adding a new deployment profile requires only a new top-level YAML key — no code changes.
+
+---
+
+## BaseProvider
+
+**File:** `Agent/Utilities/LLM_Providers/Base.py`
+
+Abstract base class for all LLM provider implementations.
+
+### Abstract Interface
+
+```python
+class BaseProvider(ABC):
+    @property
+    @abstractmethod
+    def api_key_env_var(self) -> str:
+        """Name of the environment variable containing the API key."""
+
+    @abstractmethod
+    def _create_client(self) -> httpx.AsyncClient:
+        """Build and return a configured async HTTP client."""
+
+    @abstractmethod
+    async def prepare_payload(
+        self,
+        payload: dict,
+        model: str,
+        **kwargs,
+    ) -> dict:
+        """Transform the canonical payload dict into the provider-specific request body."""
+
+    @abstractmethod
+    async def execute_request(
+        self,
+        client: httpx.AsyncClient,
+        payload: dict,
+        **kwargs,
+    ) -> dict:
+        """Send the HTTP request and return the raw provider response dict."""
+```
+
+### Concrete Methods
+
+```python
+def parse_response(self, response: dict) -> tuple[str, dict]:
+    """
+    Extract (response_text, meta) from the provider response.
+    Default implementation is a passthrough; override for provider-specific shapes.
+    meta must contain: model, input_tokens, output_tokens,
+    cache_read_input_tokens, cache_creation_input_tokens.
+    """
+
+def get_client(self) -> httpx.AsyncClient:
+    """Return cached async client; create on first call."""
+
+async def close(self) -> None:
+    """Close the async HTTP client."""
+```
+
+### Provider Implementations
+
+`ProviderFactory` (`Agent/Utilities/LLM_Providers/ProviderFactory.py`) maintains a registry of provider implementations. Three providers are registered by default:
+
+| Registry key | Implementation | Matcher | Notes |
+|---|---|---|---|
+| `cerebras` | `CerebrasProvider` | Model name in `{"llama-3.3-70b", "qwen-3-235b-a22b-instruct-2507"}` | Cerebras Inference API |
+| `openrouter` | `OpenAICompatibleProvider` | Model starts with `google/gemini` or contains `"gemini"` | Used for Gemini models routed via OpenRouter |
+| `groq` | `OpenAICompatibleProvider` | Model starts with `groq/` | Groq Cloud API; low-latency inference |
+
+**Important:** Despite the `ModelCatalog` listing Gemini models with provider key `"gemini"`, the `ProviderFactory` routes them through **OpenRouter** (not a direct Google API). There is no standalone `GeminiProvider` or `AnthropicProvider` in the registry. All `anthropic/` and unmatched models fall back to OpenRouter. For unregistered models, `InferProvider()` infers the provider from the model name prefix and returns `"openrouter"` as the final fallback.
+
+---
+
+## `AgentConfig` — LLM-Related Fields
+
+The following fields in `AgentConfig` directly affect LLM routing and execution. All are set by `from_env()` from environment variables and/or the active model profile.
+
+| Field | Env var | Default | Purpose |
+|---|---|---|---|
+| `default_model` | — | From profile | Model used when no routing strategy fires |
+| `cua_orchestrator_model` | — | From profile | VLM for GUI automation |
+| `vlm_model` | — | From profile | Vision model for screenshot analysis |
+| `default_max_tokens` | `DEFAULT_MAX_TOKENS` | `12000` | Per-call `max_tokens` |
+| `max_context_tokens` | `MAX_CONTEXT_TOKENS` | `300000` | Context window cap for compression decisions |
+| `compress_tool_outputs_over_tokens` | `COMPRESS_TOOL_OUTPUTS_OVER_TOKENS` | `150000` | Single output above this is compressed |
+| `compress_tool_outputs_keep_last` | `COMPRESS_TOOL_OUTPUTS_KEEP_LAST` | `10` | Verbatim outputs preserved during compression |
+| `forced_summarization_pct` | `FORCED_SUMMARIZATION_PCT` | `0.90` | Context ratio that triggers forced summarization |
+| `default_temperature` | `DEFAULT_TEMPERATURE` | `0.1` | LLM temperature |
+| `boost_intellect_model` | — | `anthropic/claude-sonnet-4.6:nitro` | Model for PlannerAgent intellect boost steps |
+| `worker_model_low` | — | `google/gemini-3.1-flash-lite-preview:nitro` | Economy model for `intellect="low"` sub-agents |
+| `reasoning_overlap_embedding_model` | — | `perplexity/pplx-embed-v1-0.6b` | Embedding model for `ReasoningOverlapAlertRule` |
+
+### Token Budget Fields (Digital Worker Platform)
+
+| Field | Default | Purpose |
+|---|---|---|
+| `token_budget_soft_pct` | `0.50` | Triggers `TokenBudgetAlertRule` soft warning at 50% context |
+| `token_budget_hard_pct` | `0.75` | Triggers hard warning at 75%; agent is told to escalate |
+| `forced_summarization_pct` | `0.90` | Hard compression kicks in at 90% |
+| `boost_intellect_steps` | `3` | Steps per boost window |
+| `boost_intellect_cooldown_steps` | `15` | Steps before next boost is allowed |
+| `reasoning_overlap_threshold` | `0.95` | Cosine similarity threshold for loop detection |
+| `reasoning_overlap_window` | `5` | Rolling window for embedding comparison |

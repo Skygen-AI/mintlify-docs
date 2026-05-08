@@ -1,103 +1,162 @@
 ---
-title: "Audio transcription"
-description: "Upload an audio clip, get text back — Whisper via RunPod with per-second cost tracking."
+title: "Audio Transcription"
+description: "How to transcribe audio files to text using Skygen's RunPod Faster Whisper integration."
 ---
 
-Skygen's audio service transcribes short audio clips using **Faster Whisper** hosted on RunPod. Upload an audio file, get the transcript, detected language, and cost. One endpoint, one response, no streaming.
+## Overview
 
-## Endpoint
+Skygen provides audio-to-text transcription backed by RunPod Faster Whisper. Users upload an audio file and receive a full transcript with detected language, processing time, and cost. Transcriptions are persisted and can be associated with chat sessions for voice-driven agent workflows.
 
-### `POST /audio/transcribe`
+---
 
-Multipart form-data request.
+## Supported formats
 
-| Field | Type | Required | Purpose |
-|-------|------|----------|---------|
-| `file` | file | yes | Audio file |
-| `session_id` | string | no | Link to a chat session (context) |
-| `language` | string | no | ISO 639-1 hint (e.g. `en`, `es`) |
-| `model` | string | no | Whisper model override (default `WHISPER_MODEL`) |
+| MIME type | Extension | Notes |
+|-----------|-----------|-------|
+| `audio/webm` | `.webm` | Browser MediaRecorder output |
+| `audio/wav` | `.wav` | Uncompressed PCM |
+| `audio/mpeg` | `.mp3` | |
+| `audio/ogg` | `.ogg` | Opus/Vorbis |
+| `audio/x-m4a` | `.m4a` | AAC in MPEG-4 container |
+| `audio/mp4` | `.mp4` | |
 
-**Supported content types**: `audio/webm`, `audio/wav`, `audio/mpeg`, `audio/mp3`, `audio/ogg`, `audio/x-m4a`, `audio/mp4`.
+Maximum file size: **5 MB**. Empty files are rejected with HTTP 400.
 
-**Limits**: file > 0 bytes, ≤ 5 MB.
+---
 
-**Response**:
+## Transcription API
+
+### Transcribe audio
+
+```http
+POST /audio/transcribe
+Content-Type: multipart/form-data
+Authorization: Bearer {token}
+```
+
+<ParamField query="session_id" type="string">
+  Optional. Associates the transcription with a chat session for later retrieval.
+</ParamField>
+
+<ParamField query="language" type="string">
+  Optional. BCP-47 language hint (e.g. `en`, `ru`, `es`). If omitted, Whisper auto-detects the language.
+</ParamField>
+
+<ParamField query="model" type="string">
+  Optional. Whisper model variant. Defaults to `WHISPER_MODEL` env var (e.g. `large-v3`).
+</ParamField>
+
+<ParamField body="file" type="file" required>
+  Audio file. Must match a supported MIME type and be under 5 MB.
+</ParamField>
+
+**Response — 200 OK:**
 
 ```json
 {
-  "transcription_id": "txn-abc-123",
-  "text": "Hello, this is a test recording.",
+  "transcription_id": "550e8400-e29b-41d4-a716-446655440000",
+  "text": "Hello, please schedule a meeting for tomorrow at 3pm.",
   "detected_language": "en",
-  "processing_time_seconds": 1.234,
-  "cost": 0.0124,
-  "model": "turbo"
+  "processing_time_seconds": 1.42,
+  "cost": 0.00284,
+  "model": "large-v3"
 }
 ```
 
-**Errors**:
+<ResponseField name="transcription_id" type="string">
+  UUID for the saved transcription record.
+</ResponseField>
 
-- `400` — invalid content type, empty file, or size > 5 MB
-- `500` — RunPod transcription failed (network, model error)
+<ResponseField name="text" type="string">
+  Full transcript text returned by Whisper.
+</ResponseField>
 
-## Working example
+<ResponseField name="detected_language" type="string">
+  BCP-47 language code detected by Whisper. Null if not returned by the service.
+</ResponseField>
 
-```bash
-curl -X POST https://api.skygen.ai/audio/transcribe \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@recording.wav" \
-  -F "session_id=sess_abc" \
-  -F "language=en"
+<ResponseField name="processing_time_seconds" type="number">
+  Wall-clock seconds RunPod took to process the audio.
+</ResponseField>
+
+<ResponseField name="cost" type="number">
+  Cost in USD — `audio_duration_seconds × WHISPER_COST_PER_SECOND`. If `audio_duration_seconds` is missing from the RunPod response it is estimated as `processing_time × 2` (minimum 1.0 s).
+</ResponseField>
+
+<ResponseField name="model" type="string">
+  Whisper model name used for this transcription.
+</ResponseField>
+
+---
+
+## Processing flow
+
+<Steps>
+  <Step title="File validation">
+    The backend checks the `Content-Type` header against the allowed MIME type list. Files over 5 MB or empty files return HTTP 400 with a descriptive message.
+  </Step>
+  <Step title="RunPod submission">
+    Audio bytes are forwarded to RunPod Faster Whisper. The `WHISPER_ENABLE_VAD` env var controls voice activity detection to strip silence.
+  </Step>
+  <Step title="Result extraction">
+    `text`, `detected_language`, `processing_time`, and `audio_duration_seconds` are extracted from the RunPod response.
+  </Step>
+  <Step title="Cost calculation">
+    `cost = audio_duration_seconds × WHISPER_COST_PER_SECOND`
+  </Step>
+  <Step title="Persistence">
+    A `Transcription` record is saved to PostgreSQL with the full result, model name, user ID, and optional session ID.
+  </Step>
+</Steps>
+
+---
+
+## Configuration
+
+| Env var | Description |
+|---------|-------------|
+| `RUNPOD_API_KEY` | RunPod API authentication key |
+| `WHISPER_MODEL` | Default Whisper model (e.g. `large-v3`) |
+| `WHISPER_ENABLE_VAD` | `true` or `false` — enable voice activity detection |
+| `WHISPER_COST_PER_SECOND` | Cost multiplier per second of audio |
+
+---
+
+## Error responses
+
+| Status | Cause |
+|--------|-------|
+| 400 | Invalid file type, empty file, or file exceeds 5 MB |
+| 401 | Missing or invalid auth token |
+| 500 | RunPod service error; full exception message in `detail` |
+
+---
+
+## Using transcription with agents
+
+After transcribing a voice command, send the transcript as a message to an active session:
+
+```python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+headers = {"Authorization": f"Bearer {token}"}
+
+# Step 1: Transcribe
+with open("command.webm", "rb") as f:
+    resp = httpx.post(
+        f"{BASE_URL}/audio/transcribe",
+        headers=headers,
+        files={"file": ("command.webm", f, "audio/webm")},
+    )
+transcript_text = resp.json()["text"]
+
+# Step 2: Send to agent session
+httpx.post(
+    f"{BASE_URL}/chat/sessions/{session_id}/messages",
+    headers=headers,
+    json={"content": transcript_text},
+)
 ```
 
-## Cost model
-
-```
-cost_usd = audio_duration_seconds × WHISPER_COST_PER_SECOND
-```
-
-Default `WHISPER_COST_PER_SECOND = 0.0004`. A 10-second clip costs ~$0.004. The response includes the exact cost; the amount is also recorded in the `Transcription` DB row for downstream billing.
-
-## Storage
-
-Each transcription creates a `Transcription` row:
-
-- `id` UUID
-- `user_id` FK
-- `session_id` optional FK
-- `text` — the transcript
-- `detected_language` — ISO 639-1 from Whisper
-- `model` — which model was used
-- `processing_time_seconds`
-- `audio_duration_seconds`
-- `cost`
-- `created_at`
-
-Audio files themselves are **not stored** — only the transcript. If you need the original, upload it to your own storage before calling this endpoint.
-
-## When to use `language`
-
-Providing a hint speeds up Whisper and improves accuracy on short clips. If the user's primary language is known, always pass it. Leave it empty only when you genuinely need auto-detection.
-
-## Gotchas
-
-<Warning>
-**Max size 5 MB is hardcoded.** For longer recordings, chunk on the client and call multiple times, or lift the limit in `Backend/app/routers/audio/audio_router.py` and redeploy.
-</Warning>
-
-<Note>
-**No rate limit on this endpoint.** A runaway client can burn cost. Gate calls at the UI level and alert on spikes.
-</Note>
-
-<Note>
-**Audio duration fallback is crude.** If RunPod doesn't return `audio_duration_seconds`, Skygen falls back to `processing_time × 2` or `1.0`. In billing-critical flows, pre-compute duration client-side and pass it into `session_id` metadata.
-</Note>
-
-<Note>
-**`detected_language` is not validated.** Whisper returns free-form language labels. If your app routes on language, normalize first.
-</Note>
-
-## See also
-
-- [Chat sessions](/concepts/chat-sessions) — linking transcripts to sessions
-- [Billing](/concepts/billing) — where audio costs roll up
+The agent processes voice-sourced text identically to typed input.

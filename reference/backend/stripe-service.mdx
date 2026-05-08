@@ -1,0 +1,333 @@
+---
+title: "Stripe Service"
+description: "Low-level Stripe API wrapper: checkout, SetupIntent, subscriptions, plan changes, early renewal, overage metering, and webhook routing."
+---
+
+## Overview
+
+`StripeService` (`app/services/stripe_service.py`, 1865 lines) is the low-level Stripe API wrapper. It is **called exclusively by `BillingService`** — nothing else should use it directly.
+
+**Singleton:** `stripe_service = StripeService()` at module level. Available via `from app.services.stripe_service import stripe_service`.
+
+**Guard:** `is_available: bool` property checks that `STRIPE_SECRET_KEY` is set and the SDK initialized. Every public method returns a safe failure value (`False`, `None`, or raises `RuntimeError`) when Stripe is not configured.
+
+**Key design invariant:** Stripe's `current_period_end` is **never used**. All period-end timestamps are calculated locally via `_period_end_from_plan()` using `SubscriptionPlan.billing_period_days`. This ensures Skygen's billing cycle matches our plan config, not Stripe's.
+
+---
+
+## Period End Calculation
+
+### _period_end_from_plan()
+
+```python
+def _period_end_from_plan(plan, period_start_ts: int) -> int
+```
+
+Module-level helper. Calculates the Unix timestamp for `period_end` by adding `plan.billing_period_days × seconds_per_unit` to `period_start_ts`.
+
+`billing_period_unit` enum values: `SECONDS`, `MINUTES`, `HOURS`, `DAYS` (defaults to `DAYS`). Falls back to 30-day period if `plan` is `None` or `billing_period_days` is missing.
+
+**Called by:** `confirm_payment_method_added`, `create_subscription`, `renew_subscription_early`, `change_plan`, `recover_missed_plan_switch`, and webhook handlers — everywhere Stripe returns a `period_start`.
+
+---
+
+## Customer Management
+
+### get_or_create_customer()
+
+```python
+async def get_or_create_customer(
+    db: AsyncSession,
+    user_id: str,
+    email: str,
+) -> Tuple[str, bool]  # (stripe_customer_id, was_created)
+```
+
+Looks up `StripeCustomer` by `user_id`. Creates a new Stripe customer if not found, then persists via `billing_repo.create_stripe_customer`.
+
+**Raises:** `stripe.StripeError` on Stripe API failure.
+
+---
+
+## Payment Method Setup
+
+### create_setup_intent()
+
+```python
+async def create_setup_intent(
+    db: AsyncSession,
+    user_id: str,
+    email: str,
+    plan_id: Optional[str] = None,
+) -> Dict[str, Any]  # {"client_secret": str, "setup_intent_id": str}
+```
+
+Creates a Stripe `SetupIntent` for adding a payment card. Used by the free→paid upgrade flow where the user adds a card before subscribing. `plan_id` is embedded in the intent's metadata and resolved during `confirm_payment_method_added`.
+
+---
+
+### confirm_payment_method_added()
+
+```python
+async def confirm_payment_method_added(
+    db: AsyncSession,
+    user_id: str,
+    setup_intent_id: str,
+) -> Tuple[bool, str]  # (success, message)
+```
+
+Called from the frontend after Stripe.js completes card entry. Retrieves the `SetupIntent`, resolves the plan from its metadata, creates a Stripe `Subscription`, then calls `billing_service.activate_subscription()` locally.
+
+**Idempotent:** The `create_subscription` call uses `idempotency_key = f"sub_{setup_intent_id}"` so the webhook `_handle_setup_intent_succeeded` and this API call can both fire safely.
+
+**Period end:** Calls `_period_end_from_plan()` to override Stripe's `period_end`.
+
+---
+
+## Checkout Session (Web Flow)
+
+### create_checkout_session()
+
+```python
+async def create_checkout_session(
+    db: AsyncSession,
+    user_id: str,
+    email: str,
+    plan_id: str,
+    prompt_event_id: Optional[str] = None,
+    success_url: Optional[str] = None,
+    cancel_url: Optional[str] = None,
+) -> Dict[str, Any]  # {"checkout_url": str, "session_id": str}
+```
+
+Creates a Stripe Checkout Session (`mode=subscription`). Stripe hosts the payment page. Session expires after 30 minutes.
+
+Default redirect URLs are built via `s.webapp_url()`:
+- `success_url` → `/home?checkout=success&session_id={CHECKOUT_SESSION_ID}`
+- `cancel_url` → `/subscriptions?checkout=cancelled`
+
+Custom URLs (e.g. mobile deep links) override these defaults.
+
+---
+
+## Subscription Lifecycle
+
+### create_subscription()
+
+```python
+async def create_subscription(
+    db: AsyncSession,
+    user_id: str,
+    plan_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]
+```
+
+Creates a Stripe subscription from a saved payment method. Cancels any existing `active`/`past_due` Stripe subscriptions first to prevent duplicates. Calls `billing_service.activate_subscription()` locally with period end from `_period_end_from_plan()`.
+
+**Idempotency key pattern:** `f"paid_sub_{user_id}_{plan.id}_{int(utcnow().timestamp() // 60)}"` — 1-minute bucket.
+
+**Returns:** `{"subscription_id": str, "status": str, "current_period_end": ISO str}` or `None` if Stripe is not configured.
+
+---
+
+### cancel_subscription()
+
+```python
+async def cancel_subscription(
+    db: AsyncSession,
+    user_id: str,
+    at_period_end: bool = True,
+) -> bool
+```
+
+Cancels the user's active subscription. `at_period_end=True` sets `cancel_at_period_end=True` on the Stripe subscription (access continues until period end). `at_period_end=False` deletes immediately.
+
+Calls `billing_service.cancel_subscription()` locally after the Stripe call.
+
+---
+
+### renew_subscription_early()
+
+```python
+async def renew_subscription_early(
+    db: AsyncSession,
+    user_id: str,
+) -> Tuple[bool, str]  # (success, message)
+```
+
+Immediately renews a STANDARD subscription when the user exhausts their token balance.
+
+**Redis lock:** `early_renewal_lock:{user_id}`, 30s TTL, acquired with `NX`. If already locked (concurrent call), waits up to 15 seconds polling every 1s, then returns `(True, "Renewal already in progress")`.
+
+**6-step flow:**
+1. Delete old Stripe subscription
+2. Create new subscription with `payment_behavior="default_incomplete"`
+3. Retrieve invoice, finalize if draft
+4. Pay invoice explicitly via `stripe.Invoice.pay()`
+5. Update local subscription with new `stripe_subscription_id`
+6. Call `billing_service.renew_subscription()` to reset token balance
+
+**Failure cleanup:** If invoice payment fails, the new subscription is deleted to avoid leaving the user on an unpaid subscription.
+
+**Raises:** Never raises — all exceptions caught. Returns `(False, "<reason>")` on failure.
+
+---
+
+### change_plan()
+
+```python
+async def change_plan(
+    db: AsyncSession,
+    user_id: str,
+    new_plan_id: str,
+) -> Optional[Dict[str, Any]]
+```
+
+Upgrades or downgrades the subscription plan (proration via Stripe).
+
+**Two-path behavior based on payment status:**
+
+1. **Invoice already paid** (Stripe auto-charged saved payment method): calls `billing_service.switch_plan()` immediately, granting tokens now. The later `invoice.paid` webhook hits an idempotency guard and is ignored.
+2. **Payment pending** (INCOMPLETE/PAST_DUE status): defers token grant to `invoice.paid` webhook. Returns `payment_url` (hosted invoice URL) for frontend redirect.
+
+**Returns:**
+
+```json
+{
+  "subscription_id": "sub_xxx",
+  "status": "incomplete",
+  "new_plan_id": "...",
+  "new_plan_name": "...",
+  "payment_pending": true,
+  "payment_url": "https://invoice.stripe.com/..."
+}
+```
+
+---
+
+### recover_missed_plan_switch()
+
+```python
+async def recover_missed_plan_switch(
+    db: AsyncSession,
+    user_id: str,
+    expected_price_id: str = "",
+) -> bool  # True if recovery was performed
+```
+
+Self-healing for missed `invoice.paid` webhooks during plan changes.
+
+**Two recovery cases:**
+
+1. **Local status is `INCOMPLETE` or `PAST_DUE`, Stripe shows `active`** → webhook was never received. Call `switch_plan()` now.
+2. **Local status is `ACTIVE` but `stripe_price_id != expected_price_id`** and Stripe confirms the new price → `invoice.paid` fired but processing failed. Call `switch_plan()` to repair.
+
+Guards against double-switch: if already on the target price with ACTIVE status, returns `False`.
+
+---
+
+### get_customer_portal_url()
+
+```python
+async def get_customer_portal_url(
+    db: AsyncSession,
+    user_id: str,
+    return_url: str,
+) -> Optional[str]
+```
+
+Returns the URL for the Stripe Customer Portal.
+
+**Special case for INCOMPLETE subscriptions:** Returns the proration invoice's `hosted_invoice_url` directly instead of the general portal. This ensures the user pays the exact invoice that triggers `invoice.paid(billing_reason='subscription_update')` and `switch_plan()`. Using the general portal for incomplete subs can result in a different `billing_reason` and the plan never switching.
+
+---
+
+## Overage Metering
+
+### report_overage_usage()
+
+```python
+async def report_overage_usage(
+    db: AsyncSession,
+    user_id: str,
+    tokens: int,
+) -> bool
+```
+
+Reports token overage to Stripe Meters API (`stripe.billing.MeterEvent.create`). Event name is `s.STRIPE_METER_EVENT_NAME`.
+
+**Called by:** `BillingService` when a user on an overage-enabled plan exceeds their token allocation.
+
+---
+
+## Webhook Handling
+
+### verify_webhook_signature()
+
+```python
+def verify_webhook_signature(
+    payload: bytes,
+    signature: str,
+) -> Optional[Dict[str, Any]]
+```
+
+Verifies Stripe webhook signature using `stripe.Webhook.construct_event()` against `s.STRIPE_WEBHOOK_SECRET`. Returns the parsed event dict on success, `None` on failure.
+
+**Called by:** `routers/billing.py` — POST `/billing/webhook`.
+
+---
+
+### handle_webhook_event()
+
+```python
+async def handle_webhook_event(
+    db: AsyncSession,
+    event: Dict[str, Any],
+) -> bool
+```
+
+Routes a verified Stripe event to the appropriate handler via the `WEBHOOK_HANDLERS` registry (`app/services/billing/webhook_handlers.py`).
+
+**Registered event types:**
+
+| Stripe Event | Handler |
+|---|---|
+| `checkout.session.completed` | `CheckoutSessionCompletedHandler` |
+| `customer.subscription.updated` | `SubscriptionUpdatedHandler` |
+| `customer.subscription.deleted` | `SubscriptionDeletedHandler` |
+| `invoice.paid` | `InvoicePaidHandler` |
+| `invoice.payment_failed` | `InvoicePaymentFailedHandler` |
+| `setup_intent.succeeded` | `SetupIntentSucceededHandler` |
+
+Unhandled event types return `True` (acknowledged, not an error).
+
+---
+
+## Error Handling
+
+All methods follow this pattern:
+
+- `stripe.CardError` — card-specific errors (e.g. declined). Returns `(False, "Your card was declined...")` in `renew_subscription_early`.
+- `stripe.StripeError` — all other Stripe errors. Logged and re-raised (or returned as `False`/`None` depending on method).
+- `RuntimeError("Stripe is not configured")` — raised by methods when `is_available=False`.
+
+---
+
+## Configuration
+
+| Setting | Purpose |
+|---|---|
+| `STRIPE_SECRET_KEY` | Stripe API key (enables service) |
+| `STRIPE_WEBHOOK_SECRET` | Webhook signature verification secret |
+| `STRIPE_METER_EVENT_NAME` | Billing Meters event name for overage |
+
+---
+
+## Related
+
+| Component | Location | Role |
+|---|---|---|
+| `BillingService` | `billing_service.py` | Only caller; owns token deduction and subscription state |
+| `WEBHOOK_HANDLERS` | `billing/webhook_handlers.py` | Handler registry for Stripe events |
+| `billing_repo` | `repositories/billing_repository.py` | DB access for subscriptions, customers |
+| `billing-service` | [billing-service](/reference/backend/billing-service) | Full billing reference |

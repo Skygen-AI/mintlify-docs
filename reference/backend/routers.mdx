@@ -1,0 +1,828 @@
+---
+title: "API Routers Reference"
+description: "Every REST endpoint in the Skygen Backend, organized by domain. Base URL: the FastAPI app registered at app/main.py."
+---
+
+## Overview
+
+All routes are mounted on a single FastAPI application at `app/main.py` using `app.include_router()`. The Socket.IO server wraps it via `get_socket_app(app)` → `socket_app` (the actual uvicorn target).
+
+**Auth:** Unless stated otherwise, endpoints require `Authorization: Bearer <jwt>` via `get_current_active_user`. Admin-only endpoints additionally require `role=admin` or admin-panel JWT.
+
+---
+
+## Auth & Users
+
+### /auth
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/auth/register` | Register new user (email + password + optional invite code). Returns `RegisterResponse`. |
+| `POST` | `/auth/token` | Login — returns JWT access token. |
+| `POST` | `/auth/logout` | Invalidate current session token (204). |
+| `GET` | `/auth/verify` | Verify email address via token in query param. |
+| `POST` | `/auth/forgot-password` | Send password-reset email (202, fire-and-forget). |
+| `POST` | `/auth/reset-password` | Reset password with token. |
+| `GET` | `/auth/google` | Start Google OAuth2 flow — redirects to Google. |
+| `GET` | `/auth/google/callback` | Google OAuth2 callback — returns JWT. |
+| `POST` | `/auth/google-mobile/token` | Exchange Google ID token (mobile/Tauri) for Skygen JWT. |
+| `POST` | `/auth/upgrade-session` | Upgrade short-lived session to full-access token (204). |
+| `PATCH` | `/auth/update-registration-meta` | Update registration metadata (country, source, etc.). |
+| `POST` | `/auth/setup-2fa` | Initialize TOTP 2FA — returns QR seed. |
+| `POST` | `/auth/verify-2fa` | Verify and activate TOTP code. |
+| `GET` | `/auth/2fa-status` | Check if 2FA is enabled for current user. |
+| `GET` | `/auth/ping` | Health check (no auth required). |
+
+### /users
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/users/me` | Get current user profile. |
+| `PATCH` | `/users/me` | Update current user profile. |
+| `DELETE` | `/users/me` | Soft-delete own account (204). |
+| `PATCH` | `/users/admin` | Admin-level self-update (role elevation). |
+| `GET` | `/users` | List all users (admin only). |
+| `GET` | `/users/stats` | User statistics (admin only). |
+| `GET` | `/users/{user_id}` | Get user by ID. |
+| `DELETE` | `/users/{user_id}` | Soft-delete user by ID (204). |
+
+---
+
+## Devices
+
+### /devices
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/devices` | Register a new device. Returns `DeviceRead` (201). |
+| `GET` | `/devices` | List current user's devices (paginated). |
+| `GET` | `/devices/{device_id}` | Get device by ID. |
+| `PATCH` | `/devices/{device_id}` | Update device metadata. |
+| `DELETE` | `/devices/{device_id}` | Soft-delete device (204). |
+| `POST` | `/devices/{device_id}/restore` | Restore soft-deleted device. |
+| `POST` | `/devices/{device_id}/rotate` | Rotate device KID (rate-limited: 5 min cooldown). |
+| `POST` | `/devices/{device_id}/force-release` | Force-release stuck device lock. |
+
+---
+
+## Chat Sessions
+
+### /sessions
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/sessions` | Create session. Optional `?reuse_existing=true` to return active session for device. |
+| `GET` | `/sessions` | List sessions (paginated, `?limit=20&offset=0`). Returns `{items, total, limit, offset}`. |
+| `GET` | `/sessions/{session_id}` | Get session by ID. |
+| `PATCH` | `/sessions/{session_id}` | Update session fields (title, meta_data). |
+| `DELETE` | `/sessions/{session_id}` | Soft-delete session + release all locks. |
+| `DELETE` | `/sessions/{session_id}/permanent` | Hard-delete session + all messages. Irreversible. |
+| `POST` | `/sessions/{session_id}/restore` | Restore soft-deleted session. |
+| `GET` | `/sessions/{session_id}/plan` | Get latest non-superseded agent plan for frontend reload. |
+| `GET` | `/sessions/{session_id}/summary` | Get filtered history: user queries + final responses only (`?max_messages=10`). |
+
+---
+
+## Messages
+
+### /sessions/{session_id}/messages
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/sessions/{session_id}/messages` | Submit message to agent (triggers agent pipeline via RabbitMQ/Socket.IO). Returns `ChatMessageRead` (201). |
+| `GET` | `/sessions/{session_id}/messages` | List all messages in session. |
+| `DELETE` | `/sessions/{session_id}/messages/{message_id}` | Soft-delete message (204). |
+| `POST` | `/sessions/{session_id}/messages/{message_id}/rate` | Rate assistant message. Body: `{rating: int (1–5), comment?: str}`. Returns `{success, rating, comment}`. |
+| `GET` | `/sessions/{session_id}/messages/{message_id}/rating` | Get rating for a message. |
+
+---
+
+## Tasks
+
+### /tasks
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/tasks` | Create a task. Returns `TaskRead` (201). |
+| `GET` | `/tasks` | List current user's tasks. |
+| `GET` | `/tasks/{task_id}` | Get task by ID. |
+| `PATCH` | `/tasks/{task_id}` | Update task. |
+| `DELETE` | `/tasks/{task_id}` | Soft-delete task (204). |
+
+---
+
+## Cloud PC
+
+### /cloud-pc
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/cloud-pc/connect` | Provision or resume a Cloud PC. Returns `CloudPCConnectResponse` with connection URL. |
+| `POST` | `/cloud-pc/disconnect` | Pause a Cloud PC. Returns `CloudPCDisconnectResponse`. |
+| `GET` | `/cloud-pc/list` | List user's Cloud PCs (all statuses). |
+| `GET` | `/cloud-pc/status` | Get status of active Cloud PC. |
+| `POST` | `/cloud-pc/heartbeat` | Agent heartbeat — prevents auto-pause (204). |
+| `GET` | `/cloud-pc/files` | List files in Cloud PC filesystem. |
+| `POST` | `/cloud-pc/files/download` | Download file from Cloud PC. Returns presigned URL. |
+| `POST` | `/cloud-pc/files/download-published` | Download a published (public) file. |
+| `POST` | `/cloud-pc/files/copy-attachment` | Copy attachment to/from Cloud PC. |
+| `POST` | `/cloud-pc/files/upload` | Get presigned upload URL for Cloud PC file. |
+| `POST` | `/cloud-pc/files/upload-callback` | Confirm file uploaded (204). |
+| `DELETE` | `/cloud-pc/files` | Delete file from Cloud PC (204). |
+| `POST` | `/cloud-pc/files/mkdir` | Create directory on Cloud PC (204). |
+| `POST` | `/cloud-pc/link-device` | Link a device to this Cloud PC. |
+| `POST` | `/cloud-pc/unlink-device` | Unlink device from Cloud PC (204). |
+| `POST` | `/cloud-pc/take-control` | User takes manual control from AI. |
+| `POST` | `/cloud-pc/resume-ai` | Return control to AI. |
+| `POST` | `/cloud-pc/renew-control` | Renew control TTL (heartbeat for manual control). |
+| `PATCH` | `/cloud-pc/{cloud_pc_id}` | Update Cloud PC metadata. |
+| `DELETE` | `/cloud-pc/{cloud_pc_id}` | Soft-delete Cloud PC (204). |
+| `POST` | `/cloud-pc/{cloud_pc_id}/restore` | Restore soft-deleted Cloud PC. |
+| `GET` | `/cloud-pc/admin/lock/{user_id}` | Admin: inspect Redis lock state for user. |
+| `DELETE` | `/cloud-pc/admin/lock/{user_id}` | Admin: force-release user's Cloud PC lock (204). |
+
+---
+
+## Scheduled Tasks
+
+### /scheduled-tasks
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/scheduled-tasks/extract-playbook` | Use AI to extract a cron schedule + task description from natural language. |
+| `POST` | `/scheduled-tasks` | Create a scheduled task. Returns `ScheduledTaskRead` (201). |
+| `GET` | `/scheduled-tasks` | List current user's scheduled tasks. |
+| `GET` | `/scheduled-tasks/runs/completed` | List completed runs (last N). |
+| `GET` | `/scheduled-tasks/{task_id}` | Get scheduled task by ID. |
+| `PATCH` | `/scheduled-tasks/{task_id}` | Update scheduled task (title, cron, timezone, etc.). |
+| `PATCH` | `/scheduled-tasks/{task_id}/toggle` | Enable/disable a scheduled task. |
+| `POST` | `/scheduled-tasks/{task_id}/run` | Manually trigger a scheduled task run. Returns `ScheduledTaskRunRead` (201). |
+| `DELETE` | `/scheduled-tasks/{task_id}` | Delete scheduled task (204). |
+| `GET` | `/scheduled-tasks/{task_id}/runs` | List all runs for a task. |
+
+---
+
+## Knowledge Base
+
+### /knowledge
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/knowledge/save` | Save new knowledge insight (with Gemini embedding). |
+| `POST` | `/knowledge/update/{insight_id}` | Update existing insight (re-embeds). |
+| `POST` | `/knowledge/retrieve` | Semantic similarity search — find relevant knowledge for a query. |
+| `GET` | `/knowledge/read/{insight_id}` | Get insight by ID. |
+| `DELETE` | `/knowledge/delete/{insight_id}` | Delete insight (tombstone pattern). |
+| `POST` | `/knowledge/save-summary` | Save session summary as knowledge. |
+| `GET` | `/knowledge/insights` | List all knowledge insights for user. |
+| `GET` | `/knowledge/insights/{insight_id}` | Get insight by ID (alternate path). |
+| `DELETE` | `/knowledge/insights/all` | Delete all user knowledge. |
+| `DELETE` | `/knowledge/delete_insight/{insight_id}` | Delete insight by ID (alternate path). |
+
+---
+
+## Billing
+
+### /billing
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/billing/pricing` | Get available pricing plans. |
+| `GET` | `/billing/status` | Get current user's billing status (tier, balance, plan). |
+| `GET` | `/billing/balance` | Get current token balance. |
+| `PATCH` | `/billing/model-profile` | Update user's preferred model profile. |
+| `POST` | `/billing/setup-card` | Create Stripe SetupIntent for saving a card. |
+| `POST` | `/billing/confirm-card` | Confirm card setup after Stripe JS confirmation. |
+| `POST` | `/billing/create-checkout-session` | Create Stripe Checkout Session for subscription. |
+| `GET` | `/billing/stripe/session` | Get Stripe session status. |
+| `POST` | `/billing/subscribe` | Subscribe to a plan (Stripe). |
+| `POST` | `/billing/change-plan` | Change subscription plan. |
+| `POST` | `/billing/cancel` | Cancel subscription. |
+| `POST` | `/billing/enable-overage` | Enable token overage billing. |
+| `POST` | `/billing/disable-overage` | Disable token overage billing. |
+| `GET` | `/billing/portal` | Get Stripe Customer Portal URL. |
+| `GET` | `/billing/transactions` | List billing transactions. |
+| `GET` | `/billing/transactions/grouped` | Get transactions grouped by period. |
+| `GET` | `/billing/internal/check-access/{user_id}` | Internal: check billing access (no user auth, internal token). |
+
+### /billing/v2
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/billing/v2/setup-card` | V2 card setup (SetupIntent + immediate subscription). |
+| `POST` | `/billing/v2/subscribe` | V2 subscribe flow. |
+
+### /webhooks
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/webhooks/stripe` | Stripe webhook endpoint (Stripe-Signature verified). |
+| `GET` | `/webhooks/stripe/health` | Stripe webhook health check. |
+
+---
+
+## E2B Sandboxes
+
+### /e2b/sandboxes
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/e2b/sandboxes` | Create a new E2B Desktop sandbox (201). |
+| `POST` | `/e2b/sandboxes/{sandbox_id}/execute` | Execute an action on the sandbox (click, type, screenshot, command, etc.). |
+| `GET` | `/e2b/sandboxes/{sandbox_id}/screenshot` | Take a screenshot of the sandbox desktop. |
+| `DELETE` | `/e2b/sandboxes/{sandbox_id}` | Terminate sandbox. |
+| `GET` | `/e2b/sandboxes/{sandbox_id}` | Get sandbox state. |
+| `GET` | `/e2b/sandboxes` | List active sandboxes for current user. |
+
+---
+
+## MCP — Tool Integrations
+
+### /mcp/toolkits
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/mcp/toolkits/search` | Search Composio toolkit catalog (`?q=...&category=...`). |
+| `GET` | `/mcp/toolkits/categories` | List toolkit categories with counts. |
+| `GET` | `/mcp/toolkits/{slug}` | Get toolkit details by slug. |
+
+### /mcp/integrations
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/mcp/integrations/available` | List available integrations (triggers pending-connection reconcile). |
+| `GET` | `/mcp/integrations/connected` | List user's active connections. |
+| `GET` | `/mcp/integrations/connections` | Full connection list with status details. |
+| `POST` | `/mcp/integrations/connect/{provider}` | Initiate OAuth connection for a toolkit. Returns redirect URL. |
+| `POST` | `/mcp/integrations/disconnect/{provider}` | Disconnect a toolkit. |
+| `PATCH` | `/mcp/integrations/connections/{connection_id}/label` | Set a custom label for a connection. |
+| `PATCH` | `/mcp/integrations/{toolkit}/active` | Toggle toolkit active/inactive for agent. |
+
+### /mcp/triggers
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/mcp/triggers` | List user's active triggers. |
+| `GET` | `/mcp/triggers/types` | List available trigger types (optionally `?toolkit=...`). |
+| `POST` | `/mcp/triggers` | Create a trigger. |
+| `GET` | `/mcp/triggers/app-counts` | Trigger counts per app (sidebar badge data). |
+| `PATCH` | `/mcp/triggers/{trigger_id}` | Update trigger config. |
+| `DELETE` | `/mcp/triggers/{trigger_id}` | Delete trigger. |
+| `GET` | `/mcp/triggers/{trigger_id}` | Get trigger details. |
+| `GET` | `/mcp/triggers/events` | List trigger event history. |
+
+### /mcp/webhooks
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/mcp/webhooks/composio` | Composio webhook receiver (HMAC verified). Dispatches trigger events to agents. |
+
+### /mcp/oauth
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/mcp/oauth/callback` | Unified OAuth callback (web browser + Tauri deep link). Starts background poller for connection completion. |
+
+### /mcp/telegram
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/mcp/telegram/connect` | Start Telegram bot connection (returns OTP). |
+| `POST` | `/mcp/telegram/verify` | Verify OTP to complete Telegram connection. |
+| `DELETE` | `/mcp/telegram/disconnect` | Disconnect Telegram. |
+| `GET` | `/mcp/telegram/status` | Get Telegram connection status. |
+| `POST` | `/mcp/telegram/reconnect` | Re-issue connection token. |
+
+### /agent/mcp (Agent-Side MCP Tools)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/agent/mcp/tools` | List all available MCP tools for the agent. |
+| `POST` | `/agent/mcp/execute` | Execute an MCP tool. Returns result + usage. |
+| `GET` | `/agent/mcp/custom-servers` | List custom MCP server configurations. |
+| `POST` | `/agent/mcp/tool-usage` | Record MCP tool usage metrics. |
+| `GET` | `/agent/mcp/config` | Get Composio MCP server config for the agent. |
+| `GET` | `/agent/mcp/disabled-toolkits` | Get list of toolkits disabled for the agent. |
+| `GET` | `/agent/mcp/health` | MCP subsystem health check. |
+
+### /agent — Device Control & Task Management
+
+**Auth:** All device/screenshot endpoints require agent token (`verify_agent_auth`). Task cancel/status endpoints use standard user JWT (`get_current_active_user`).
+
+Source: `app/routers/agent/device_control.py`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/agent/device/execute` | Agent token | Execute a device action. Body: `{device_id, action_type, parameters?, timeout, action_id?}`. Routes to WebSocket for real devices or E2B SDK for sandbox devices. Returns `DeviceActionResponse {success, action_id, task_id?, result?, error?, execution_time?, status}`. |
+| `GET` | `/agent/device/action/{action_id}/result` | Agent token | Poll for action result. Returns same `DeviceActionResponse`. Status values: `completed` / `failed` / `pending` / `timeout` / `not_found`. Results cached in Redis with TTL. |
+| `GET` | `/agent/device/{device_id}/status` | Agent token | Get device connection status. Returns `{device_id, is_connected, connection_info}`. Works for real and E2B devices. |
+| `POST` | `/agent/upload-screenshot/presigned` | Agent token | Get S3 presigned upload URL for a screenshot. Body: `{session_id, task_id?}`. Returns `{upload_url, fields, screenshot_id, expires_at, method}`. |
+| `POST` | `/agent/upload-screenshot` | Agent token | Legacy direct screenshot upload (base64, max 10 MB). Body: `{session_id, step_number, screenshot_base64}`. Returns `{screenshot_url, status: "uploading"}`. |
+| `POST` | `/agent/task/cancel` | User JWT | Cancel a running agent task. Body: `{session_id, device_id?, reason?}`. Sets Redis cancel flag, wakes any hibernated agents, saves cancel message to DB. Returns `TaskCancellationResponse {success, session_id, message, is_active, device_notified}`. |
+| `GET` | `/agent/task/{session_id}/status` | User JWT | Check task status for a session. Returns `{session_id, is_active, is_cancelled, status}` where `status` is one of `active` / `cancelling` / `cancelled` / `completed_or_not_found`. |
+
+### /agent/ws (Deprecated Agent WebSocket)
+
+> **Deprecated.** Use the Socket.IO `/agent` namespace instead.
+
+Source: `app/routers/agent/agent_websocket.py`
+
+| Method | Path | Description |
+|---|---|---|
+| `WS` | `/agent/ws` | Deprecated agent WebSocket endpoint. |
+| `GET` | `/agent/ws/status` | Deprecated agent WebSocket status check. |
+
+---
+
+## Screenshots
+
+### /screenshots
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/screenshots` | Create screenshot record + get S3 presigned upload URL (201). |
+| `GET` | `/screenshots/{screenshot_id}` | Get screenshot metadata. |
+| `DELETE` | `/screenshots/{screenshot_id}` | Delete screenshot. |
+| `GET` | `/screenshots/proxy/{object_path:path}` | Proxy screenshot from S3 (avoids CORS on frontend). |
+| `GET` | `/screenshots/session/{session_id}` | List screenshots for a session. |
+| `GET` | `/screenshots/agent/session/{session_id}` | Agent-facing session screenshots. |
+
+---
+
+## Files
+
+### /files
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/files/parse` | Upload and parse a file (PDF, DOCX, PPTX, XLSX, CSV, image). Returns extracted text + images. |
+| `GET` | `/files` | List attachments for current user. |
+| `POST` | `/files/parse-existing` | Parse a file already stored in S3. |
+| `GET` | `/files/proxy/{object_path:path}` | Proxy file from S3. |
+
+---
+
+## Safety
+
+### /safety
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/safety/log-violation` | Log a safety policy violation (agent-initiated, 201). |
+| `GET` | `/safety/violations` | List violations for current user. |
+| `GET` | `/safety/violations/stats` | Violation statistics per user. |
+| `GET` | `/safety/violations/global-stats` | Global violation statistics (admin only). |
+
+---
+
+## Audio
+
+### /audio
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/audio/transcribe` | Transcribe audio via RunPod Whisper. |
+
+---
+
+## Notifications
+
+### /notifications
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/notifications/unread` | List unread notifications. |
+| `GET` | `/notifications/all` | List all notifications. |
+| `GET` | `/notifications/count` | Get unread notification count. |
+| `POST` | `/notifications/{notification_id}/read` | Mark notification as read. |
+| `POST` | `/notifications/read-all` | Mark all notifications as read. |
+
+---
+
+## Emplogents (AI Personas)
+
+### /emplogent-templates
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/emplogent-templates` | List templates for current user. |
+| `POST` | `/emplogent-templates` | Create template (201). |
+| `GET` | `/emplogent-templates/{template_id}` | Get template by ID. |
+| `DELETE` | `/emplogent-templates/{template_id}` | Delete template (204). |
+
+### /emplogents
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/emplogents` | List emplogents for current user. |
+| `POST` | `/emplogents` | Create emplogent from template (201). |
+| `GET` | `/emplogents/{emplogent_id}` | Get emplogent by ID. |
+| `PUT` | `/emplogents/{emplogent_id}` | Update emplogent. |
+| `DELETE` | `/emplogents/{emplogent_id}` | Delete emplogent (204). |
+
+---
+
+## Connectors
+
+### /connectors
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/connectors/icon/presigned` | Get presigned URL for connector icon upload. |
+| `GET` | `/connectors/custom` | List custom connectors for current user. |
+| `POST` | `/connectors/custom` | Create custom connector (MCP server registration) (201). |
+| `PATCH` | `/connectors/custom/{connector_id}` | Update custom connector. |
+| `DELETE` | `/connectors/custom/{connector_id}` | Delete custom connector (204). |
+
+---
+
+## Analytics
+
+### /analytics
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/analytics/events` | Track analytics event (GA4 + Yandex + Amplitude fanout). |
+| `POST` | `/analytics/crash` | Report app crash event. |
+| `POST` | `/analytics/load-time` | Report load time metric. |
+| `POST` | `/analytics/session/start` | Report session start event. |
+| `POST` | `/analytics/session/end` | Report session end event. |
+| `POST` | `/analytics/uninstall` | Report app uninstall event. |
+| `GET` | `/analytics/status` | Analytics health check. |
+
+### /analytics/admin
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/analytics/admin/jobs/inactive-users` | Run inactive users job manually. |
+| `POST` | `/analytics/admin/jobs/retention-tracking` | Run retention tracking job. |
+| `GET` | `/analytics/admin/inactive-users` | List inactive users. |
+| `GET` | `/analytics/admin/dau-mau` | DAU/MAU metrics. |
+| `GET` | `/analytics/admin/retention` | Retention cohort data. |
+| `GET` | `/analytics/admin/config` | Analytics config. |
+
+---
+
+## Library
+
+### /library
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/library/types` | List library card types/categories. |
+| `GET` | `/library/cards/{card_id}` | Get library card by ID. |
+| `GET` | `/library/cards` | List library cards (public use cases). |
+
+---
+
+## Pricing
+
+### /pricing
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/pricing/plans` | List all public active subscription plans. |
+| `GET` | `/pricing/plans/{plan_id}` | Get pricing plan details. |
+
+---
+
+## Invites
+
+### /invites
+
+> **Note:** The user-facing invites router is currently **disabled** in production (`user_invites_router` is commented out in `app/main.py`). Admin invite management remains active under `/admin/invites`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/invites/my` | Create an invite code (201). |
+| `GET` | `/invites/my` | List current user's invite codes. |
+| `GET` | `/invites/my/{code}` | Get invite code details. |
+| `POST` | `/invites/my/{code}/deactivate` | Deactivate an invite code. |
+
+---
+
+## Helpdesk
+
+### /helpdesk
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/helpdesk/tickets` | Create support ticket (201). |
+| `GET` | `/helpdesk/tickets` | List current user's tickets. |
+| `GET` | `/helpdesk/tickets/{ticket_id}` | Get ticket details. |
+| `PATCH` | `/helpdesk/tickets/{ticket_id}` | Update ticket (status, priority). |
+| `DELETE` | `/helpdesk/tickets/{ticket_id}` | Delete ticket (204). |
+| `POST` | `/helpdesk/tickets/{ticket_id}/messages` | Add message to ticket (201). |
+| `POST` | `/helpdesk/tickets/{ticket_id}/rate` | Rate ticket resolution (1–5). |
+| `POST` | `/helpdesk/tickets/{ticket_id}/attachments/presigned` | Get presigned upload URL for attachment. |
+| `GET` | `/helpdesk/tickets/{ticket_id}/attachments/{attachment_id}/download` | Download ticket attachment. |
+| `GET` | `/helpdesk/kb/articles` | List knowledge base articles. |
+| `GET` | `/helpdesk/kb/articles/{slug}` | Get KB article by slug. |
+| `POST` | `/helpdesk/kb/articles/{article_id}/feedback` | Submit article feedback. |
+
+---
+
+## Action History
+
+### /action-history
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/action-history` | List user's agent action history. Query params: `session_id` (filter by session), `date_from` / `date_to` (ISO 8601 datetime range), `mode` (`cua` \| `deep_research` \| `mcp` \| `ask_human`), `limit` (1–200, default 50), `offset` (default 0). Returns `ActionHistoryResponse {items, total, session_id}`. |
+
+---
+
+## Prompt Stats
+
+### /prompt-stats
+
+These endpoints track user funnel events (e.g., prompt page views → app launch → registration). All require Bearer JWT.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/prompt-stats/mark-already` | Mark that user already had the app installed when visiting a prompt page. |
+| `POST` | `/prompt-stats/mark-launch` | Mark that user launched the app from a prompt page. |
+| `POST` | `/prompt-stats/mark-register` | Mark that user registered from a prompt page. |
+
+---
+
+## Landing Stats (App-Originated)
+
+### /landing-stats
+
+Tracks product use-case events originating from inside the app (not the landing site). Requires Bearer JWT.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/landing-stats/track-from-app` | Record a use-case view or interaction event. Body: `{use_case_title: str, source: str, event_type: str, view_slug: str}`. |
+
+---
+
+## Email
+
+### /email
+
+Handles email subscription management. No auth required (token is embedded in unsubscribe link).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/email/unsubscribe` | Render HTML unsubscribe confirmation page. Query param: `token` (signed unsubscribe token from email link). |
+| `POST` | `/email/unsubscribe` | Process unsubscribe action (RFC 8058 List-Unsubscribe-Post). Query param: `token`. Returns 200 on success. |
+
+---
+
+## Real-Time Transport
+
+### /ws — Deprecated Device & User WebSocket
+
+> **Deprecated.** Migrate to the Socket.IO namespaces: `/device` (device commands), `/user` (user notifications), `/agent` (agent events).
+
+Source: `app/routers/websocket/device_ws.py`
+
+The REST helper endpoints still work and are used for direct task dispatch without a Socket.IO connection.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `WS` | `/ws/device/{device_id}` | `?token=<JWT>` query param | JSON-RPC 2.0 device WebSocket. Keepalive pings every 30 s. Handles inbound methods: `heartbeat`, `task_result`, `get_presigned_upload_url`. |
+| `WS` | `/ws/user/{user_id}` | `?token=<JWT>` query param | User notifications WebSocket with durable Redis-backed delivery. Handles: `notification_ack`, `ping`. |
+| `GET` | `/ws/connected-devices` | User JWT | List currently connected devices (WebSocket connections + all E2B sandbox devices for user). |
+| `POST` | `/ws/send-task/{device_id}` | User JWT | Send a task to a specific device over WebSocket. Body: `{command, payload?, title?, description?}`. Returns `{status, device_id, task_id}`. |
+| `POST` | `/ws/broadcast-task` | User JWT | Broadcast task to all connected devices for current user. Same body as `send-task`. |
+| `GET` | `/ws/device-status/{device_id}` | User JWT | Get WebSocket connection status object for a device. |
+
+---
+
+## Internal APIs
+
+### /ws/internal
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/ws/internal/notify-user/{user_id}` | Internal token | Push Socket.IO event to a specific user. |
+| `GET` | `/ws/internal/health` | None | Internal health check. |
+
+### /internal/landing-stats
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/internal/landing-stats/track` | Landing token | Track landing page event. |
+
+### /internal/prompt-stats
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/internal/prompt-stats/track` | Landing token | Track prompt stats event. |
+| `POST` | `/internal/prompt-stats/launch` | Landing token | Record app launch. |
+
+---
+
+## Admin Panel
+
+All admin routes require admin JWT (`/admin/api/auth/login`).
+
+### Admin: Auth
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/api/auth/login` | Admin login — returns JWT. |
+| `POST` | `/admin/api/auth/refresh` | Refresh admin token. |
+| `GET` | `/admin/api/auth/me` | Get current admin identity. |
+
+### Admin: Users
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/users` | List all users (filterable). |
+| `POST` | `/admin/api/users` | Create user. |
+| `PATCH` | `/admin/api/users/{user_id}` | Update user. |
+| `PATCH` | `/admin/api/users/{user_id}/role` | Change user role. |
+| `DELETE` | `/admin/api/users/{user_id}` | Soft-delete user. |
+| `DELETE` | `/admin/api/users/{user_id}/permanent` | Hard-delete user. |
+| `GET` | `/admin/api/users/{user_id}/details` | Full user details (subscriptions, devices, sessions). |
+| `POST` | `/admin/api/users/{user_id}/reset-password` | Force password reset. |
+| `DELETE` | `/admin/api/users/{user_id}/sessions` | Invalidate all user sessions. |
+
+### Admin: Billing
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/billing/set-subscription` | Manually set user subscription. |
+| `POST` | `/admin/billing/grant` | Grant tokens to user. |
+| `POST` | `/admin/billing/deduct` | Deduct tokens from user. |
+| `GET` | `/admin/billing/user/{user_id}/status` | Get billing status for user. |
+| `GET` | `/admin/billing/user/{user_id}/transactions` | List transactions for user. |
+
+### Admin: Subscriptions
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/subscriptions/users/billing` | List users with billing info. |
+| `POST` | `/admin/api/subscriptions/users/grant-tokens` | Grant tokens. |
+| `POST` | `/admin/api/subscriptions/users/deduct-tokens` | Deduct tokens. |
+| `POST` | `/admin/api/subscriptions/users/set-subscription` | Set subscription. |
+
+### Admin: Plans
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/plans` | List all plans. |
+| `GET` | `/admin/api/plans/{plan_id}` | Get plan. |
+| `POST` | `/admin/api/plans` | Create plan. |
+| `PUT` | `/admin/api/plans/{plan_id}` | Update plan. |
+| `DELETE` | `/admin/api/plans/{plan_id}` | Delete plan. |
+| `GET` | `/admin/api/plans/available-profiles` | List available model profiles for plans. |
+| `GET` | `/admin/api/plans/public/active` | List public active plans (no admin auth). |
+
+### Admin: Model Profiles
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/model-profiles` | List model profile configs. |
+| `POST` | `/admin/api/model-profiles` | Create model profile. |
+| `PUT` | `/admin/api/model-profiles/{key}` | Update model profile. |
+| `DELETE` | `/admin/api/model-profiles/{key}` | Delete model profile. |
+
+### Admin: Costs
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/costs/record` | Record API cost entry (201). |
+| `GET` | `/admin/costs/user/{user_id}/summary` | Cost summary for user. |
+| `GET` | `/admin/costs/user/{user_id}/records` | Cost records for user. |
+| `GET` | `/admin/costs/session/{session_id}` | Costs for a session. |
+| `GET` | `/admin/costs/session/{session_id}/summary` | Cost summary for session. |
+| `GET` | `/admin/costs/users/top` | Top users by cost. |
+| `GET` | `/admin/costs/daily` | Daily cost breakdown. |
+| `GET` | `/admin/costs/stats/global` | Global cost statistics. |
+
+### Admin: Invites
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/invites` | Create invite code. |
+| `POST` | `/admin/invites/batch` | Batch create invite codes. |
+| `GET` | `/admin/invites` | List invite codes. |
+| `POST` | `/admin/invites/{code}/deactivate` | Deactivate invite code. |
+| `GET` | `/admin/invites/{code}` | Get invite code. |
+
+### Admin: Notifications
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/notifications` | List notifications. |
+| `POST` | `/admin/api/notifications/send` | Send notification to user(s). |
+| `GET` | `/admin/api/notifications/{notification_id}` | Get notification details. |
+
+### Admin: System
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/health/status` | Full system health check (DB, Redis, RabbitMQ, S3). |
+| `GET` | `/admin/api/health/metrics` | System metrics. |
+| `POST` | `/admin/api/cache/clear` | Clear Redis cache. |
+| `GET` | `/admin/api/cache/stats` | Redis cache statistics. |
+| `GET` | `/admin/api/db/connections` | DB connection pool stats. |
+| `GET` | `/admin/api/logs/recent` | Recent log lines. |
+| `GET` | `/admin/api/prod-status` | Production environment status. |
+
+### Admin: System Settings
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/system-settings` | Get all system settings. |
+| `PUT` | `/admin/system-settings/file-parse-max-size` | Update max file parse size (MB). |
+
+### Admin: Analytics
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/stats` | Aggregate dashboard stats. |
+| `GET` | `/admin/api/analytics/charts` | Chart data for analytics dashboard. |
+| `GET` | `/admin/api/analytics/retention` | Retention cohort data. |
+
+### Admin: Message Ratings
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/message-ratings` | List message ratings. |
+| `GET` | `/admin/api/message-ratings/analytics` | Rating analytics. |
+
+### Admin: Prompt Stats
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/prompt-stats` | List prompt stats. |
+| `GET` | `/admin/api/prompt-stats/csv` | Download prompt stats as CSV. |
+
+### Admin: Roles
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/roles` | List roles. |
+| `POST` | `/admin/api/roles` | Create role. |
+| `PUT` | `/admin/api/roles/{role_id}` | Update role. |
+| `DELETE` | `/admin/api/roles/{role_id}` | Delete role. |
+
+### Admin: Library
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/library/categories` | List library categories. |
+| `GET` | `/admin/api/library/categories/{category_id}` | Get category. |
+| `POST` | `/admin/api/library/categories` | Create category. |
+| `PUT` | `/admin/api/library/categories/{category_id}` | Update category. |
+| `DELETE` | `/admin/api/library/categories/{category_id}` | Delete category. |
+| `GET` | `/admin/api/library/cards` | List library cards. |
+| `GET` | `/admin/api/library/cards/{card_id}` | Get card. |
+| `POST` | `/admin/api/library/cards` | Create card. |
+| `PUT` | `/admin/api/library/cards/{card_id}` | Update card. |
+| `DELETE` | `/admin/api/library/cards/{card_id}` | Delete card. |
+
+### Admin: Session Logs
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/session-logs/{session_id}/logs` | Get session agent logs. |
+| `GET` | `/admin/api/session-logs/{session_id}` | Get session details with logs. |
+
+### Admin: Landing Stats
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/landing-stats` | Landing page statistics. |
+| `GET` | `/admin/api/landing-stats/summary` | Landing stats summary. |
+
+### Admin: Views
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/views` | List admin views. |
+| `POST` | `/admin/api/views` | Create view (201). |
+| `GET` | `/admin/api/views/templates` | List view templates. |
+| `GET` | `/admin/api/views/widgets` | List available widgets. |
+| `GET` | `/admin/api/views/deployed-slugs` | List deployed view slugs. |
+| `GET` | `/admin/api/views/global-legal` | Get global legal content. |
+| `PUT` | `/admin/api/views/global-legal` | Update global legal content. |
+| `GET` | `/admin/api/views/{view_id}` | Get view. |
+| `PUT` | `/admin/api/views/{view_id}` | Update view. |
+| `DELETE` | `/admin/api/views/{view_id}` | Delete view (204). |
+| `POST` | `/admin/api/views/{view_id}/copy` | Clone view (201). |
+| `POST` | `/admin/api/views/deploy` | Deploy/publish views. |
+| `POST` | `/admin/api/views/{view_id}/upload-video` | Upload video for view. |
+| `DELETE` | `/admin/api/views/{view_id}/delete-video` | Delete view video. |
+
+### Admin: Helpdesk
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/api/helpdesk/tickets` | List all tickets. |
+| `GET` | `/admin/api/helpdesk/tickets/{ticket_id}` | Get ticket. |
+| `PATCH` | `/admin/api/helpdesk/tickets/{ticket_id}` | Update ticket (assign, status, priority). |
+| `POST` | `/admin/api/helpdesk/tickets/{ticket_id}/messages` | Add admin message (201). |
+| `GET` | `/admin/api/helpdesk/stats` | Helpdesk statistics. |
+| `GET` | `/admin/api/helpdesk/assignable-agents` | List admin users available for assignment. |
+| `GET` | `/admin/api/helpdesk/tickets/{ticket_id}/attachments/{attachment_id}/download` | Download attachment. |
+| `GET` | `/admin/api/helpdesk/analytics` | Helpdesk analytics. |
+| `GET/POST/PATCH/DELETE` | `/admin/api/helpdesk/sla-policies` | SLA policy CRUD. |
+| `GET/POST/GET/PATCH/DELETE` | `/admin/api/helpdesk/kb/articles` | KB article CRUD. |
+| `GET/GET/POST/PATCH/DELETE` | `/admin/api/helpdesk/canned-responses` | Canned response CRUD. |

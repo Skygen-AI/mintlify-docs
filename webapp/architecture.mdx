@@ -1,114 +1,231 @@
 ---
-title: "WebApp architecture"
-description: "Platform shell pattern — thin WebApp wrapper, shared ui-shared-tauri submodule, cross-platform adapter."
+title: "WebApp Architecture"
+description: "Platform shell pattern, dual-location code split, bootstrap lifecycle, and module map for the Skygen web frontend."
 ---
 
-Skygen's web and desktop clients share 95% of their code through a **platform shell pattern**. `WebApp/` is a thin ~50-line wrapper that bootstraps `ui-shared-tauri/` — the git submodule that holds all pages, stores, API clients, components, and hooks. Desktop variants (`AppDemo-MacOS`, `AppDemo-Win`) follow the same pattern.
+# WebApp Architecture
 
-## Three variants, one core
+The Skygen WebApp follows a **Platform Shell Pattern**: the browser app (`WebApp/`) is a thin configuration wrapper (~20 lines) that bootstraps a shared UI library (`ui-shared-tauri/`) which contains all real application code. This separation allows the same UI codebase to run inside a Tauri desktop app and the browser without conditional imports.
 
-| | WebApp | AppDemo-MacOS | AppDemo-Win |
-|---|--------|---------------|-------------|
-| Platform | Browser | Tauri + Swift | Tauri + Rust |
-| Desktop automation | No | CGEvent, CGImage | SendInput, DXGI |
-| Secure storage | localStorage | Keychain | Windows Credential Manager |
-| OAuth window | Same-tab redirect | Native Safari window | Native browser |
-| UI layer | React 18 + Vite → ui-shared-tauri | → ui-shared-tauri | → ui-shared-tauri |
+---
 
-All three share pages, Zustand stores, HTTP + Socket.IO clients, Stripe integration, and theme.
-
-## Folder layout
+## Repository Layout
 
 ```
 WebApp/
-├── src/                          # Thin wrapper, ~50 lines
-│   ├── main.tsx                  # Bootstrap + render
-│   ├── config/api.ts             # BACKEND_URL, WS_URL from VITE_* envs
-│   ├── platform/
-│   │   └── webPlatformAdapter.ts # IPlatformAdapter for browser
-│   └── styles/globals.css
-├── ui-shared-tauri/              # Git submodule (separate repo)
-│   └── src/
-│       ├── init/bootstrap.ts     # Stores global config + platform
-│       ├── api/                  # HTTP client + Socket.IO manager
-│       ├── store/                # 10 Zustand slices
-│       ├── pages/                # All page components
-│       ├── components/           # Reusable UI
-│       ├── hooks/                # Custom hooks
-│       └── types/                # TypeScript interfaces
-├── index.html
-├── vite.config.ts
-└── tailwind.config.js            # content: ["./ui-shared/**"]
+├── src/                          # Web wrapper (~3 files)
+│   ├── main.tsx                  # Entry point — bootstrap + render
+│   ├── config/api.ts             # VITE_BACKEND_URL / VITE_WS_URL / VITE_STRIPE_PUBLISHABLE_KEY
+│   └── platform/webPlatformAdapter.ts   # IPlatformAdapter for browser
+│
+└── ui-shared-tauri/src/          # All real UI code (git submodule)
+    ├── api/
+    │   ├── http/                 # HTTP API modules (one file per domain)
+    │   └── websocket/            # Socket.IO singleton client
+    ├── store/
+    │   ├── useStore.ts           # Zustand store composition
+    │   └── slices/               # 11 domain slices
+    ├── components/               # Reusable React components
+    ├── pages/                    # Page-level components
+    ├── hooks/                    # Custom React hooks
+    ├── types/                    # TypeScript type definitions
+    ├── contexts/                 # React contexts
+    ├── utils/                    # Pure utilities
+    └── init/bootstrap.ts         # Bootstrap + global config accessors
 ```
 
-## Entry point flow
+<Info>
+The `ui-shared-tauri/` directory is a **git submodule**. When modifying UI code, you must commit in both the submodule repository and the parent `WebApp/` repository.
+</Info>
 
-**`WebApp/src/main.tsx`** is the entire web-side bootstrap:
+---
 
-```tsx
-import { bootstrap, App } from "../ui-shared-tauri/src";
-import { API_CONFIG } from "./config/api";
-import { webPlatformAdapter } from "./platform/webPlatformAdapter";
+## Bootstrap Lifecycle
 
+The app must be initialized before any React rendering starts.
+
+```typescript
+// WebApp/src/main.tsx
 bootstrap({
   apiConfig: {
-    BACKEND_URL: API_CONFIG.BACKEND_URL,
-    WS_URL: API_CONFIG.WS_URL,
-    STRIPE_PUBLISHABLE_KEY: API_CONFIG.STRIPE_PUBLISHABLE_KEY,
+    BACKEND_URL: import.meta.env.VITE_BACKEND_URL || 'https://dev.skygen.ai',
+    WS_URL:      import.meta.env.VITE_WS_URL      || 'wss://dev.skygen.ai',
+    STRIPE_PUBLISHABLE_KEY: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY || '',
   },
   platform: webPlatformAdapter,
+  basePath: '/app',
 });
 
-ReactDOM.createRoot(document.getElementById("root")!).render(<App />);
+ReactDOM.createRoot(document.getElementById('root')!).render(<App />);
 ```
 
-**`ui-shared-tauri/src/init/bootstrap.ts`** stores the config globally. `getApiConfig()` and `getPlatform()` are used by the HTTP client, Socket.IO manager, secure storage, and desktop automation. Deferred access prevents circular imports.
+`bootstrap()` stores the `apiConfig` and `platform` adapter in module-level variables inside `init/bootstrap.ts`. All other modules call `getBackendUrl()`, `getWsUrl()`, and `getPlatform()` to access them — there is no prop-drilling or React context for these.
 
-## Environment variables (WebApp)
+### Environment Variables
 
-Vite requires `VITE_` prefix for client-exposed vars. Changes require a rebuild:
+| Variable | Default | Purpose |
+|---|---|---|
+| `VITE_BACKEND_URL` | `https://dev.skygen.ai` | REST API base URL |
+| `VITE_WS_URL` | `wss://dev.skygen.ai` | Socket.IO server URL |
+| `VITE_STRIPE_PUBLISHABLE_KEY` | `""` | Stripe.js init key |
 
-| Var | Purpose |
-|-----|---------|
-| `VITE_BACKEND_URL` | Backend API (e.g. `https://api.skygen.ai`) |
-| `VITE_WS_URL` | Socket.IO endpoint (e.g. `wss://api.skygen.ai`) |
-| `VITE_STRIPE_PUBLISHABLE_KEY` | Stripe publishable (`pk_live_…`) |
-| `VITE_GTM_ID` | Google Tag Manager container ID |
-| `VITE_GOOGLE_ADS_ID` | Google Ads conversion tracking ID |
+---
 
-Resolved in `src/config/api.ts` with sensible defaults.
+## Platform Adapter
 
-## What's shared vs platform-specific
+The `IPlatformAdapter` interface abstracts platform capabilities. The web implementation uses `localStorage` for storage and `window.location.href` for OAuth:
 
-**Shared (ui-shared-tauri):**
-- Pages: `LoginPage`, `RegisterPage`, `ChatPage`, `PricingPage`, `HomeUpdated`, `HelpdeskPage`, all the rest
-- Zustand stores: auth, sessions, messages, devices, billing, UI, notifications, helpdesk, cloud-pc, scheduled-tasks
-- HTTP modules: `authApi`, `sessionApi`, `deviceApi`, `billingApi`, `connectorsApi`, and more
-- Socket.IO client with namespace subscriptions
-- Stripe Elements wiring
-- Dark/light theme, form validation, error handling
+```typescript
+// WebApp/src/platform/webPlatformAdapter.ts
+export const webPlatformAdapter: IPlatformAdapter = {
+  platform: 'web',
+  capabilities: {
+    hasDesktopAutomation: false,   // No device WebSocket on web
+    hasSecureStorage: false,        // Uses localStorage, not OS keychain
+    hasOverlay: false,
+    canOpenOAuthWindow: true,
+  },
+  storage: {
+    get:    async (key) => localStorage.getItem(key),
+    set:    async (key, value) => localStorage.setItem(key, value),
+    remove: async (key) => localStorage.removeItem(key),
+  },
+  openOAuthWindow: async (url) => { window.location.href = url; },
+  desktop: undefined,              // No device WebSocket for web
+  analytics: {
+    identify: (userId) => window.dataLayer.push({ event: 'identify', user_id: userId }),
+    track:    (event, props) => window.dataLayer.push({ event, ...props }),
+  },
+};
+```
 
-**Platform-specific (per wrapper):**
-- Desktop automation (macOS/Windows only)
-- Secure token storage (native keychains vs localStorage)
-- Auto-update mechanism
-- System overlay for desktop actions
-- Device websocket (broker) connection
+The desktop (Tauri) adapter implements `desktop.startDeviceWebSocket()` and uses OS-level secure storage. Feature-gating is done in `authSlice` via `platform.capabilities.hasDesktopAutomation`.
 
-## Adding a new platform
+---
 
-Create a sibling wrapper (e.g. `ElectronApp/`) that:
+## Module Map
 
-1. Defines an `IPlatformAdapter` implementation (see [Platform adapter](/webapp/platform-adapter))
-2. Imports `bootstrap` and `App` from the `ui-shared-tauri` submodule
-3. Passes its adapter into `bootstrap({ platform: ... })`
-4. Handles its own packaging and deploy pipeline
+<AccordionGroup>
+  <Accordion title="api/ — HTTP and WebSocket clients">
+    **`api/http/httpClient.ts`** — Base `fetch` wrapper. Injects auth headers, handles `credentials:'include'`, throws typed `HttpClientError` on non-2xx.
 
-That is the full integration work. Pages, API calls, and state all come from the submodule.
+    **`api/http/authApi.ts`** — Auth endpoints: login, register, logout, 2FA, token refresh, session upgrade.
 
-## See also
+    **`api/http/sessionApi.ts`** — Session CRUD, message history, message send, plan fetch, task cancel/status.
 
-- [State management](/webapp/state-management) — Zustand slices
-- [API client](/webapp/api-client) — HTTP + Socket.IO
-- [Platform adapter](/webapp/platform-adapter) — interface + implementations
-- [Pages](/webapp/pages) — every route
+    **`api/http/billingApi.ts`** — Billing status, plans, Stripe setup, subscriptions.
+
+    **`api/http/deviceApi.ts`** — Device registration, listing, deletion.
+
+    **`api/http/cloudPcApi.ts`** — Cloud PC lifecycle, file manager, control transfer.
+
+    **`api/http/notificationsApi.ts`** — Notification listing and read marking.
+
+    **`api/http/scheduledTasksApi.ts`** — Scheduled task CRUD + run history.
+
+    **`api/websocket/wsClient.ts`** — `SocketIOClient` singleton. Connects to `/user` namespace, manages all event subscriptions, deduplicates durable events by `notification_id`.
+  </Accordion>
+
+  <Accordion title="store/ — Zustand state management">
+    Single Zustand store composed of 11 slices. See [State Management](/webapp/state-management) for details.
+
+    | Slice | Responsibility |
+    |---|---|
+    | `authSlice` | User auth, session restore, login/logout lifecycle |
+    | `sessionSlice` | Chat session CRUD |
+    | `messageSlice` | Message history, send, cancel, optimistic updates |
+    | `liveStateSlice` | Task status, typing indicators, agent steps, plan |
+    | `deviceSlice` | Device list, selection, status updates |
+    | `billingSlice` | Billing status, plans, subscription mutations |
+    | `cloudPcSlice` | Per-session Cloud PC state, heartbeat lifecycle |
+    | `uiSlice` | Theme, sidebar, confirmations, paywall, modals |
+    | `notificationsSlice` | Admin notifications |
+    | `helpdeskSlice` | Support ticket state |
+    | `scheduledTasksSlice` | Scheduled task CRUD |
+  </Accordion>
+
+  <Accordion title="hooks/ — Custom React hooks">
+    **`useChatWebSocket`** — Subscribes to all Socket.IO events for a chat session. Handles `display_message`, `new_message`, `task_progress`, `agent_typing`, `ui_meta_update`, `agent_error`, `attachments_ready`. Contains a 120s watchdog timer that REST-polls `/agent/task/{id}/status` every 15s while a task is active to unstick a stale spinner.
+
+    **`useChatSend`** — Wraps `messageSlice.sendMessage()` with device/mode selection logic.
+
+    **`useAuth`** — Exposes auth state from store.
+
+    **`useDevices`** — Device list with load-on-first-use.
+
+    **`useBilling`** — Billing status with paywall logic.
+
+    **`useCloudPCActions`** — Connect/disconnect/take-control for Cloud PC.
+
+    **`useCloudPCEvents`** — Subscribes to `cloud_pc_status_changed`, `cloud_pc_control_changed`, etc.
+
+    **`useMainLayoutInit`** — Runs the initial data loading sequence after auth: sessions, devices, billing status, notifications.
+  </Accordion>
+
+  <Accordion title="types/ — TypeScript contracts">
+    All interfaces mirroring backend Pydantic schemas. See [API Contract](/contracts/frontend-api-contract) for full type listing.
+
+    - `types/api.ts` — Re-export hub (backward compat)
+    - `types/auth.ts` — `User`, `TokenResponse`, `RegisterResponse`
+    - `types/sessions.ts` — `Session`
+    - `types/messages.ts` — `Message`, `MessageMetadata`, `SendMessageResult`, error types, UI meta aliases
+    - `types/websocket.ts` — `JsonRpcMessage`, all WS event params, `UiMetaUpdatePayload` union, type guards
+    - `types/devices.ts` — `Device`, `CreateDeviceRequest`
+    - `types/billing.ts` — `BillingStatus`, `Plan`, transaction types, `PAYWALL_REASONS`
+    - `types/cloudpc.ts` — `CloudPCStatus`, `CloudPCController`, `CloudPCViewMode`
+    - `types/platform.ts` — `IPlatformAdapter`, `BootstrapConfig`, `ApiConfig`
+    - `types/confirmations.ts` — `ConfirmationRequest` and confirmation flow types
+    - `types/scheduledTasks.ts` — `ScheduledTask`, `ScheduledTaskCreate`, `ScheduledTaskRun`
+    - `types/notifications.ts` — `NotificationItem`, `WsAdminNotification`
+    - `types/files.ts` — `Attachment`, `AttachmentRead`, `FileParseResponse`
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Data Flow Diagram
+
+```
+User action
+    │
+    ▼
+React Component
+    │  reads state via useStore() / custom hook
+    ▼
+Zustand Store (useStore)
+    │  dispatches actions
+    ▼
+Store Slice action (e.g. messageSlice.sendMessage)
+    │  calls API module
+    ▼
+HTTP API module (e.g. sessionApi.sendMessage)
+    │  fetch() with credentials:'include' + Bearer header
+    ▼
+Backend REST API
+
+ Backend → Socket.IO event
+    │
+    ▼
+wsClient (SocketIOClient singleton)
+    │  internal pub/sub
+    ▼
+useChatWebSocket hook handlers
+    │  useStore.getState().<action>()
+    ▼
+Zustand Store
+    │  triggers re-render
+    ▼
+React Components
+```
+
+---
+
+## Auth Cookie Migration
+
+The backend is actively migrating from pure Bearer-token auth to `skygen_session` HttpOnly cookies. The frontend handles both:
+
+1. **First login/register** — backend sets `skygen_session` cookie AND returns JWT in body. Both are stored.
+2. **Session restore** — `authApi.upgradeSession()` converts any legacy localStorage token to a cookie before every `/users/me` call.
+3. **HTTP requests** — `httpClient` uses `credentials:'include'`. Backend prefers cookie when present; falls back to Bearer for native clients.
+4. **Socket.IO** — `withCredentials: true` on the handshake + `auth.token` fallback for native.
+5. **Phase 2** — `/auth/upgrade-session` returns `410 Gone` once migration is complete; frontend auto-purges stale localStorage tokens on 410.

@@ -1,106 +1,282 @@
 ---
-title: "Safety"
-description: "Violation logging, unified confirmations, and why Skygen's safety layer is intentionally thin."
+title: "Safety & Guardrails"
+description: "How Skygen evaluates agent outputs for safety, blocks harmful content, and escalates ambiguous cases to the user."
 ---
 
-Skygen's Safety layer is **transparency-focused, not constraint-focused**. There is no user-configurable rule engine on the backend. Instead, agents implement their own safety checks and the backend provides two primitives:
+## Overview
 
-1. A violation log — agents write to it when they flag unsafe content.
-2. A unified confirmation channel — agents ask the user when in doubt (same plumbing as [Confirmations](/concepts/confirmations)).
+Every Skygen agent output passes through a two-tier guardrail pipeline before an action is taken. Tier 1 runs fast, deterministic checks in parallel. If any Tier 1 check flags the content, Tier 2 escalates to a more powerful LLM judge that returns one of three verdicts: `SAFE`, `NEED_HUMAN_CLARIFICATION`, or `UNSAFE`. The system is designed to be conservative — UNSAFE verdicts are rare and reserved for clearly harmful behavior.
 
-That is the entire safety surface. If you expected a rule editor, see the section at the bottom — it is intentional.
+---
 
-## Verdicts
-
-Only two canonical values ever appear in logs:
-
-- **`UNSAFE`** — the agent's safety checker classified the content as a hard violation.
-- **`NEED_HUMAN_CLARIFICATION`** — the agent is unsure and wants user input.
-
-Stored with `reason`, the context (`user_id`, `task_id`, `device_id`), `triggered_by` (list of checker names like `["regex_checker", "permission_blocker"]`), the raw `user_input` and `agent_output`, and `user_approved` (nullable boolean).
-
-## Endpoints
-
-### Agent-authenticated
-
-<ParamField path="POST /safety/request-confirmation" type="legacy">
-Legacy alias for the unified confirmations flow. Body: `{ device_id, reason, timeout, session_id? }`. Creates a Redis confirmation with TTL, polls every 500ms until the user responds or the timeout fires. Returns `{ approved, message }`. Kept for backward compatibility — new code should use `/agent/confirmations/request`.
-</ParamField>
-
-<ParamField path="POST /safety/log-violation" type="agent">
-Log a safety violation after the agent flags content. Body: `{ verdict, reason, user_id?, task_id?, device_id?, triggered_by?, user_input?, agent_output? }`. Returns `{ violation_id, message }`.
-</ParamField>
-
-### User-authenticated
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/safety/violations?verdict=&limit=&offset=` | The current user's violations |
-| `GET` | `/safety/violations/stats?days=30` | Personal counts by verdict |
-
-### Admin-only
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/safety/violations/global-stats?days=7` | Platform-wide aggregates with affected-user count |
-
-## Violation retrieval
-
-```bash
-curl "https://api.skygen.ai/safety/violations?verdict=UNSAFE&limit=50" \
-  -H "Authorization: Bearer $TOKEN"
-# → { "violations": [{ id, verdict, reason, triggered_by, user_approved, created_at, ... }], "total": 5, ... }
-```
-
-Violations are indexed on `user_id`, `task_id`, `device_id`, `verdict`, `created_at`. Users see their own; admins see global aggregates.
-
-## Integration with confirmations
-
-When a safety checker fires `NEED_HUMAN_CLARIFICATION`, the agent calls `POST /safety/request-confirmation` (or the newer `/agent/confirmations/request`). The rest is identical to a normal confirmation:
+## Pipeline architecture
 
 ```
-Agent detects uncertain action
-   │
-   ▼
-POST /safety/request-confirmation
-   │
-   ▼
-Backend creates Redis confirmation (TTL 300s default)
-   │
-   ▼
-Socket.IO `confirmation_request` event on /user
-   │
-   ▼
-User decides via POST /agent/confirmations/{id}/respond
-   │
-   ▼
-Agent resumes. Violation logged with user_approved=true|false
+User Input + Agent Output
+        ↓
+   SafetyCheckContext
+        ↓
+  ┌─────────────────────────────────────────────┐
+  │  Tier 1 — concurrent, fast                  │
+  │  ┌──────────────┐  ┌────────────────────┐   │
+  │  │  RegexCheck  │  │ LightClassifier    │   │
+  │  │  (always)    │  │ (if ctx > 25k tok) │   │
+  │  └──────────────┘  └────────────────────┘   │
+  │  + agent self-reflection vote (if present)   │
+  └─────────────────────────────────────────────┘
+        ↓ (if any vote is_safe=False)
+  ┌─────────────────────────────────────────────┐
+  │  Tier 2 — heavy LLM judge                   │
+  │  Model: qwen/qwen3-235b-a22b-thinking-2507  │
+  │  Output: SAFE | NEED_HUMAN_CLARIFICATION    │
+  │          | UNSAFE                           │
+  └─────────────────────────────────────────────┘
+        ↓
+   GuardrailResult(verdict, reason, triggered_by)
 ```
 
-See [Confirmations](/concepts/confirmations) for the full protocol.
+The entry point is `run_safety_pipeline()` in `Agent/Guardrails/Guardrails.py`. It accepts `user_input`, `agent_output` (a `ThinkOutput` dataclass), and the message `history`. The pipeline is pluggable — custom deployments can register additional `SafetyCheck` subclasses via `GetDefaultRegistry().Register(check)`.
 
-## Why there is no rule editor
+---
 
-Skygen's backend deliberately does not host safety rule configuration. The reasoning:
+## Tier 1 checks
 
-- **Safety lives where it enforces.** The agent has direct access to the full context (proposed action, history, screenshots) — a server-side rule engine cannot reproduce that fidelity without becoming the agent.
-- **Audit, not override.** The backend's job is to provide transparent records of what the agent flagged and what the user decided. Editing the rules is the agent's job.
-- **Confirmation is the escape valve.** If an action is borderline, ask. That covers the 5% of cases a rigid ruleset cannot.
+### Regex check
 
-If you need user-level configuration (e.g., "always require confirmation for shell commands containing `sudo`"), that lives in the agent's own safety profile, not in this API.
+**Name:** `regex`  
+**Always runs:** yes
 
-## Default checkers
+Scans the combined `user_input + agent_output` text against compiled patterns:
 
-There is no canonical list of default rules stored in the Backend — agents define their own. Typical classes of checks an agent will flag:
+| Category | What it matches |
+|----------|----------------|
+| `illegal_activity` | Instructions to build bombs, explosives, weapons, or synthesize methamphetamine |
+| `hate_speech` | Nazi ideology, supremacist rhetoric, genetically inferior framing |
+| `self_harm` | Explicit self-harm or suicide instructions |
 
-- Destructive file operations outside a scratch directory
-- Outbound messages from connected integrations (email, Slack)
-- Reading sensitive file types (`.pem`, `.env`, `.kdbx`)
-- Financial transactions
+A match immediately marks the vote `is_safe=False`. No LLM call is made — this check is synchronous and takes under 1 ms.
 
-Each agent version may add or remove checks. Track the agent's release notes, not this page.
+### Light classifier check
 
-## See also
+**Name:** `light_classifier`  
+**Runs when:** `history_tokens > context_token_threshold` (default 25,000)
 
-- [Confirmations](/concepts/confirmations) — the flow that every safety ask uses
-- [Agents](/concepts/agents) — where safety checkers actually run
+When conversation context is large, regex alone may miss intent hidden in nuance. The light classifier sends the combined text to a fast LLM requesting a JSON response `{"safe": bool, "reason": str}`. Default model: `qwen/qwen3-235b-a22b-thinking-2507`.
+
+On classifier failure (empty response, parse error, timeout) the check defaults to `is_safe=True`. Errors in monitoring do not block user tasks.
+
+### Agent self-reflection
+
+Each agent `ThinkOutput` can include a `safety_assessment` field — a `Tier1Vote` the LLM produced by evaluating its own planned actions. Agents include a `SAFETY_ASSESSMENT: {...}` JSON block in structured output:
+
+```
+SAFETY_ASSESSMENT: {"safe": false, "reason": "About to send data to an untrusted endpoint"}
+```
+
+If parsing fails, the vote defaults to `is_safe=True`.
+
+---
+
+## Tier 2 — heavy judge
+
+When any Tier 1 vote flags unsafe, the pipeline escalates to the heavy judge. The judge receives the original user input, the full serialized agent output, and the flagging votes. The judge prompt instructs the model to be **very conservative with UNSAFE verdicts** — ordinary automation (web scraping, Telegram, API calls) is not unsafe.
+
+| Verdict | Consequence |
+|---------|-------------|
+| `SAFE` | Agent proceeds normally |
+| `NEED_HUMAN_CLARIFICATION` | Agent hibernates; ask_human prompt surfaces in UI |
+| `UNSAFE` | Agent terminates; violation logged to `safety_violations` table |
+
+If the heavy judge itself fails, it defaults to `UNSAFE` — a failure in the safety judge is treated as a red flag.
+
+---
+
+## Safety violations
+
+Violations are persisted via `log_safety_violation()` in `app/services/safety_service.py`:
+
+```python
+violation_id = await log_safety_violation(
+    db=db,
+    verdict="UNSAFE",
+    reason="Regex match for category: illegal_activity",
+    user_id=user_id,
+    task_id=task_id,
+    device_id=device_id,
+    triggered_by=["regex"],
+    user_input=user_input,
+    agent_output=agent_output,
+)
+```
+
+Fields stored: `verdict`, `reason`, `triggered_by` (list of checker names), `user_input`, `agent_output`, and traceability references (`user_id`, `task_id`, `device_id`).
+
+Admins review violations at `GET /admin/api/safety-violations`.
+
+---
+
+## Configuring the pipeline
+
+| Config field | Default | Description |
+|---|---|---|
+| `safety_context_threshold` | `25000` | Token count above which light classifier activates |
+| `safety_light_classifier_model` | `qwen/qwen3-235b-a22b-thinking-2507` | Tier 1 LLM model |
+| `safety_heavy_classifier_model` | `qwen/qwen3-235b-a22b-thinking-2507` | Tier 2 judge model |
+
+### Registering a custom check
+
+```python
+from Guardrails.Checks import SafetyCheck, SafetyCheckContext
+from Utilities.Context.Primitives import Tier1Vote
+from Guardrails.Guardrails import GetDefaultRegistry
+
+class DomainBlocklistCheck(SafetyCheck):
+    Name = "domain_blocklist"
+
+    async def Evaluate(self, ctx: SafetyCheckContext) -> Tier1Vote:
+        if "evil-domain.com" in ctx.combined_text:
+            return Tier1Vote(self.Name, is_safe=False, reason="Blocked domain")
+        return Tier1Vote(self.Name, is_safe=True, reason="No blocked domains")
+
+GetDefaultRegistry().Register(DomainBlocklistCheck())
+```
+
+Custom checks run concurrently with built-ins via `asyncio.gather`. Checks must never raise — return `is_safe=True` on internal failure.
+
+---
+
+## What is not blocked
+
+The safety system is intentionally permissive for standard automation:
+
+- Web scraping and data extraction
+- API integrations (Telegram, Slack, Gmail, GitHub)
+- File system operations within the E2B sandbox
+- Running shell commands inside Cloud PC sessions
+- Sending emails and messages on behalf of the user
+
+These are normal agent operations. Guardrails target genuinely harmful content: weapons instructions, hate speech, self-harm, and explicit illegal activity.
+
+---
+
+## Safety in sub-agents
+
+Each agent in the hierarchy (Orchestrator, Supervisor, Performer) runs safety checks independently on its own outputs. If a sub-agent produces `NEED_HUMAN_CLARIFICATION`, it emits its own ask_human prompt and hibernates; the parent BrokerAgent waits for the child to resume before continuing the parent task.
+
+---
+
+## SafetyCheckContext reference
+
+`run_safety_pipeline()` builds a `SafetyCheckContext` from the call arguments and passes it to every tier-1 check.
+
+**Function signature:**
+
+```python
+async def run_safety_pipeline(
+    user_input: str,
+    agent_output: ThinkOutput,
+    history: list[Message],
+    *,
+    session=None,
+    session_id: str = "unknown",
+    user_id: Optional[str] = None,
+    config: Optional[AgentConfig] = None,
+) -> GuardrailResult
+```
+
+**`SafetyCheckContext` dataclass** (defined in `Agent/Guardrails/Checks.py`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `combined_text` | `str` | `user_input + "\n" + serialized agent_output` — the text evaluated by all checks |
+| `history_tokens` | `int` | Estimated token count of the conversation history; compared against `context_token_threshold` |
+| `session` | `Any` | Backend session object (passed through for checks that need to query session state) |
+| `session_id` | `str` | Session UUID; defaults to `"unknown"` |
+| `user_id` | `Optional[str]` | User UUID for violation logging |
+| `context_token_threshold` | `int` | Default 25,000. Light classifier activates when `history_tokens > context_token_threshold` |
+| `light_classifier_model` | `str` | Default `qwen/qwen3-235b-a22b-thinking-2507`. Model used by `LightClassifierSafetyCheck` |
+
+`ThinkOutput` is defined in `Agent/Utilities/Context/Primitives.py` and holds the structured LLM output. Its `safety_assessment` field is a `Tier1Vote` — the agent's own self-assessment before the external pipeline evaluates it.
+
+---
+
+## Tier1Vote schema
+
+Each check in the pipeline returns a `Tier1Vote`:
+
+```python
+@dataclass
+class Tier1Vote:
+    checker_name: str   # e.g. "regex", "light_classifier", "self_reflection"
+    is_safe: bool
+    reason: str         # Human-readable explanation for the verdict
+```
+
+All votes from Tier 1 are collected. If every vote has `is_safe=True`, the pipeline returns `GuardrailVerdict.SAFE` immediately without calling the heavy judge.
+
+---
+
+## Pipeline error handling
+
+The safety pipeline is designed to never block agent operation due to infrastructure failures:
+
+| Failure mode | Behavior |
+|---|---|
+| Light classifier LLM call times out | Vote defaults to `is_safe=True`; pipeline continues |
+| Light classifier returns unparseable JSON | Vote defaults to `is_safe=True` |
+| Heavy judge LLM call fails | Verdict defaults to `UNSAFE` — judge failure is treated as a safety signal |
+| Heavy judge returns unparseable output | Verdict defaults to `UNSAFE` |
+| `log_safety_violation()` DB write fails | Logged as error; agent still terminates (violation not silently swallowed) |
+
+The asymmetry is intentional: Tier 1 failures are permissive (assume safe so automation continues), while Tier 2 judge failures are restrictive (assume unsafe because the system could not verify).
+
+---
+
+## User-facing escalation flow
+
+When the heavy judge returns `NEED_HUMAN_CLARIFICATION`, the following sequence occurs:
+
+<Steps>
+  <Step title="Agent emits ask_human message">
+    The BrokerAgent calls `communicate(wait_for_reply=True)` with an ask_human input card containing the judge's `reason` field as the clarification prompt.
+  </Step>
+  <Step title="Session hibernates">
+    `HibernationController.Hibernate()` creates a `SentinelTask` with strategy `user_reply`. The agent thread is freed.
+  </Step>
+  <Step title="User reviews and responds">
+    The chat interface enters ask-human mode. The user reads the clarification question and either approves the action or provides an alternative instruction.
+  </Step>
+  <Step title="Agent resumes with context">
+    The user's reply is injected as a user message. The agent re-evaluates its plan with the clarification. If the next action is safe, it proceeds; if the same action is attempted again and flags `UNSAFE`, the session terminates.
+  </Step>
+</Steps>
+
+---
+
+## Viewing violations in the admin panel
+
+Safety violations are accessible at `GET /admin/api/safety-violations`. Each record contains:
+
+| Field | Description |
+|-------|-------------|
+| `id` | UUID of the violation record |
+| `verdict` | `UNSAFE` or `NEED_HUMAN_CLARIFICATION` |
+| `reason` | Human-readable explanation from the judge |
+| `triggered_by` | Array of checker names that flagged the output |
+| `user_id` | User whose session produced the violation |
+| `task_id` | Task UUID for traceability |
+| `user_input` | The user message that initiated the flagged turn |
+| `agent_output` | The agent output that was flagged |
+| `created_at` | Timestamp |
+
+Admins can update a violation record's `user_response` field to note the review outcome:
+
+```python
+await update_violation_user_response(
+    db=db,
+    violation_id=violation_id,
+    user_response="Reviewed — false positive, user confirmed legitimate research task",
+)
+```
+
+This audit trail supports SOC 2 review workflows and operator compliance reporting.

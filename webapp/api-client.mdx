@@ -1,225 +1,335 @@
 ---
-title: "API client"
-description: "HTTP modules, Socket.IO lifecycle, type system, and error handling."
+title: "API Client"
+description: "HTTP client, Socket.IO client, authentication flow, durable delivery, and event catalogue for the Skygen frontend."
 ---
 
-The API layer in `ui-shared-tauri/src/api/` is two things: a tiny HTTP client (`httpClient`) used by per-domain modules, and a Socket.IO manager (`wsClient`) used by every real-time feature.
+# API Client
 
-## HTTP client
+The frontend API layer is split into two clients: an HTTP client for REST calls and a Socket.IO client for real-time events. Both live in `ui-shared-tauri/src/api/`.
 
-**`src/api/http/httpClient.ts`**:
+---
+
+## HTTP Client (`api/http/httpClient.ts`)
+
+A thin, typed wrapper around the browser `fetch` API.
+
+### Usage
 
 ```typescript
-export const httpClient = {
-  get: <T>(path, options?) => request<T>("GET", path, undefined, options),
-  post: <T>(path, body?, options?) => request<T>("POST", path, body, options),
-  patch: <T>(path, body?, options?) => request<T>("PATCH", path, body, options),
-  delete: <T>(path, options?) => request<T>("DELETE", path, undefined, options),
-};
+import { httpClient } from './api/http/httpClient';
+
+// All methods are typed generics:
+const session = await httpClient.get<Session>('/sessions/abc123');
+const created = await httpClient.post<Session>('/sessions', { title: 'New chat' });
+await httpClient.patch('/sessions/abc123', { title: 'Updated' });
+await httpClient.delete('/sessions/abc123');
 ```
 
-### Auth headers
+The base URL is read from `getBackendUrl()` which returns the value passed to `bootstrap()`. Never hardcode URLs — they differ between dev and prod.
 
-Token is resolved **per-request** because storage is async on desktop:
+### Auth header injection
 
 ```typescript
-async function getAuthHeaders() {
-  const platform = getPlatform();
-  const token = await platform.storage.get("auth_token");
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  return headers;
+// httpClient.ts — called on every non-GET request
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const token = await getPlatform().storage.get('auth_token');
+  return token
+    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+    : { 'Content-Type': 'application/json' };
 }
 ```
 
-### Error extraction
+`credentials: 'include'` is set on every request, so the `skygen_session` cookie is always sent for browser clients regardless of whether a Bearer token is present.
 
-`HttpClientError` captures status + data. `extractErrorMessage(err)` normalizes three shapes into a string:
+### Error handling
 
-1. FastAPI standard: `detail: "message"`
-2. Nested: `detail: { message: "..." }`
-3. Pydantic validation: `detail: [{ loc: [...], msg: "..." }]`
+Non-2xx responses throw `HttpClientError`:
 
 ```typescript
-export function extractErrorMessage(error: unknown): string {
-  if (!(error instanceof HttpClientError)) return String(error);
-  const errObj = error.data as Record<string, unknown>;
-  if (typeof errObj.detail === "string") return errObj.detail;
-  if (typeof errObj.detail === "object" && !Array.isArray(errObj.detail)) {
-    return (errObj.detail as any).message ?? "Unknown error";
-  }
-  if (Array.isArray(errObj.detail)) {
-    return errObj.detail.map((e: any) => `${e.loc.join(".")}: ${e.msg}`).join("; ");
-  }
-  return error.message;
+export class HttpClientError extends Error {
+  status: number;      // HTTP status code (0 for network errors)
+  statusText: string;
+  data?: unknown;      // Raw parsed error response body
 }
 ```
 
-## Per-domain API modules
+Error messages are extracted by `extractErrorMessage()` which handles:
+- `string` detail
+- `object` detail with `message` field (billing errors, device errors)
+- `array` detail (Pydantic validation errors — joined with `;`)
+- Nested `{ error: string }` shape
 
-All follow the same pattern: import `httpClient`, export namespaced methods. One file per domain:
+### Network error detection
 
-| Module | Responsibility |
-|--------|----------------|
-| `authApi` | signup, login, logout, refresh, OAuth, 2FA stubs |
-| `sessionApi` | sessions + messages CRUD, send message |
-| `deviceApi` | devices CRUD, register, delete, status |
-| `billingApi` | billing info, payment intent, plans, coupons |
-| `connectorsApi` | MCP integrations, OAuth initiate, disconnect |
-| `scheduledTasksApi` | scheduled tasks CRUD |
-| `helpdeskApi` | tickets, replies, attachments, KB articles |
-| `cloudPcApi` | Cloud PC lifecycle + files |
-| `notificationsApi` | in-app notifications, mark-read |
+`detectNetworkError()` maps `TypeError` (CORS, connection refused, mixed content) to human-readable messages. This fires before `HttpClientError` is thrown.
 
-### Example: login flow
+### Raw fetch usage
+
+Three API modules bypass `httpClient` and call `fetch()` directly:
+
+| API | Reason |
+|---|---|
+| `authApi.login` | `application/x-www-form-urlencoded` content type |
+| `authApi.getCurrentUser`, `authApi.register`, etc. | Fine-grained error handling (401 vs 400 branching) |
+| `sessionApi.sendMessage` | Status-based branching on 402/403/409/426 — `HttpClientError` would lose typed discriminators |
+| `sessionApi.getMessages`, `getTaskStatus`, `getPlan` | Require `AbortController` timeout (not yet in `httpClient`) |
+
+The `fetchWithTimeout` helper in `sessionApi.ts` wraps raw `fetch` with a 30-second abort controller.
+
+### Mock mode
 
 ```typescript
-async login(email: string, password: string): Promise<TokenResponse> {
-  const body = new URLSearchParams();
-  body.append("username", email);
-  body.append("password", password);
-
-  const res = await fetch(`${getBackendUrl()}/auth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  const data: TokenResponse = await res.json();
-  await getPlatform().storage.set("auth_token", data.access_token);
-  return data;
-}
+const USE_MOCKS = false;  // flip to true for offline dev
 ```
 
-Note: the login endpoint uses form-encoded (OAuth2 spec), not JSON.
+When `true`, all requests return `{}` immediately and log to console. Defined independently in `httpClient.ts`, `authApi.ts`, and `billingApi.ts`.
 
-## Socket.IO client
+---
 
-**`src/api/websocket/wsClient.ts`** (singleton):
+## Domain API Modules
+
+Each module in `api/http/` corresponds to one backend domain. All are plain objects with `async` methods.
+
+<CodeGroup>
+```typescript sessionApi
+// api/http/sessionApi.ts
+sessionApi.getSessions()
+sessionApi.createSession(deviceId, title)
+sessionApi.getSession(sessionId)
+sessionApi.updateSession(sessionId, { title })
+sessionApi.closeSession(sessionId)
+sessionApi.deleteSession(sessionId)
+sessionApi.getMessages(sessionId, limit?, offset?)
+sessionApi.sendMessage(sessionId, content, otpCode?, deviceId?, isSandbox?, agentMode?, metaData?)
+sessionApi.getPlan(sessionId)
+sessionApi.getTaskStatus(sessionId)          // 30s timeout
+sessionApi.getAgentTaskStatus(sessionId)     // via httpClient, no custom timeout
+sessionApi.cancelTask(sessionId, deviceId?, reason?)
+```
+
+```typescript authApi
+// api/http/authApi.ts
+authApi.login(email, password)
+authApi.register(email, password, displayName?, meta?)
+authApi.getCurrentUser()
+authApi.logout()
+authApi.upgradeSession()       // Cookie migration — called on every app mount
+authApi.refreshToken()
+authApi.setup2FA(forceReset?)
+authApi.verify2FA(otpCode)
+authApi.verifyOTP(otpCode)
+authApi.check2FAStatus()
+authApi.forgotPassword(email)
+authApi.resetPassword(token, newPassword)
+```
+
+```typescript billingApi
+// api/http/billingApi.ts
+billingApi.getStatus()
+billingApi.getPricing()
+billingApi.getPlans()
+billingApi.setupCard(planId?)
+billingApi.confirmCard(setupIntentId, promptEventId?)
+billingApi.createCheckoutSession(planId, promptEventId?)
+billingApi.subscribe(planId?)
+billingApi.changePlan(planId)
+billingApi.cancel(atPeriodEnd?)
+billingApi.enableOverage()
+billingApi.disableOverage()
+billingApi.setModelProfile(profile)
+```
+</CodeGroup>
+
+---
+
+## Socket.IO Client (`api/websocket/wsClient.ts`)
+
+A **singleton** Socket.IO client that connects to the `/user` namespace. All React code subscribes to it via `wsClient.on()` / `wsClient.off()` — never via the raw Socket.IO socket.
+
+### Connection
 
 ```typescript
-const wsClient = SocketIOClient.getInstance();
+import { wsClient } from './api/websocket/wsClient';
 
+// Connect (called by authSlice after login/restoreSession)
 await wsClient.connect(userId, token);
 
-wsClient.on("agent_response", (msg) => { /* */ });
-wsClient.on("ui_meta_update", (data) => { /* */ });
-wsClient.on("task_progress", (p) => { /* */ });
+// Set token refresher so reconnects get a fresh token
+wsClient.setTokenRefresher(() => platform.storage.get('auth_token'));
 
+// Disconnect (called by authSlice on logout)
 wsClient.disconnect();
+
+// Check status
+wsClient.isConnected(); // boolean
 ```
 
-### Connection details
+### Auth flow
 
-- **Namespace**: `/user` (authenticated user events)
-- **Transport**: WebSocket, falls back to HTTP long-polling
-- **Reconnection**: exponential backoff (1s → 2s → 4s → max 10s)
-- **Heartbeat**: 25-second ping/pong
-
-### Events you handle
-
-| Event | Payload | Notes |
-|-------|---------|-------|
-| `agent_response` | `{ session_id, message, status, tokens_remaining }` | Final assistant reply |
-| `ui_meta_update` | `{ session_id, payload: { type, ... } }` | Live agent progress |
-| `status_update` | `{ session_id, status, content? }` | "thinking", "executing", "hibernated" |
-| `plan_update` | `{ plan_version, steps[] }` | Step tree with statuses |
-| `mode_progress` | `{ mode, stage, status, progress, detail }` | Per-agent-mode progress |
-| `confirmation_request` | `{ input_config: { type, prompt, choices } }` | `ask_human` |
-| `task_progress` | `{ session_id, progress, status, message }` | Task execution % |
-| `device_status_update` | `{ device_id, status }` | Online / offline |
-| `attachments_ready` | `{ session_id, message_id, attachments[] }` | File upload complete |
-| `cloud_pc_status_changed` | `{ device_id, status }` | Cloud PC state change |
-| `admin_notification` | `{ type, content }` | System broadcast |
-
-<Note>
-**Skygen does not stream tokens for assistant replies.** A single `agent_response` event carries the complete message. Use `ui_meta_update`, `mode_progress`, and `status_update` for live progress indication.
-</Note>
-
-### Token refresh on reconnect
+Socket.IO's `auth` option is a function (not a static value), so it is called on every connection attempt including reconnects:
 
 ```typescript
-wsClient.setTokenRefresher(() => platform.storage.get("auth_token"));
+this.socket = io(`${httpUrl}/user`, {
+  auth: async (cb) => {
+    let currentToken = this.token;
+    if (this.tokenRefresher) {
+      const fresh = await Promise.race([
+        this.tokenRefresher(),
+        new Promise<null>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+      ]);
+      if (fresh) currentToken = fresh;
+    }
+    cb({ token: currentToken, user_id: this.userId });
+  },
+  withCredentials: true,    // Sends skygen_session cookie cross-origin
+  transports: ['websocket'], // No polling — prevents session mismatch behind ALB
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 30000,
+  reconnectionAttempts: Infinity,
+});
 ```
 
-On connection loss, Socket.IO auto-reconnects and fetches the current token before reauthenticating. If the token expired, reconnect fails; the user must log in again.
-
-## Type system
-
-Types live in `ui-shared-tauri/src/types/api.ts` (plus `platform.ts`, `websocket.ts`).
-
-**Source of truth**: hand-written TypeScript. Types are manually kept in sync with backend Pydantic models. No code generation. Risk of drift is mitigated by:
-
-- Contract tests in CI
-- Runtime guards: `isDeviceBusyError(detail)`, `isValidationError(detail)`
-- Defensive error extraction (see above)
-
-Core shapes:
+### Subscribing to events
 
 ```typescript
-interface User {
-  id: string;
-  email: string;
-  display_name: string;
-  is_active: boolean;
-  is_admin: boolean;
-  is_email_verified: boolean;
-  is_2fa_verified: boolean;
-  created_at: string;
-}
+// Subscribe (deduplicated — same function reference will not be added twice)
+wsClient.on('new_message', (params: NewMessageParams) => {
+  // params is typed based on MethodHandlersMap
+});
 
-interface Session {
-  id: string;
-  user_id: string;
-  device_id?: string;
-  title: string;
-  is_archived: boolean;
-  created_at: string;
-  updated_at: string;
-}
+// Unsubscribe specific handler
+wsClient.off('new_message', handler);
 
-interface Message {
-  id: string;
-  session_id: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  meta_data?: MessageMetadata;
-  attachments?: AttachedFile[];
-  created_at: string;
-}
+// Unsubscribe all handlers for an event
+wsClient.off('new_message');
 ```
 
-## Error type guards
+**Type safety:** For events defined in `MethodHandlersMap` (`types/websocket.ts`), the payload is strongly typed. Synthetic events (`reconnected`, `device_status`, etc.) fall back to `unknown`.
+
+### Durable delivery and deduplication
+
+The backend uses at-least-once durable delivery for important events. After a reconnect, the server replays events that were not ACK'd. The client deduplicates these via a LRU set of 200 `notification_id` values:
 
 ```typescript
-function isDeviceBusyError(detail: unknown): detail is DeviceBusyError {
-  return (
-    typeof detail === "object" && detail !== null
-    && (detail as any).error === "device_busy"
-  );
-}
-
-try {
-  await sessionApi.sendMessage(...);
-} catch (err) {
-  if (err instanceof HttpClientError && isDeviceBusyError(err.data?.detail)) {
-    showModal("Device busy with another task");
+private dispatchDurable(notificationId: unknown, emit: () => void): void {
+  const id = typeof notificationId === 'string' ? notificationId : undefined;
+  if (id && this.seenNotificationIds.has(id)) {
+    this.sendNotificationAck(id);  // ACK so server stops replaying
+    return;                         // Skip emit
   }
+  emit();
+  if (id) this.markNotificationSeen(id);
+  this.sendNotificationAck(id);
 }
 ```
 
-## Mocking mode
+**Events using durable dispatch:** `agent_response`, `display_message`, `confirmation_request`, `task_progress`, `device_status_update`, `admin_notification`, `agent_status_update`, `agent_error`, `cloud_pc_status_changed`, `mcp_connection_completed`.
 
-Both `httpClient.ts` and `authApi.ts` define:
+**Ephemeral events (no ACK):** `cloud_pc_control_changed`, `cloud_pc_provisioned`, `mcp_connection_failed/timeout/expired`, all cross-client session/task sync events.
+
+### Sending events
 
 ```typescript
-const USE_MOCKS = false;
+// Send a confirmation response
+wsClient.sendSafetyConfirmationResponse(
+  confirmationId,
+  approved,
+  message?,
+  onAck?       // Optional Socket.IO ack callback
+);
 ```
 
-Flip to `true` to short-circuit every network call with empty data. Useful for offline UI work.
+### Tab visibility handling
 
-## See also
+When the page becomes visible after being hidden, the client checks if the socket is disconnected and Socket.IO's own reconnection is not already in progress. If both conditions are met, it forces a reconnect. This covers the case where a laptop wakes from sleep after the socket connection timed out.
 
-- [State management](/webapp/state-management) — how store actions use these modules
-- [Chat sessions](/concepts/chat-sessions) — Socket.IO event catalog
-- [Errors](/errors) — HTTP status codes
+### `agent_response` normalisation
+
+The `agent_response` event is the legacy protocol. The client normalises it to a `WsChatMessage` and emits it as `new_message` to subscribers, plus a `task_progress` event derived from the `status` field. The new `display_message` event is the preferred path.
+
+---
+
+## Full Event Catalogue
+
+### Incoming events (Backend to Frontend)
+
+| Event | Durable | Primary handler |
+|---|---|---|
+| `display_message` | Yes | `useChatWebSocket.handleDisplayMessage` |
+| `agent_response` (legacy) | Yes | `wsClient.handleAgentResponse` |
+| `new_message` | — | `useChatWebSocket.handleNewMessage` |
+| `ui_meta_update` | — | `useChatWebSocket.handleUiMetaUpdate` |
+| `task_progress` | Yes | `useChatWebSocket.handleTaskProgress` |
+| `agent_typing` | — | `useChatWebSocket.handleTyping` |
+| `device_status_update` | Yes | `useChatWebSocket.handleDeviceStatus` |
+| `agent_error` | Yes | `useChatWebSocket.handleAgentError` |
+| `attachments_ready` | — | `useChatWebSocket.handleAttachmentsReady` |
+| `message_deleted` | — | `useChatWebSocket.messageDeletedHandler` |
+| `confirmation_request` | Yes | uiSlice confirmations queue |
+| `safety_confirmation_request` | — | Legacy confirmation flow |
+| `billing_status_updated` | — | Triggers `billingSlice.loadStatus()` |
+| `payment_required` | — | Opens paywall UI |
+| `admin_notification` | Yes | notificationsSlice |
+| `cloud_pc_status_changed` | Yes | cloudPcSlice |
+| `cloud_pc_control_changed` | No | cloudPcSlice |
+| `cloud_pc_session_released` | No | cloudPcSlice |
+| `cloud_pc_session_rebound` | No | cloudPcSlice |
+| `cloud_pc_provisioned` | No | UI notification |
+| `mcp_connection_completed` | Yes | MCP integration UI |
+| `mcp_connection_failed/timeout/expired` | No | Toast notifications |
+| `mcp_trigger_disabled` | No | Toast notification |
+| `mcp_integration_active_changed` | No | MCP integration state |
+| `session_created/updated/deleted/restored` | No | sessionSlice cross-client sync |
+| `chat_message_meta_updated` | No | messageSlice meta update |
+| `scheduled_task_created/updated/deleted` | No | scheduledTasksSlice |
+| `task_created/updated/deleted` | No | Internal task tracking |
+| `ticket_created/reply/updated` | No | helpdeskSlice |
+| `scheduled_session_created` | No | Session auto-creation for scheduled tasks |
+
+### Outgoing events (Frontend to Backend)
+
+| Event | Payload | Purpose |
+|---|---|---|
+| `confirmation_response` | `{ confirmation_id, approved, message? }` | User confirms or rejects agent action |
+| `notification_ack` | `{ notification_id, received_at }` | Acknowledges durable delivery |
+
+---
+
+## `sendMessage` Response Handling
+
+`sessionApi.sendMessage()` returns a `SendMessageResult` — it never throws. All error branches are encoded in the result:
+
+```typescript
+interface SendMessageResult {
+  success: boolean;
+  data?: Message;                   // Present on success
+  error?: 'device_busy'
+        | 'device_unreachable'
+        | 'cloud_pc_conflict'
+        | 'invalid_otp'
+        | 'network'
+        | 'update_required'
+        | 'payment_required'
+        | 'unknown';
+  errorMessage?: string;
+  deviceBusyInfo?: DeviceBusyError;
+  deviceUnreachableInfo?: DeviceUnreachableError;
+  cloudPcConflictInfo?: CloudPcSessionConflictError;
+  updateRequiredInfo?: UpdateRequiredError;
+  paymentRequiredInfo?: PaymentRequiredError;
+}
+```
+
+HTTP status to error mapping:
+
+| HTTP status | error field | Condition |
+|---|---|---|
+| 200 | — | `success: true` |
+| 402 | `payment_required` | Any billing block |
+| 403 | `invalid_otp` | OTP validation failed |
+| 409 | `device_busy` | `isDeviceBusyError(detail)` — device locked by another session |
+| 409 | `device_unreachable` | `isDeviceUnreachableError(detail)` — device offline or not responding |
+| 409 | `cloud_pc_conflict` | `isCloudPcSessionConflict(detail)` — Cloud PC bound to another session |
+| 426 | `update_required` | `isUpdateRequiredError(detail)` |
+| network error | `network` | `TypeError` from fetch |
+| other | `unknown` | All other cases |

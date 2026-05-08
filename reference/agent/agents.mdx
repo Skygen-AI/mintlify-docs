@@ -1,0 +1,648 @@
+---
+title: "Specialist Agents Reference"
+description: "Complete reference for BrokerAgent, PlannerAgent, MCPToolsAgent, DataFetcherAgent, SoftwareEngineerAgent, and CUA_OrchestratorAgent."
+---
+
+# Specialist Agents
+
+Every specialist agent inherits from `BaseAgent`. The specialists differ in three dimensions: their system prompt (persona + directives), the sub-agent types they are allowed to spawn (`subagent_classes`), and the tools they register. Some also override factory methods to inject custom components.
+
+---
+
+## BrokerAgent
+
+**File:** `Agent/BrokerAgent/broker.py`
+
+`BrokerAgent` is the top-level entry point. It is **not** a `BaseAgent` subclass. It owns the asyncio event loop and bridges three external systems: RabbitMQ (inbound tasks), Socket.IO `/agent` namespace (bidirectional Backend events), and Redis (cancellation, locks, hibernation).
+
+### Constructor
+
+```python
+BrokerAgent(config: AgentConfig)
+```
+
+`BrokerAgent` instantiates everything it needs from `config` in `start()`. It does not accept a `ws_client` or `device_id` at construction time; those are obtained from the Backend registration handshake.
+
+### `start()`
+
+```python
+async def start() -> None
+```
+
+Full initialization sequence:
+
+1. Connect to Redis (`aioredis` async client).
+2. Connect to RabbitMQ and declare queues.
+3. Create `AgentSocketIOClient` and connect to Backend `/agent` namespace.
+4. Register Socket.IO event handlers.
+5. Start `max_workers` concurrent `worker_loop()` tasks.
+6. Start `sentinel_loop()` (ARCH-001 hibernation driver).
+7. Start `start_consumer()` (RabbitMQ consumer).
+
+### Worker and Task Processing
+
+```python
+async def worker_loop() -> None
+```
+
+Dequeues from `internal_queue`, calls `process_task()`, and handles exceptions. At most `config.max_workers` (default 3) concurrent workers run simultaneously.
+
+```python
+async def process_task(task_message: dict) -> None
+```
+
+Extracts `session_id`, `user_id`, `device_id`, `agent_mode`, and `message_text` from the inbound task. Acquires the Redis device lock. Routes by `agent_mode`:
+
+| Mode | Handler |
+|---|---|
+| `"auto"`, `"cua"`, `"swe"` | `_run_planner_task()` |
+| `"llm"` | `_run_llm_mode_task()` |
+| `"deep_research"` | `_run_datafetcher_task()` |
+
+### `_run_chat_with_cancel_watch()`
+
+```python
+async def _run_chat_with_cancel_watch(
+    agent: BaseAgent,
+    context: AgentContext,
+    state: BaseAgentState,
+    llm_params: dict,
+    *,
+    session_id: str,
+) -> tuple[dict, list[dict]]
+```
+
+Wraps `agent.chat()` with two concurrent watchers:
+
+- **Soft cancel**: polls `agent:task:{session_id}:cancel` every 2 seconds; on detection, sends `STOP` to the agent's inbox.
+- **Hard cancel**: if the agent does not exit within 10 seconds after soft cancel, calls `asyncio.Task.cancel()`.
+
+### Hibernation Management
+
+```python
+async def sentinel_loop() -> None
+```
+
+Runs every second. Checks the `SentinelStore` for hibernated sessions whose wake conditions have fired. On wake, calls `BrokerWaker.WakeSession()` which enqueues the session for re-run via `internal_queue`.
+
+```python
+def _get_hibernation_controller() -> HibernationController
+```
+
+Lazily builds a `HibernationController` backed by `SentinelStore(redis_client)` and the default strategy registry. Cached after first call.
+
+```python
+async def _schedule_sentinel_task(
+    session_id: str,
+    hibernate_config: dict,
+    context: AgentContext,
+) -> None
+```
+
+Called when a root agent returns `_special_action=HIBERNATE`. Calls `HibernationController.Hibernate()`, sets the `hibernation:user_reply:session:{session_id}` Redis marker if `pending_question_type="user_reply"`, and emits a `task_paused` Socket.IO event to the Backend.
+
+### Inbox Registration
+
+```python
+def register_agent_inbox(self, session_id: str, inbox: Inbox) -> None
+def unregister_agent_inbox(self, session_id: str) -> None
+```
+
+Called by `_run_planner_task()` (and similar task runners) immediately before and after `agent.chat()`. Entries in `_active_agent_inboxes` allow Socket.IO event handlers to deliver messages to a running agent by session ID without knowing the agent instance directly. If a `PAUSE` signal arrives before the inbox is registered, it is buffered in `_pending_pauses` and delivered the moment `register_agent_inbox()` is called.
+
+### Socket.IO Event Handlers
+
+| Handler | Trigger | Effect |
+|---|---|---|
+| `_handle_user_followup` | `user_followup` from Backend | If session has a live inbox: pushes `USER_FOLLOWUP` message into it. If hibernated: calls `HibernationController.WakeSession()` with the user content as the wake reason (it becomes a `user` turn on resume). If neither: clears the stale Redis user-reply marker. |
+| `_handle_user_cancel` | `cancel_task` from Backend | If session has a live inbox: sends `USER_CANCEL` inbox message so the lifecycle wait loop unblocks immediately. If hibernated: calls `HibernationController.WakeSession()` so `chat()` resumes and reads the Redis cancel flag on its first iteration. |
+| `_handle_agent_pause` | `pause_agent` from Backend | Sends `PAUSE` inbox message to the running agent. If the inbox is not yet registered, stores the pause in `_pending_pauses` for deferred delivery. |
+| `_handle_trigger_event` | `trigger_event` from Backend | 4-stage pipeline: parse event data → build prompt from `_TRIGGER_PROMPT_TEMPLATE` → build synthetic RabbitMQ payload → enqueue to `internal_queue`. |
+| `_handle_mcp_integration_active_changed` | MCP toolkit toggle | Calls the module-level `apply_toolkit_toggle_for_user()` function (imported from `MCPToolsAgent`) on all live instances for the user. Note: this is a module-level function, not a `@staticmethod` on the class. |
+| `_handle_mcp_connection_completed` | OAuth callback complete | Wakes sessions waiting on MCP connection |
+| `_handle_cloud_pc_session_bound` | Cloud PC allocated | Injects device binding into agent context via `CloudPcBindingManager` |
+
+### Cleanup
+
+```python
+async def _best_effort_task_cleanup(session_id: str) -> None
+```
+
+Called unconditionally at the end of every task. Releases:
+- Redis device lock (`agent:task:{session_id}:active`)
+- Cancel key (`agent:task:{session_id}:cancel`)
+- All child sentinel tasks
+- User-reply hibernation marker
+
+---
+
+## PlannerAgent
+
+**File:** `Agent/Agents/PlannerAgent/base.py`
+
+`PlannerAgent` is the global orchestrator. It is the root agent for `agent_mode="auto"`, `"cua"`, and `"swe"`. It maintains a structured multi-step plan visible to users and enforces the `TerminateGuard` to prevent premature termination.
+
+### Key Differences from BaseAgent
+
+| Feature | BaseAgent | PlannerAgent |
+|---|---|---|
+| `TERMINATE_GUARD_ENABLED` | `False` | **`True`** |
+| `subagent_classes` | `{}` | `{mcp_tools_agent, cua_orchestrator, data_fetcher, software_engineer}` |
+| `PlanManager` | Not present | Owned; tracks steps and sub-steps |
+| `PlanReporter` | Not present | Emits plan updates to Frontend via Socket.IO |
+| `SubAgentPlanCoordinator` | Not present | Correlates child agents with plan steps |
+| `on_subagent_spawn()` | returns `None` | Allocates a plan step; returns its ID |
+| `on_subagent_finish()` | no-op | Updates plan step status (completed / failed) |
+| `pre_action_guard()` | returns `None` | Blocks `communicate(result)` while a child agent is waiting for user reply |
+
+### Constructor kwargs
+
+In addition to all `BaseAgent` constructor kwargs, `PlannerAgent.__init__` accepts:
+
+| kwarg | Type | Default | Purpose |
+|---|---|---|---|
+| `is_deep_research` | `bool` | `False` | Hint that the task is a deep-research run; adjusts system prompt |
+| `is_exploration_mode` | `bool` | `False` | Enables exploration-mode directives in the system prompt |
+| `swe_enabled` | `bool` | `False` | Activates the Software Engineer specialist hint and sandboxed planning prompts |
+| `custom_system_prompt` | `str \| None` | `None` | Replaces the default `SYSTEM_PROMPT` persona block entirely |
+| `playwright_client` | `Any \| None` | `None` | Pre-built Playwright browser client forwarded to `CUA_OrchestratorAgent` children |
+| `cua_preferred` | `bool` | `False` | Biases plan generation toward CUA specialist sub-agents |
+| `device_type` | `str` | `""` | Descriptor of the attached compute device (e.g. `"cloud_pc"`, `"local_mac"`) |
+| `initial_device_status` | `str` | `"unknown"` | Starting status string for `_live_device_status`; updated via `_handle_cloud_pc_session_bound` |
+| `cloud_pc_can_provision` | `bool` | `False` | When `True`, the planner may emit provision-device plan steps via `_ensure_compute_for_step()` (Compute V2 / Lane B) |
+| `emplogent_persona` | `str \| None` | `None` | Custom persona name applied at construction; stored in `current_persona` and persisted to Redis |
+
+> **Important**: `cloning_depth` is **forced to `2`** inside `PlannerAgent.__init__` regardless of what the caller passes. This is hardcoded to constrain the sub-agent nesting depth to exactly two levels (Planner → Specialist).
+
+### Instance attributes (PlannerAgent-specific)
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `plan` | `PlanManager` | Manages the structured multi-step plan visible in the UI |
+| `plan_reporter` | `PlanReporter` | Emits plan-update events to the Frontend via Socket.IO |
+| `plan_coordinator` | `SubAgentPlanCoordinator` | Correlates child `agent_id` values with plan step IDs |
+| `current_persona` | `str \| None` | Active persona name (set by `AdjustPersonaTool` or `emplogent_persona` kwarg) |
+| `_plan_custom_system_prompt` | `str \| None` | Stored copy of `custom_system_prompt` kwarg |
+| `_playwright_client` | `Any \| None` | Stored playwright client forwarded to CUA children |
+| `_live_device_status` | `str` | Current compute-device status; updated by Socket.IO events |
+| `cloud_pc_can_provision` | `bool` | Whether Lane B compute provisioning is allowed |
+| `is_deep_research` | `bool` | Deep-research mode flag |
+| `is_exploration_mode` | `bool` | Exploration-mode flag |
+| `swe_enabled` | `bool` | SWE specialist enabled flag |
+| `cua_preferred` | `bool` | CUA preference flag |
+| `device_type` | `str` | Attached device type descriptor |
+
+### Additional registered tools
+
+`PlannerAgent._create_tool_manager()` registers three extra tools beyond the `BaseAgent` defaults:
+
+| Tool | Purpose |
+|---|---|
+| `BoostIntellectTool` | Switches the active model to the high-tier LLM for the current step (one-shot upgrade) |
+| `AdjustPersonaTool` | Changes the active persona mid-run; persists to `current_persona` and injects persona directives |
+| `ManagePlanTool` | CRUD operations on the structured plan: create, update-step, mark-complete, mark-failed |
+
+### `restore_state()` override
+
+`PlannerAgent.restore_state()` extends `BaseAgent.restore_state()` to rehydrate:
+- `PlanManager` from the `plan_state` key in the Redis payload
+- Active `current_persona` from the `persona` key
+
+### `_reregister_plan_stagnation_rule()`
+
+```python
+def _reregister_plan_stagnation_rule(self) -> None
+```
+
+Replaces the `PlanStagnationAlertRule` in `budget_alert_manager` with a freshly constructed one that references the current `plan` object. Called after `ManagePlanTool` creates or replaces the plan, so the alert rule always tracks the live plan instance.
+
+### Compute V2 / Lane B
+
+```python
+async def _ensure_compute_for_step(self, plan_step_id: str, context: AgentContext) -> None
+```
+
+Called by `on_subagent_spawn()` when `COMPUTE_V2_AGENT_ENABLED=true`. Reads the `compute` field of the plan step identified by `plan_step_id`. If the step's required compute kind differs from `_active_compute_kind`, looks up the `provision_compute` tool from `tool_manager` and calls it with `{"kind": <compute_kind>, "force": False}`. Non-fatal: errors are logged but do not block the specialist dispatch. This implements the Compute V2 Lane B provisioning flow (feature-flagged via `COMPUTE_V2_AGENT_ENABLED` env var).
+
+### `TERMINATE_GUARD_ENABLED = True`
+
+`TerminateGuard` inspects the Planner's current plan state before allowing termination. It checks:
+
+1. Are there incomplete required plan steps?
+2. Are there child agents that are active or hibernated and awaiting a user reply?
+3. Is the Planner attempting to finalize with an empty or skeleton result?
+
+If any check fails, `TerminateGuard.Check()` returns a rejection with a `AsReflectionMessage()` string injected as a `role="system"` message. The Planner's next iteration sees this reflection and is forced to address the remaining work.
+
+### Plan State Machine
+
+```
+         create_plan()
+              │
+     ┌────────▼────────┐
+     │ STEP: PENDING   │
+     └────────┬────────┘
+              │ on_subagent_spawn()
+     ┌────────▼────────┐
+     │ STEP: IN_PROGRESS│
+     └────────┬────────┘
+              │ on_subagent_finish()
+     ┌────────▼────────────────┐
+     │ STEP: COMPLETED / FAILED│
+     └─────────────────────────┘
+```
+
+Plan state is persisted to Redis in `redis_payload["plan_state"]` via `AgentStateRepository.persist_state()`.
+
+### Agent Type Routing
+
+The Planner's `prepare_subagent_kwargs()` injects agent-type-specific constructor arguments:
+
+| `agent_type` | Injected kwargs |
+|---|---|
+| `"data_fetcher"` | `search_mode` (from `extra_args`), web research config |
+| `"software_engineer"` | sandbox config, file toolkit target env |
+| `"mcp_tools_agent"` | active MCP providers for the user |
+| `"cua_orchestrator"` | `device_id`, Cloud PC session binding |
+
+---
+
+## MCPToolsAgent
+
+**File:** `Agent/Agents/MCPToolsAgent/base.py`
+
+`MCPToolsAgent` integrates with Composio-hosted MCP servers. It handles Gmail, Google Calendar, Google Drive, Slack, GitHub, Jira, Linear, HubSpot, and other provider integrations.
+
+### Live Toggle Support
+
+```python
+_REMOTE_TOOL_MANAGER_REGISTRY: WeakSet  # process-level registry of live instances
+```
+
+```python
+# Module-level function (not a @staticmethod on the class):
+def apply_toolkit_toggle_for_user(user_id: str, toolkit: str, is_active: bool) -> None
+```
+
+When the user enables or disables an MCP integration from the Frontend, `BrokerAgent._handle_mcp_integration_active_changed()` calls this module-level function (imported from `MCPToolsAgent`). It iterates the `WeakSet` of live `MCPToolsAgent` instances, locates those owned by the given `user_id`, and calls `tool_manager.register_tool()` or `tool_manager.unregister_tool()` to atomically add or remove the provider's tool set — without restarting the agent.
+
+> **Parameter name correction**: The parameter is `toolkit` (not `provider`) and the enable flag is `is_active` (not `enabled`). Calling code in `BrokerAgent` passes the event payload's `toolkit` field directly.
+
+### Faithfulness Rule
+
+`MCPToolsAgent` includes a `FAITHFULNESS` directive in its `TERMINATION_GUIDELINES_PROMPT`: the agent must only report counts, dates, and identifiers that are directly observed in tool outputs. It must not extrapolate, average, or fill gaps from training data. This rule was added in response to a production fabrication incident (session 865dcbaa, 2026-05-07) where the sub-agent reported `~201 unread` when actual = 5.
+
+### Disabled prompt sections
+
+`MCPToolsAgent` sets the following class attributes to empty strings, which causes `PromptBuilder` to omit those sections entirely from the system prompt:
+
+| Class attribute | Set to | Effect |
+|---|---|---|
+| `MEMORY_MANAGEMENT_PROMPT` | `""` | Removes the memory-management directives block |
+| `SAFETY_ASSESSMENT_PROMPT` | `""` | Removes the safety-assessment guidelines block |
+| `BEHAVIORAL_GUIDELINES_PROMPT` | `""` | Removes the general behavioral-guidelines block |
+
+This produces a leaner prompt focused exclusively on MCP tool operation and the `FAITHFULNESS` rule.
+
+### Factory method overrides
+
+`MCPToolsAgent` overrides two IoC factory methods:
+
+| Factory method | Override purpose |
+|---|---|
+| `_create_session_manager()` | Returns an `MCPSessionManager` that additionally tracks active MCP provider connection state |
+| `_create_prompt_builder()` | Returns an `MCPToolsPromptBuilder` that skips the disabled prompt sections above |
+
+### Sub-agent capabilities
+
+`MCPToolsAgent.subagent_classes = {"mcp_tools_agent": MCPToolsAgent}` — it can spawn a **copy of itself** as a sub-agent when the task requires parallel MCP operations. Despite the self-spawning capability, the spawned child receives `cloning_depth=0` so it cannot spawn further children.
+
+### RemoteToolManager
+
+`RemoteToolManager` is the tool-discovery and execution engine inside `MCPToolsAgent`. It handles both Composio MCP and custom HTTP-based connectors.
+
+**Dual-source architecture:**
+- **Composio MCP** (`_composio_tools`) — discovered via MCP protocol from the Composio server (configured per user, fetched from `GET /agent/mcp/config`).
+- **Custom connectors** (`_custom_mcp_tools`) — user-defined connectors fetched from `GET /agent/mcp/tools`. Executed via HTTP (`POST /agent/mcp/execute`) or via per-connector MCP sub-sessions.
+
+Both sources are merged into a unified tool list by `fetch_available_tools()`.
+
+#### Key Instance Attributes
+
+| Attribute | Type | Purpose |
+|-----------|------|---------|
+| `_composio_connected` | `bool` | True when Composio MCP session is active |
+| `_composio_tools` | `List[Dict]` | Tools discovered from Composio MCP |
+| `_mcp_session` | `MCPClientSession \| None` | Active Composio MCP session |
+| `_mcp_entity_id` | `str \| None` | Composio entity ID injected into tool calls |
+| `_disabled_toolkits` | `List[str]` | Toolkit slugs the user has disabled |
+| `_connected_toolkits` | `List[str]` | Toolkits with active OAuth |
+| `_custom_mcp_sessions` | `Dict[str, MCPClientSession]` | Per-connector MCP sessions (`connector_id → session`) |
+| `_custom_mcp_tools` | `List[Dict]` | Tools from custom connectors |
+| `_needs_reconnect` | `bool` | Set by `_handle_mcp_integration_active_changed` to trigger reconnect on next `fetch_available_tools()` |
+| `COMPOSIO_RECONNECT_INTERVAL` | `int` | 300 s — retry interval after Composio connection failure |
+
+#### Composio MCP Methods
+
+| Method | Purpose |
+|--------|---------|
+| `connect_composio_mcp(context) → bool` | Fetches MCP config from Backend, opens `StreamableHTTP` transport session, discovers tools. Returns `False` on failure; schedules `_schedule_reconnect()`. |
+| `fetch_composio_tools() → List[Dict]` | Lists tools from the active MCP session. Returns `[]` if not connected. |
+| `execute_composio_tool(tool_name, args, context) → Dict` | Executes a single Composio tool call. Auto-injects `entity_id`. Emits audit log. |
+| `_fetch_mcp_config(context) → Optional[Dict]` | `GET /agent/mcp/config` with Bearer token. Returns raw config dict or `None`. |
+| `_is_tool_from_disabled_toolkit(tool_name) → bool` | Returns `True` if the tool belongs to a toolkit the user has disabled. Used in `fetch_available_tools()` to filter. |
+| `_refresh_disabled_toolkits(context)` | Re-fetches `disabled_toolkits` from Backend config endpoint and updates `_disabled_toolkits`. |
+| `_fetch_connected_toolkits(context) → List[str]` | `GET /agent/mcp/connected-toolkits` — returns OAuth-connected toolkit slugs. |
+| `_close_composio_connection()` | Closes `_mcp_context_stack` and resets connection state. |
+| `_schedule_reconnect()` | Schedules a reconnect after `COMPOSIO_RECONNECT_INTERVAL` s via `asyncio.create_task`. Cancels any prior reconnect task first. |
+| `_cancel_reconnect()` | Cancels a pending reconnect task. Called on `cleanup()`. |
+
+#### Custom Connector Methods
+
+| Method | Purpose |
+|--------|---------|
+| `fetch_custom_tools(context) → List[Dict]` | `GET /agent/mcp/tools` — returns custom connector tool definitions. |
+| `connect_custom_mcp_servers(context) → bool` | Establishes per-connector MCP sessions (HTTP or SSE transport). |
+| `execute_custom_mcp_tool(tool_name, args, context) → Dict` | Routes to the correct per-connector session. |
+| `_execute_custom_tool_http(tool_name, args, context) → Dict` | `POST /agent/mcp/execute` fallback when no MCP session exists. |
+| `cleanup_custom_mcp_sessions()` | Closes all per-connector `AsyncExitStack` sessions. |
+
+#### Unified Tool Discovery
+
+| Method | Purpose |
+|--------|---------|
+| `fetch_available_tools(context) → List[Dict]` | Merges Composio + custom tools. Filters by `_disabled_toolkits`. Re-fetches if `_needs_reconnect=True`. Returns cached list if cache is fresh (TTL: 5 min). |
+| `execute_remote_tool(tool_name, args, context) → Dict` | Routes to `execute_composio_tool()` or `execute_custom_mcp_tool()` based on tool origin. |
+
+#### Toolkit Recommendation
+
+| Method | Purpose |
+|--------|---------|
+| `recommend_toolkits_for_task(context, task_desc, available_tools) → List[Dict]` | LLM-based toolkit recommender. Given a task description and the list of available tools, returns ordered recommendations. Caches by `(task_desc, available_tools_frozenset)`. |
+
+#### Properties
+
+| Property | Returns |
+|----------|---------|
+| `is_composio_connected` | `bool` — True when Composio MCP session is active |
+| `not_connected_providers` | `List[str]` — copy of `_not_connected_providers` |
+| `toolkit_recommendations` | `List[str]` — copy of `_toolkit_recommendations` |
+
+#### `cleanup()`
+
+Calls `_cancel_reconnect()`, `_close_composio_connection()`, and `cleanup_custom_mcp_sessions()`. Called in `MCPToolsAgent.chat()` `finally` block.
+
+---
+
+### MCPToolManager
+
+`MCPToolManager` is a `ToolManager` subclass that wraps a `RemoteToolManager` and adds the full remote-tool lifecycle: fetching, LLM-based ranking, and injection of unconnected-provider context into the tools block.
+
+```python
+class MCPToolManager(ToolManager):
+    DEFAULT_PROMPT_TOOL_LIMIT = 25
+```
+
+`DEFAULT_PROMPT_TOOL_LIMIT` (25) is the soft cap on how many tools appear in the LLM system prompt. Mandatory tools (always-active toolkit entries) are included unconditionally; recommended tools fill the remaining slots up to the limit.
+
+#### `fetch_and_register_remote_tools(task, session_id, user_id)`
+
+Main lifecycle method. Runs five steps in sequence:
+
+| Step | Action |
+|------|--------|
+| 0 | Reconnects Composio/MCP sessions that dropped since the last call |
+| 1 | Connects to Composio MCP (fetches active integration list) |
+| 1b | Connects to all custom MCP servers configured for the user |
+| 2 | Fetches all available tools from connected providers |
+| 3 | Sends the full tool catalog (up to 50 entries) and the current task description to an LLM for ranking via `rank_tools_with_llm()` |
+| 4 | Applies toolkit-level recommendations from the `TOOL_CLASSIFIER_SYSTEM_PROMPT` response via `select_recommended_tools()` |
+
+After this method resolves, `get_tools_block()` will return a prompt-ready tool list for the agent's system prompt.
+
+#### `rank_tools_with_llm(task, tools)`
+
+Sends the tool catalog and task string to the LLM using `TOOL_CLASSIFIER_SYSTEM_PROMPT` as the system prompt. Expects a JSON response of the form:
+
+```json
+{"tools": [{"name": "TOOL_NAME", "reason": "why this tool fits"}]}
+```
+
+The returned names are stored as the ranked set for `select_recommended_tools()`.
+
+#### `get_tools_block()`
+
+Builds the ordered tool list injected into the agent system prompt:
+
+1. Mandatory tools (always present, not subject to the limit).
+2. Recommended tools from LLM ranking, up to `DEFAULT_PROMPT_TOOL_LIMIT` total.
+3. An unconnected-integrations block listing providers not yet authorized, so the LLM can prompt the user to connect them.
+
+#### `_ComposioAutoWrapTool`
+
+An internal guard tool. When the LLM hallucinates a Composio slug that matches `_COMPOSIO_SLUG_RE` (e.g. `GMAIL_SEND_EMAIL`) but was not registered as a real tool, `_ComposioAutoWrapTool` intercepts the call and forwards it to `COMPOSIO_MULTI_EXECUTE_TOOL`. This prevents "tool not found" hard failures on valid but unregistered slugs.
+
+The regex excludes slugs already prefixed with `COMPOSIO_` (which are real registered wrappers) to avoid double-wrapping.
+
+#### `_MANAGE_CONNECTIONS_DESCRIPTION_OVERRIDE`
+
+Overrides the Composio `MANAGE_CONNECTIONS` tool description. The default Composio description contains a `redirect_url` field that LLMs tend to render as a clickable markdown link — which breaks the UI flow. The override removes the markdown link framing; the frontend renders its own connect-button UI automatically.
+
+---
+
+## DataFetcherAgent
+
+**File:** `Agent/Agents/DataFetcherAgent/base.py`
+
+`DataFetcherAgent` performs web research, factual search, and synthesis tasks.
+
+### Constructor
+
+`DataFetcherAgent` has a **non-standard constructor** — it requires three mandatory positional arguments before the standard `BaseAgent` kwargs:
+
+```python
+def __init__(
+    self,
+    research_tool: ResearchTool,
+    drafter: DraftTool,
+    draft_mode: bool,
+    *args,
+    **kwargs,
+)
+```
+
+| Parameter | Type | Purpose |
+|---|---|---|
+| `research_tool` | `ResearchTool` | Pre-built research tool instance (web search, crawl, etc.) |
+| `drafter` | `DraftTool` | Pre-built drafting tool instance; used in deep-research synthesis |
+| `draft_mode` | `bool` | When `True`, activates the `_CommunicateResultPromptWrapper` and post-research drafting loop |
+
+**Never instantiate `DataFetcherAgent` directly.** Use the async factory instead:
+
+```python
+@classmethod
+async def create(cls, *args, **kwargs) -> "DataFetcherAgent"
+```
+
+`DataFetcherAgent.create()` resolves the `is_deep_research` kwarg, constructs `ResearchTool` and `DraftTool` instances with the correct configuration, sets `draft_mode = is_deep_research`, and calls `__init__`. `BrokerAgent._run_datafetcher_task()` always uses `create()`.
+
+### Instance attributes (DataFetcherAgent-specific)
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `research_tool` | `ResearchTool` | The injected research tool |
+| `drafter` | `DraftTool` | The injected drafting tool |
+| `draft_mode` | `bool` | Whether drafting is active |
+| `current_draft` | `str \| None` | The latest draft text produced by `DraftTool`; cleared at the start of each run |
+| `research_seen_store` | `set[str]` | URLs/IDs of sources already processed in the current run; prevents re-fetching |
+
+### Factory method overrides
+
+`DataFetcherAgent` overrides several IoC factory methods to register research-specific tools:
+
+| Factory method | Purpose |
+|---|---|
+| `_create_tool_manager()` | Registers `FetchPageTool` and `ExchangeRateTool` in addition to the standard tools |
+| `_create_prompt_builder()` | Returns a `DataFetcherPromptBuilder` with the four core directives injected |
+
+### `_observe_phase()` override (draft mode)
+
+When `draft_mode=True`, `DataFetcherAgent._observe_phase()` runs `DraftTool` after each research step to synthesize incremental findings into `current_draft`. The wrapped `_CommunicateResultPromptWrapper` is applied to the final `communicate(result)` call to ensure the answer is a polished draft rather than raw research notes.
+
+### Core Directives
+
+The agent's `SYSTEM_PROMPT` enforces four directives at runtime:
+
+| Directive | Rule |
+|---|---|
+| `NO_SELF_KNOWLEDGE` | Never answer from training data. All claims require tool-obtained evidence. |
+| `SOURCE_HIERARCHY` | Prefer live search results > cached pages > knowledge base > training data. |
+| `TEMPORAL_GROUNDING` | Cross-check all date-sensitive claims against `ENV_CONTEXT.current_date`. |
+| `TOOL_FIRST` | Think → identify what tool to call → execute → read stdout → report. Never simulate. |
+
+### Search Modes
+
+`DataFetcherAgent` is constructed with an `is_deep_research: bool` flag (and internally a `draft_mode: bool`). When `is_deep_research=False`, `max_iter` is capped to `DEFAULT_QUICK_SEARCH_ITER = 3`. When `is_deep_research=True`, `draft_mode` is also set to `True` and the iteration limit is the full config `max_iter`.
+
+| Mode | Constructor flag | Max iterations | Strategy |
+|---|---|---|---|
+| Quick search (default) | `is_deep_research=False` | 3 steps | Fast; suitable for single-fact lookups |
+| Deep research | `is_deep_research=True` | Config `max_iter` | Multi-source synthesis, draft writing loop |
+
+`BrokerAgent._run_datafetcher_task()` determines the mode from `agent_mode="deep_research"` in the payload.
+
+### Sub-agent capabilities
+
+When `draft_mode=True` (i.e. `is_deep_research=True`) **and** `cloning_depth > 0`, `DataFetcherAgent` registers `SubAgentManagerTool` and adds itself to `subagent_classes` — it can then spawn copies of itself for parallel research branches. In quick-search mode (`draft_mode=False`) this registration is skipped and `DataFetcherAgent` behaves as a leaf node with no sub-agent capability.
+
+---
+
+## SoftwareEngineerAgent
+
+**File:** `Agent/Agents/ProjectSoftwareAgent/base.py`
+
+`SoftwareEngineerAgent` handles code generation, debugging, refactoring, test writing, and execution inside a sandbox.
+
+### Constructor kwargs (SoftwareEngineerAgent-specific)
+
+In addition to all `BaseAgent` constructor kwargs, `SoftwareEngineerAgent.__init__` accepts Docker attachment kwargs:
+
+| kwarg | Type | Default | Purpose |
+|---|---|---|---|
+| `docker_container_id` | `str \| None` | `None` | ID of an existing Docker container to attach to |
+| `docker_container_image` | `str \| None` | `None` | Docker image to use when creating a new container |
+| `docker_container_work_dir` | `str` | `"/workspace"` | Working directory inside the container |
+| `docker_preserve_container` | `bool` | `False` | When `True`, does not destroy the container on agent termination |
+
+### Trajectory logger
+
+`SoftwareEngineerAgent.trajectory_logger = log_swe_step` — the class-level `trajectory_logger` is pre-set to the `log_swe_step` function (imported from the agent's module). This records a structured SWE-bench-compatible step record at each iteration, enabling offline evaluation.
+
+### Overridden phase methods
+
+`SoftwareEngineerAgent` overrides two template methods from `BaseAgent`:
+
+**`_execute_think_phase()`** — Forces a deterministic bootstrap action on step 1: injects a single `ls -l <work_dir>` (or PowerShell `Get-ChildItem` on Windows) before the LLM is called. This grounds the model in the actual directory state before any edits. On all subsequent steps, delegates to the standard `BaseAgent._execute_think_phase()`.
+
+**`_execute_act_phase()`** — Wraps each tool execution with SWE-specific `ui_meta` Socket.IO events (`step_start` / `step_end`), building a human-readable step title for the Frontend (e.g. `$ <command>`, `Editing <file_path>`). Meta-tools like `communicate` are passed through without wrapping.
+
+### Sandbox Tooling
+
+`SoftwareEngineerAgent` registers sandbox tools alongside the standard toolkit. The exact tools depend on `config.sandbox_type`:
+
+| `sandbox_type` | Tools registered |
+|---|---|
+| `"docker"` | `bash_docker`, `read_file`, `write_file`, `str_replace_editor` |
+| `"local"` | `bash_local`, `read_file`, `write_file`, `str_replace_editor` |
+| `"remote"` | `bash_remote`, `read_file`, `write_file`, `str_replace_editor` |
+
+### Overridden `_observe_phase()`
+
+`SoftwareEngineerAgent` overrides `_observe_phase()` to apply custom result formatting before appending tool outputs to the message history. The override extracts the `output` or `error` string from each `ToolResult` dict and runs it through `_process_result()` for length normalization. This keeps the context compact by omitting raw metadata and presenting only the human-readable tool output.
+
+### Sub-agent capabilities
+
+`SoftwareEngineerAgent.subagent_classes = {"software_engineer": SoftwareEngineerAgent}` — it can spawn a copy of itself for parallel sub-tasks (e.g. simultaneous test writing and implementation). Spawned children inherit the sandbox configuration.
+
+---
+
+## CUA_OrchestratorAgent
+
+**File:** `Agent/Agents/CUA_OrchestratorAgent/base.py`
+
+`CUA_OrchestratorAgent` performs GUI automation against a Cloud PC or local desktop. It captures screenshots, interprets the accessibility tree, and issues remote input events.
+
+### Extended State
+
+```python
+@dataclass
+class CUAState(BaseAgentState):
+    screenshot_path: Optional[str] = None
+    world_model_summary: Optional[str] = None
+```
+
+Source: `Agent/Utilities/Context/State.py`
+
+### GUI Tools
+
+Tools are defined in `Agent/Agents/CUA_OrchestratorAgent/GUI_Customs/remote_gui_tools.py`. The LLM does not call these tools directly. Instead it calls `perform_gui_action` with a `tool_to_use` argument that names one of the 12 backend tools. For Playwright-based browser automation, see `Agent/Agents/CUA_OrchestratorAgent/playwright/`.
+
+| Tool class | `tool_to_use` value | `vlm_required` | Purpose |
+|---|---|---|---|
+| `RemoteClickTool` | `click` | Yes | Click at grounded coordinates |
+| `RemoteTypeTool` | `type` | No | Type text into the focused element |
+| `RemotePressKeysTool` | `press_keys` | No | Send key combinations (Ctrl+C, Enter, etc.) |
+| `RemoteScrollTool` | `scroll` | Yes | Scroll at grounded coordinates |
+| `RemoteDragTool` | `drag` | Yes | Drag from source to target (VLM resolves both points) |
+| `RemoteHoverTool` | `hover` | Yes | Move cursor without clicking |
+| `RemoteHoldClickTool` | `hold_click` | Yes | Press and hold the mouse button |
+| `RemoteReleaseClickTool` | `release_click` | No | Release a held mouse button |
+| `RemoteOpenAppTool` | `open_app` | No | Launch an application by name or path |
+| `RemoteActivateWindowTool` | `activate_window` | No | Bring a named window to the foreground |
+| `RemoteCloseWindowTool` | `close_window` | No | Close a named window |
+| `RemoteWaitTool` | `wait` | No | Pause execution for N seconds |
+
+Tools with `vlm_required=True` require an `interaction_description` argument. `PerformGUIActionTool` calls `GroundingModule.find_coordinates()` to resolve pixel coordinates before dispatching the action.
+
+### VLM Integration
+
+Before each think phase, `CUA_OrchestratorAgent` captures a screenshot via `RemotePerceptionModule` and includes it as a base64-encoded `image_url` content block in the LLM payload. Each think step receives both the previous screenshot (before) and the current screenshot (after) so the LLM can verify its last action's outcome.
+
+`config.enable_accessibility_tree` (default `False`) switches to `gui_observation_mode="a11y_dom_screenshot"`, which additionally provides the accessibility tree and active-page DOM to the LLM for element-ID-based interactions.
+
+### Sub-agent capabilities
+
+`CUA_OrchestratorAgent.subagent_classes = {}` — leaf node for screen interactions. The parent `PlannerAgent` coordinates multiple CUA orchestrators if parallel GUI tasks are needed.
+
+---
+
+## Agent Capability Matrix
+
+| Agent | Spawns children | Terminate Guard | Vision | Sandbox | MCP tools | Self-spawns |
+|---|---|---|---|---|---|---|
+| `BrokerAgent` | Creates root agent | N/A | No | No | No | N/A |
+| `PlannerAgent` | Yes (4 types) | Yes | No | No | No | No |
+| `MCPToolsAgent` | Yes (self only) | No | No | No | Yes | Yes (cloning_depth > 0) |
+| `DataFetcherAgent` | Yes (self only) | No | No | No | No | Yes (deep_research + cloning_depth > 0) |
+| `SoftwareEngineerAgent` | Yes (self only) | No | No | Yes | No | Yes (cloning_depth > 0) |
+| `CUA_OrchestratorAgent` | No | No | Yes | No | No | No |

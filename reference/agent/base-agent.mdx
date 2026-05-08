@@ -1,0 +1,958 @@
+---
+title: "BaseAgent Reference"
+description: "Complete API reference for BaseAgent — the ReAct loop, IoC factory methods, lifecycle hooks, injected components, and all built-in tools."
+---
+
+# BaseAgent
+
+`BaseAgent` (`Agents/BaseAgent/base.py`) is the concrete base class for every specialist agent. It implements the full ReAct loop (Think → Act → Observe), wires all sub-components via IoC factory methods, and exposes override hooks for subclasses. It is **not** abstract — it can be instantiated directly for simple single-agent tasks.
+
+---
+
+## Constructor
+
+```python
+class BaseAgent:
+    def __init__(self, *args, **kwargs)
+```
+
+All parameters are keyword arguments popped from `**kwargs` inside `__init__`. There is no fixed positional signature.
+
+<ParamField path="config" type="AgentConfig | None">
+  Validated configuration object loaded from env + YAML profile via `AgentConfig.from_env()`. Provides model names, token limits, Redis URL, billing limits, and per-specialist settings.
+</ParamField>
+
+<ParamField path="ws_client" type="AgentSocketIOClient | None">
+  Socket.IO client connected to the Backend `/agent` namespace. Used by `UXInteractionManager` to emit `agent_step`, `ui_meta`, and `agent_typing` events. May be `None` for offline/test scenarios.
+</ParamField>
+
+<ParamField path="device_id" type="str | None">
+  Identifier for the compute device (Cloud PC or local machine) this agent controls. Forwarded to every sub-agent via `SubAgentManagerTool._create_subagent`.
+</ParamField>
+
+<ParamField path="default_llm" type="str | None">
+  Overrides the model specified in `AgentSettings`. Useful when `SubAgentManagerTool` spawns a child with `intellect="low"` and resolves a cheaper model.
+</ParamField>
+
+<ParamField path="allow_parallel" type="bool" default="true">
+  If `True`, the agent may spawn parallel sub-agents via `ParallelBranchesTool`. Inherited by all children.
+</ParamField>
+
+<ParamField path="cloning_depth" type="int" default="1">
+  Maximum depth of sub-agent nesting. Each child receives `cloning_depth - 1`. When depth reaches `0`, `SubAgentManagerTool` and `SwitchLifecycleModeTool` are not registered, preventing further spawning.
+</ParamField>
+
+<ParamField path="max_iter" type="int" default="100">
+  Maximum number of ReAct loop iterations. After exhausting iterations, the loop exits with status `"max_iterations"`. Can be overridden per specialist via `AgentSettings.max_iter` in `model_profiles.yaml`.
+</ParamField>
+
+<ParamField path="target_env" type="TargetEnv" default="TargetEnv.for_linux_cloud()">
+  Target execution environment descriptor. Used by sandbox tools and `CloudPCAttachmentEmitter` to select shell family, OS-specific paths, and command formatting.
+</ParamField>
+
+<ParamField path="is_self_learning" type="bool" default="false">
+  When `True`, enables `StepBudgetAlertRule` and the full KnowledgeBase registry (ICL + active memory). Set by `SubAgentManagerTool` for agents spawned with learning capabilities.
+</ParamField>
+
+<ParamField path="remove_subagents_on_termination" type="bool" default="false">
+  If `True`, all active child agents are stopped when this agent terminates. Useful for root agents that own the full task tree.
+</ParamField>
+
+<ParamField path="parent_inbox" type="AgentInbox | None">
+  Reference to the parent agent's inbox. Set by `SubAgentManagerTool` at spawn time. Child calls to `communicate(to="parent")` write to this inbox.
+</ParamField>
+
+<ParamField path="disable_ux" type="bool" default="false">
+  When `True`, passes `disable_ux=True` to `_create_ux_manager()`, resulting in a no-op `UXInteractionManager` that suppresses all `agent_step` / `agent_typing` / `ui_meta` Socket.IO emissions. Useful for offline unit tests and scripted batch pipelines.
+</ParamField>
+
+### Instance attributes set in `__init__`
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `agent_id` | `str` | UUID4 identifying this agent instance |
+| `inbox` | `Inbox` | Receives messages from parent and child agents (asyncio queue) |
+| `event_log` | `SharedEventLog` | Append-only structured event log for telemetry |
+| `active_children` | `dict[str, dict]` | UUID → `{task, agent_instance, agent_type, …}` for running children |
+| `hibernating_children` | `dict[str, dict]` | UUID → metadata for hibernated children |
+| `subagents` | `dict[str, BaseAgent]` | All ever-spawned children (retained after completion for re-query) |
+| `parent_agent_id` | `str \| None` | Parent's `agent_id`; `None` for root agents |
+| `parent_inbox` | `Inbox \| None` | Reference to the parent's inbox; set by `SubAgentManagerTool` at spawn |
+| `subscribed_insights` | `list[BaseInsightType]` | ICL insight types retrieved by `KnowledgeManager` each step |
+| `is_self_learning` | `bool` | Whether this agent operates in self-learning mode |
+| `crud_activated` | `bool` | Whether active-memory CRUD is enabled (currently always `False`) |
+| `endpoints` | `EndpointRegistry` | Registry of user-facing communication channels (web, CLI) |
+| `_current_state` | `BaseAgentState \| None` | Read-only snapshot of the live state; refreshed each step for tools |
+| `_pending_emitted_files` | `list` | Files queued for delivery; harvested by parent on child finish |
+| `_tool_not_found_in_turn` | `bool` | Bug B3 guard: blocks false-success `communicate(result)` after `Tool not found` without recovery |
+| `_last_action_was_inform_no_wait` | `bool` | Guard: prevents `wait` immediately after `communicate(inform)` |
+| `current_step_reasoning` | `str` | The normalized reasoning text from the last think phase (cleared each step) |
+| `_total_children_spawned` | `int` | Running count of all children ever spawned by this agent |
+| `subagent_prompts` | `Dict[str, str]` | Optional per-agent-type custom prompt overrides; keyed by `agent_type` string |
+| `is_waiting_for_reply` | `bool` | Set `True` while the agent is blocked waiting for a user reply (ask_text / ask_choice) |
+| `_kb_insight_id` | `str \| None` | ID of the last knowledge-base insight record written; used to correlate ICL entries |
+| `ux_config` | `Dict[str, Any]` | UX customization dict forwarded to `UXInteractionManager` (e.g. persona display settings) |
+
+---
+
+## Core Loop
+
+### `chat()`
+
+```python
+async def chat(
+    self,
+    context: AgentContext,
+    state: BaseAgentState,
+    llm_params: dict,
+) -> Tuple[Dict[str, Any], List[Dict]]
+```
+
+Entry point for a single agent run. Runs the ReAct loop until a terminal condition is reached, then calls `_terminal_return()` and returns `(result_dict, messages_list)`.
+
+> **Note on return type**: `chat()` returns `(result_dict, state.messages)` — a `List[Dict]` of message history, **not** a `BaseAgentState`. Callers that need the final state should call `persist_state()` / `restore_state()` separately.
+
+The return dict contains at minimum `{"summary": str, "status": str}`. For hibernation it contains `{"_special_action": "HIBERNATE", "hibernate_config": dict}`.
+
+**Loop flow per iteration:**
+
+1. **Compress tool outputs**: call `memory_manager.compress_tool_outputs()` if any previous output exceeds `compress_tool_outputs_over_tokens`.
+2. **Forced summarization**: call `forced_summarization_manager.maybe_force_summarize()` — compress full history if near `forced_summarization_pct` of `max_context_tokens`.
+3. **Clean done children**: remove completed `asyncio.Task` entries from `active_children`.
+4. **Lifecycle mode router**: if `lifecycle_mode="batch"` or `"time"`, enter wait loop polling child steps / elapsed time, draining inbox at 1s intervals, until the batch/timeout condition clears.
+5. **Inbox check**: call `_handle_inbox_messages()` — process `STOP`, `PAUSE`, `FLUSH`, `CHILD_DONE`, `CHILD_HIBERNATED`, `USER_FOLLOWUP`. May return `should_terminate=True`.
+6. **Ask-human cancel detection**: call `_detect_ask_human_cancellation()` — if the most recent user reply following an `ask_human_hibernated` marker starts with `REJECTED`/`CANCELLED`, exit with `"cancelled"`.
+7. **Redis cancellation check**: call `session_manager.check_cancellation()` — poll `TaskCancellationManager`.
+8. **Budget alerts**: call `budget_alert_manager.check_alerts()` — inject any alert messages into state.
+9. **Think phase**: call `_execute_think_phase()`.
+10. **Guardrails phase**: call `_execute_guardrails_phase()`.
+11. **Parse + memory phase**: call `_execute_parse_and_memory_phase()`.
+12. **Pre-act cancellation check**: second Redis cancellation poll before executing tools.
+13. **Termination check**: call `_handle_termination()` — if the parsed actions contain a terminal action, execute the termination path and exit without running the act phase.
+14. **Act phase**: call `_execute_act_phase()`.
+15. **Observe phase**: call `_observe_phase()`.
+16. **Log trajectory**: call `log_trajectory()`.
+17. **Decrement iter**: decrement `state.remaining_iter`; if zero, exit with `"max_iterations"`.
+
+---
+
+## Template Methods (Override in Subclasses)
+
+### `_execute_think_phase()`
+
+```python
+async def _execute_think_phase(
+    self,
+    state: BaseAgentState,
+    llm_params: Dict,
+    context: AgentContext,
+    session_id: str,
+    current_step: int,
+) -> Tuple[Any, Dict, BaseAgentState]
+```
+
+On the last iteration, calls `llm_manager.summarize_to_terminate()` to force a terminal response. On all other iterations, calls `llm_manager.think_phase()`. Returns `(resp_content, llm_meta, updated_state)`. Subclasses can override to inject pre-/post-processing around the LLM call, add VLM screenshots, or change model parameters.
+
+### `_execute_guardrails_phase()`
+
+```python
+async def _execute_guardrails_phase(
+    self,
+    resp_content: Any,
+    state: BaseAgentState,
+    context: AgentContext,
+    session_id: str,
+    current_step: int,
+) -> Tuple[bool, bool, Dict]
+```
+
+Passes the LLM response through `SafetyManager`. Returns `(is_safe, should_continue, guardrail_meta)`. If `is_safe=False`, the loop exits with status `"unsafe"`. If clarification is needed, a `_CLARIFICATION_HIBERNATE_MARKER` is injected into state and the agent hibernates.
+
+> **Return order**: `is_safe` is the **first** element, `should_continue` is **second**. Do not confuse with the former convention.
+
+### `_execute_parse_and_memory_phase()`
+
+```python
+async def _execute_parse_and_memory_phase(
+    self,
+    resp_content: Any,
+    state: BaseAgentState,
+    context: AgentContext,
+    current_step: int,
+) -> Tuple[BaseAgentState, Dict, List[Dict], List[ToolInput]]
+```
+
+Parses the LLM JSON output into a list of `ToolInput` objects and applies ICL memory enrichment via `KnowledgeManager`. Returns `(updated_state, parse_meta, results_for_history, actions_to_execute)`.
+
+### `_execute_act_phase()`
+
+```python
+async def _execute_act_phase(
+    self,
+    actions_to_execute: List[ToolInput],
+    context: AgentContext,
+    current_step: int,
+) -> List[ActionExecutionRecord]
+```
+
+Delegates to `ActionExecutor.act_phase()`. Runs the tool bundle sequentially, checks cancellation between steps, emits step reports via `status_callback`, and returns execution records with full tool inputs and outputs.
+
+### `_observe_phase()`
+
+```python
+async def _observe_phase(
+    self,
+    execution_records: List[ActionExecutionRecord],
+    state: BaseAgentState,
+    context: AgentContext,
+    current_step: int,
+) -> Tuple[BaseAgentState, List[Dict]]
+```
+
+Converts `ActionExecutionRecord` objects into the `role="user"` observation message appended to the agent's history. Returns `(updated_state, results_for_history)`. Uses `_RenderTimeBlock()` to prepend wall-clock / time-remaining lines. Uses `_build_observe_message_meta()` to stamp the `ask_human_hibernated` marker when a `CommunicateTool` HIBERNATE result is present.
+
+---
+
+## IoC Factory Methods
+
+These methods are called once during `__init__` to construct the injected components. Override any of them in a subclass to substitute a custom implementation without touching the loop.
+
+```python
+def _create_tool_manager(self) -> ToolManager
+def _create_safety_manager(self) -> SafetyManager
+def _create_ux_manager(self, disable_ux: bool = False) -> UXInteractionManager
+def _create_action_executor(self) -> ActionExecutor
+def _create_prompt_builder(self) -> PromptBuilder
+def _create_memory_manager(self) -> MemoryManager
+def _create_knowledge_manager(self) -> KnowledgeManager
+def _create_llm_manager(self) -> LLMManager
+def _create_session_manager(self) -> SessionManager
+def _create_state_repository(self) -> AgentStateRepository
+def _create_budget_alert_manager(self) -> BudgetAlertManager
+def _create_forced_summarization_manager(self) -> ForcedSummarizationManager
+def _BuildEndpointRegistry(self) -> EndpointRegistry
+```
+
+---
+
+## Lifecycle Hooks
+
+These methods are called at specific points in the agent lifecycle. Override them to add cross-cutting logic without touching `chat()`.
+
+### `prepare_subagent_kwargs()`
+
+```python
+def prepare_subagent_kwargs(
+    self,
+    agent_type: str,
+    task: str,
+    clone_kwargs: dict,
+    extra_args: dict,
+) -> dict
+```
+
+Called by `SubAgentManagerTool._create_subagent()` just before the child agent is instantiated. The return value replaces `clone_kwargs`. Use this to inject agent-type-specific constructor arguments (e.g., `search_mode` for `DataFetcherAgent`, `sandbox_config` for `SoftwareEngineerAgent`).
+
+### `on_subagent_spawn()`
+
+```python
+async def on_subagent_spawn(
+    self,
+    child_agent_id: str,
+    agent_type: str,
+    explicit_plan_step_id: Optional[str],
+    context: AgentContext,
+) -> Optional[str]
+```
+
+Called immediately after the child task is created as an `asyncio.Task`. Returns an optional `plan_step_id` string (for orchestrators that maintain a `PlanManager`). Base implementation returns `None`; `PlannerAgent` overrides to allocate a plan step.
+
+### `on_subagent_finish()`
+
+```python
+async def on_subagent_finish(
+    self,
+    child_agent_id: str,
+    context: AgentContext,
+    summary: str,
+    *,
+    failed: bool,
+) -> None
+```
+
+Called in `SubAgentManagerTool._run_child_wrapper` on both success and failure. Base implementation is a no-op. `PlannerAgent` overrides to update the plan step status.
+
+### `pre_action_guard()`
+
+```python
+async def pre_action_guard(
+    self,
+    action_name: str,
+    args: dict,
+    context: AgentContext,
+) -> Optional[str]
+```
+
+Called by `ActionExecutor.execute_single_action()` before every tool invocation. Return a non-empty string to block the action and inject the string as an error message; return `None` or `""` to allow. Used by `PlannerAgent` to block `communicate(result)` while a child is waiting on a user reply.
+
+---
+
+## Termination
+
+### `_handle_termination()`
+
+```python
+async def _handle_termination(
+    self,
+    actions: List[Union[ToolInput, List[ToolInput]]],
+    state: BaseAgentState,
+    context: AgentContext,
+    session_id: str,
+    reasoning: str = None,
+) -> Optional[Dict]
+```
+
+Called **before** the act phase when parsed actions include a terminal action. Detects the terminal action type (`communicate(result)`, `communicate(ask_text/ask_choice)`, `hibernate_and_watch`, `request_confirmation`) and routes to `_terminal_return()` with the appropriate status.
+
+Applies the Bug B3 guard: if `_tool_not_found_in_turn=True` at termination time and no recovery tool succeeded, blocks `communicate(result)` by rewriting the intent into an error reflection. The guard has a carve-out for explicit failure reports (content starting with `[BLOCKED]`, `[FAILURE]`, `STATUS: FAILED`, etc.) which are passed through as-is so the agent can report that it cannot proceed.
+
+If `meta["hibernate_config"]` is present in the result, routes to the hibernation path. Returns the terminal result dict, or `None` to continue the loop.
+
+### `_terminal_return()`
+
+```python
+def _terminal_return(
+    self,
+    state: BaseAgentState,
+    result: Dict[str, Any],
+    *,
+    status: str,
+    event_name: str = "agent.terminate",
+    summary: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Tuple[Dict[str, Any], List[Dict]]
+```
+
+Single exit point for all loop terminations. Builds the canonical `result_dict`, logs a structured telemetry event under `event_name`, and returns `(result_dict, state.messages)` — **not** `(result_dict, state)`. `status` must be one of the valid terminal status values (`"completed"`, `"cancelled"`, `"terminated_by_parent"`, `"max_iterations"`, `"billing_limit_reached"`, `"unsafe"`, `"hibernating"`, `"persisted"`, `"paused"`).
+
+---
+
+## Additional Methods
+
+### Cancellation API
+
+```python
+def request_cancellation(self) -> None
+```
+Sets `_cancellation_requested = True`. Called by `SessionManager` on soft-cancel detection.
+
+```python
+def is_cancellation_requested(self) -> bool
+```
+Returns the current cancellation flag. Polled by `ActionExecutor` between tool executions.
+
+```python
+def reset_cancellation(self) -> None
+```
+Clears `_cancellation_requested`. Called at the start of a resumed session.
+
+---
+
+### Insight Subscription API
+
+```python
+def subscribe_insight(self, insight: BaseInsightType) -> None
+```
+Adds an insight type to `subscribed_insights` and recomputes the CRUD flag.
+
+```python
+def set_subscribed_insights(self, insights: list[BaseInsightType]) -> None
+```
+Replaces the full `subscribed_insights` list and recomputes the CRUD flag.
+
+```python
+def unsubscribe_insight(self, insight_type: type[BaseInsightType]) -> None
+```
+Removes all instances of the given insight type class from `subscribed_insights`. The CRUD flag is **not** cleared — it is monotonic.
+
+---
+
+### State Persistence Proxies
+
+```python
+async def persist_state(self, context: AgentContext, state: BaseAgentState = None) -> None
+```
+Proxy to `state_repository.persist_state()`. Serializes messages, scratchpad, plan state, and active persona to `agent_history:{agent_id}` in Redis (TTL 24h).
+
+```python
+async def restore_state(self, context: AgentContext, agent_uuid: str) -> Dict
+```
+Proxy to `state_repository.restore_state()`. Reads `agent_history:{agent_uuid}` from Redis and returns the deserialized state dict.
+
+---
+
+### Static / Class Utilities
+
+```python
+@staticmethod
+def _RenderTimeBlock(state: BaseAgentState) -> str
+```
+Renders a time-orientation block for the observe-phase message. Always emits `[CURRENT TIME]`. Adds `[TIME REMAINING]` only when the agent has a real `time_limit_seconds` set.
+
+```python
+@staticmethod
+def _build_observe_message_meta(
+    execution_records: List[ActionExecutionRecord],
+    results_for_history: List[Dict],
+) -> Dict[str, Any]
+```
+Builds the `meta` dict for the observe-phase message. Scans `execution_records` for an `ask_human_hibernated` marker (set by `CommunicateTool` on HIBERNATE results) and propagates it to the message metadata so it survives persist → restore.
+
+```python
+@classmethod
+def _looks_like_explicit_failure_report(cls, content: str) -> bool
+```
+Returns `True` if `content` starts with a structured failure tag (`[BLOCKED]`, `[FAILURE]`, `[FAILED]`, `[ERROR]`, `[ABORT]`, `STATUS: BLOCKED`, `STATUS: FAILED`, `STATUS: FAILURE`, `STATUS: ERROR`). Used by the Bug B3 guard to allow honest error reports through without demoting them to CONTINUE.
+
+```python
+@classmethod
+def get_user_prompt(cls, prompt: str) -> Dict[str, str]
+```
+Returns `{"role": "user", "content": prompt}`. Convenience constructor used by `LLMManager` and tests.
+
+---
+
+### Internal Loop Helpers
+
+```python
+async def _handle_inbox_messages(
+    self,
+    state: BaseAgentState,
+    context: AgentContext,
+) -> Tuple[BaseAgentState, bool]
+```
+Drains the inbox queue and applies each message to state. Returns `(updated_state, should_terminate)`. `should_terminate=True` on `STOP` or `PAUSE` messages.
+
+Message type effects:
+
+| Type | Effect |
+|---|---|
+| `STOP` | Sets `is_terminated=True`; returns `should_terminate=True` |
+| `PAUSE` | Sets `status=PAUSED`, `is_persisted=True`; returns `should_terminate=True` |
+| `FLUSH` | Persists trajectory, resets history to system+new objective, resets `remaining_iter` |
+| `INFO` / `INFORM` | Injects `[INCOMING PRIORITY MESSAGE]` as `role=system` |
+| `CHILD_DONE` | Injects `[SUB-AGENT FINISHED]` message; removes done child from `active_children` and `hibernating_children` |
+| `CHILD_HIBERNATED` | Moves child to `hibernating_children`; injects blocking or non-blocking system message depending on `pending_question_type` |
+| `USER_FOLLOWUP` | Injects user message into history (live follow-up while agent is running) |
+
+```python
+def _detect_ask_human_cancellation(self, messages: List[Dict]) -> bool
+```
+Scans backward for the most recent message with `meta.ask_human_hibernated`. Then scans forward: returns `True` if the first substantive user or system reply signals cancel (`REJECTED`, `CANCELLED`, `CANCELED`, or `Timer expired`). Returns `False` if the reply is a real user answer.
+
+```python
+async def gather_children_batch(self, context: AgentContext) -> str
+```
+Reads new `SharedEventLog` entries from all active children since the last poll. Returns a formatted text summary of child activity (thoughts, tool calls, results, spawns, messages). Used in the `CHILD_DONE` handler to flush remaining child events before the child is removed.
+
+```python
+def _get_total_child_steps(self) -> int
+```
+Returns the total number of `think_start` events across all active children's event logs. Used by the `batch` lifecycle mode to count collective child progress.
+
+```python
+def _get_total_child_events(self) -> int
+```
+Returns the total number of events across all active children's `SharedEventLog` entries. More granular than `_get_total_child_steps()` — used for fine-grained batch-mode progress tracking.
+
+```python
+def _format_children_events_as_text(self) -> str
+```
+Renders a human-readable multi-line summary of the most recent events from each active child. Included in the OBSERVE phase message when the parent is in batch/time lifecycle mode.
+
+```python
+def _emit_agent_state_event(self, event_name: str, **data: Any) -> None
+```
+Emits a structured telemetry event to `event_log` and (when `ws_client` is set) sends an `agent_state` Socket.IO event to the Backend. `event_name` identifies the event class; `**data` is the payload. Called by `_terminal_return()`, `_handle_termination()`, and internal checkpoints.
+
+```python
+def _recompute_crud_flag(self) -> None
+```
+Recalculates `crud_activated` based on current `subscribed_insights`. Called after any insight subscription change. Currently sets `crud_activated = False` unconditionally (feature-flagged off), but the hook is present for future active-memory CRUD enablement.
+
+```python
+def _render_trajectory(self, state: BaseAgentState) -> str
+```
+Renders the full agent trajectory as a human-readable multi-line string for external logging and telemetry. Includes step number, tool calls, results, and scratchpad snapshot.
+
+```python
+def _build_runtime_environment_payload(self, context: AgentContext) -> Dict[str, Any]
+```
+Builds the `ENV_CONTEXT` dict injected into every LLM call payload. Contains `current_date`, `session_id`, `user_id`, `device_id`, `agent_id`, and `lifecycle_mode`. Used by `DataFetcherAgent`'s `TEMPORAL_GROUNDING` directive to cross-check date-sensitive claims.
+
+```python
+@staticmethod
+def _has_billing_stop_marker(messages: List[Dict[str, Any]]) -> bool
+```
+Returns `True` if any message in `messages` contains the `_BILLING_STOP_MARKER` sentinel string. Used at startup to skip re-running a task that has already been billed to its limit.
+
+```python
+@staticmethod
+def _is_tool_output_message(message: Dict[str, Any]) -> bool
+```
+Returns `True` if the message dict represents a tool output (role=`"user"`, `meta.tool_results` key present). Used by memory compression logic to identify compressible messages.
+
+```python
+def _collapse_tool_outputs(
+    self,
+    messages: List[Dict[str, Any]],
+    *,
+    keep_last_tool_outputs: int,
+    collapsed_content: str,
+) -> List[Dict[str, Any]]
+```
+Replaces the content of older tool-output messages with `collapsed_content`, keeping the `keep_last_tool_outputs` most recent tool-output messages intact. Returns the modified message list. Called by `MemoryManager` during context compression.
+
+```python
+async def log_trajectory(self, *args, **kwargs) -> None
+```
+Calls `trajectory_logger` if set, and delegates to `knowledge_manager.log_step()`. Called at the end of each iteration to persist a structured step record. The method accepts `*args, **kwargs` and forwards them to both the external `trajectory_logger` callable and `knowledge_manager.log_step()`; the concrete positional args are `(state, context, current_step)` but are not enforced in the signature.
+
+---
+
+### `evaluator` property
+
+```python
+@property
+def evaluator(self) -> TrajectoryEvaluator
+```
+Exposes the `TrajectoryEvaluator` owned by `knowledge_manager`. Accessible as `agent.evaluator`. Used by tools (e.g. `SaveInsightTool`) and tests.
+
+---
+
+## Built-in Tools
+
+All tools are registered by `_create_tool_manager()` and injected into the system prompt via `ToolManager.get_tools_block()`.
+
+### Conditional tool registrations
+
+In addition to the always-registered tools below, `_create_tool_manager()` conditionally registers additional tools:
+
+| Condition | Tool registered |
+|---|---|
+| `BRAVE_API_KEY` env var is set | `ShallowWebSearchTool` — lightweight web search via Brave Search API |
+| `ws_client` is not `None` **and** `device_id` is not `None` | `RemoteRunPythonTool` — executes Python on the remote device |
+| `ws_client` is not `None` (root agent only) | `CloudPCAttachmentEmitter` — delivers sandbox files to the Frontend as downloadable attachments |
+
+### `communicate`
+
+Universal communication bus. Routes based on the `to` argument.
+
+<AccordionGroup>
+  <Accordion title="communicate(to='user', message_type='result')">
+    Sends the final answer to the user and terminates the agent. Stamps `status=completed` on the emitted message. If `TERMINATE_GUARD_ENABLED` is `True` (PlannerAgent only), `TerminateGuard.Check()` runs first and may reject the termination with a reflection message.
+
+    Accepts `emitted_files: list[str]` to deliver files from the agent's sandbox to the user. Files pending from child agents (`_pending_emitted_files`) are automatically appended and deduplicated.
+  </Accordion>
+  <Accordion title="communicate(to='user', message_type='inform')">
+    Sends a non-blocking progress update. Execution continues. With `wait_for_reply=true`, the agent suspends for up to 300s. Sets `_last_action_was_inform_no_wait=True` so a subsequent bare `wait` tool call is blocked.
+  </Accordion>
+  <Accordion title="communicate(to='user', message_type='ask_text' | 'ask_choice')">
+    Sends a question to the user via the registered `UserEndpoint`. On the web endpoint, this emits a `ui_meta(ask_human)` event and returns a `hibernate` reply — the agent hibernates via ARCH-001 and resumes when the user replies. On the CLI endpoint, it blocks synchronously.
+  </Accordion>
+  <Accordion title="communicate(to='parent', message_type='result')">
+    Sends the child's final summary to the parent inbox (type=INFO) and terminates the child. Sub-agents cannot send directly to `user`; a `to='user'` call from a sub-agent is auto-redirected to `parent`.
+  </Accordion>
+  <Accordion title="communicate(to='<agent_uuid>', message_type='inform' | 'stop' | 'flush')">
+    Sends a message to a specific active child agent. `stop` commands the child to halt. `flush` commands the child to clear context and pivot. If the target agent is hibernating, sending to it via this tool triggers `SubAgentManagerTool._interrupt_sleep()` — the child is woken with the content as its new prompt.
+  </Accordion>
+</AccordionGroup>
+
+```python
+# Args
+{
+  "to": "user" | "parent" | "<agent_uuid>",
+  "message_type": "inform" | "result" | "ask_text" | "ask_choice" | "stop" | "flush",
+  "content": str,
+  "wait_for_reply": bool,          # optional; default False
+  "choices": list[str],            # only for ask_choice
+  "emitted_files": list[str],      # only for result; file paths on target device
+  "endpoint": str,                 # optional; "web" | "cli" if multiple endpoints registered
+}
+```
+
+---
+
+### `manage_subagent`
+
+Creates, re-queries, or force-wakes sub-agents.
+
+```python
+# Args
+{
+  "command": "create" | "query" | "interrupt_sleep",
+  "task": str,                          # required for create / query
+  "agent_type": str,                    # required for create
+  "agent_uuid": str,                    # required for query / interrupt_sleep
+  "plan_step_id": str,                  # optional; correlates child with a plan step
+  "intellect": "default" | "low",       # optional; "low" uses worker_model_low
+  "time_limit_seconds": int,            # optional; child receives TIME CHECK alerts
+  "search_mode": "normal" | "deep_research",  # DataFetcherAgent only
+}
+```
+
+**`create`**: Instantiates an agent from `subagent_classes`, calls `on_subagent_spawn()`, and launches an `asyncio.Task` via `_run_child_wrapper()`. Hard cap of 10 active children.
+
+**`query`**: If the child is still active, sends a `NEW TASK` inbox message. If it has finished, restores state from Redis (`agent_history:{uuid}`) and re-launches the agent with the new task appended to its history.
+
+**`interrupt_sleep`**: Removes the child from `hibernating_children`, cancels its Redis sentinel via `HibernationController.Wake()`, and resumes the child via `_query_subagent()` with a wake prompt.
+
+---
+
+### `hibernate_and_watch`
+
+Suspends the agent. The `_execute` method validates the `trigger_type` against the registered strategy registry and returns a `ToolResult` with `meta={"hibernate_config": config}`. The actual scheduling is handled by `HibernationController` in `BrokerAgent` or `SubAgentManagerTool._run_child_wrapper`.
+
+```python
+# Args
+{
+  "trigger_type": "timer" | "visual_condition",
+  "condition": str,               # description of wake condition; "none" for timer
+  "interval_seconds": int,        # check frequency for visual_condition
+  "timeout_seconds": int,         # maximum wait time
+}
+```
+
+---
+
+### `request_confirmation`
+
+ARCH-001 flow for Approve/Reject cards. Emits `ui_meta(mode=ask_human, input.type=confirmation)` to the frontend, then returns a HIBERNATE `ToolResult`. Default timeout is `CONFIRMATION_TIMEOUT_SECONDS` (30 minutes).
+
+```python
+# Args
+{
+  "action_type": str,
+  "action_description": str,
+  "action_parameters": dict,
+  "risk_level": "low" | "medium" | "high",
+  "requires_reason": bool,
+  "approve_label": str,           # default "Approve"
+  "reject_label": str,            # default "Reject"
+  "timeout_seconds": int,
+}
+```
+
+---
+
+### `switch_lifecycle_mode`
+
+Controls sub-agent orchestration rhythm. Can only switch to `batch` or `time` mode when there is at least one active child.
+
+```python
+# Args
+{
+  "mode": "continuous" | "batch" | "time",
+  "steps_batch_size": int,    # required for "batch"; child steps to wait for
+  "timeout_seconds": int,     # required for "time"
+}
+```
+
+| Mode | Behaviour |
+|---|---|
+| `continuous` | Execute loop steps without waiting for children. Default. |
+| `batch` | Suspend until children collectively complete `steps_batch_size` steps or any child terminates. |
+| `time` | Suspend for `timeout_seconds` or until any child terminates. |
+
+---
+
+### `execute_parallel_branches`
+
+Runs multiple independent tool sequences concurrently. Each branch is a list of action objects executed sequentially. Results are merged with LWW semantics for `UpdateProps` and append semantics for `AddMessages`.
+
+```python
+# Args
+{
+  "branches": [
+    [{"name": "tool_a", "args": {...}}],
+    [{"name": "tool_b", "args": {...}}, {"name": "tool_c", "args": {...}}],
+  ]
+}
+```
+
+---
+
+### `manage_scratchpad`
+
+Personal notepad. Lines are zero-indexed. `line_range` is `[start, end]` inclusive.
+
+```python
+# Args
+{
+  "action": "append" | "edit" | "delete" | "clear",
+  "texts": list[str],         # lines to append / replacement lines for edit
+  "lines": list[int],         # specific zero-based line indexes
+  "line_range": [int, int],   # range alternative to "lines"
+}
+```
+
+---
+
+### `wait`
+
+Short environmental delay. Maximum 120 seconds. Cannot be called immediately after `communicate(inform)` without `wait_for_reply=true`.
+
+```python
+# Args
+{"seconds": int}   # 1–120
+```
+
+---
+
+## Component Reference
+
+All components are accessed as `self.<name>` on the agent instance.
+
+<AccordionGroup>
+  <Accordion title="llm_manager (LLMManager)">
+    **`llm_call(payload, context, session_id, *, requires_vision=False) -> tuple[str, dict]`**
+
+    Calls the configured LLM via the provider selected by `ModelRouter`. Handles caching headers (`write_cache_control`), streaming, retry on provider error. Returns `(response_text, meta)` where `meta` contains `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `latency_ms`.
+
+    Token usage is forwarded to `CostTracker.record_api_call_async()`. If billing limit is exceeded, raises `BillingLimitReached`, which causes the loop to exit with status `"billing_limit_reached"`.
+  </Accordion>
+
+  <Accordion title="tool_manager (ToolManager)">
+    **`register_tool(tool: BaseTool)`** — Add a tool to the registry.
+
+    **`unregister_tool(name: str)`** — Remove a tool by name.
+
+    **`get_tool(name: str) -> Optional[BaseTool]`** — Look up a tool.
+
+    **`suggest_similar_tools(name: str) -> str`** — Return a hint string when a tool is not found. Uses prefix matching (`youtube_list_channels` → suggests all `youtube_*` tools).
+
+    **`get_tools_block() -> Optional[PromptBlock]`** — Build the `<SYSTEM.TOOLS>` XML prompt block. `CommunicateTool` and `RequestConfirmationTool` sort first; remaining tools sort alphabetically.
+  </Accordion>
+
+  <Accordion title="action_executor (ActionExecutor)">
+    **`execute_single_action(action_name, args, action_id, context) -> ActionExecutionRecord`**
+
+    Looks up the tool, calls `pre_action_guard()`, executes the tool, handles Bug B3 sentinel logic (`_tool_not_found_in_turn`).
+
+    **`execute_bundle(bundle, context) -> list[ActionExecutionRecord]`**
+
+    Sequential execution. Checks cancellation before each tool. Stops the bundle on tool error.
+
+    **`act_phase(actions_to_execute, context) -> list[ActionExecutionRecord]`**
+
+    Top-level call from `_execute_act_phase`. Runs `execute_bundle`, then calls `ux_manager.report_actions()` and emits step reports via `status_callback` for sub-agents without dedicated step reporting.
+  </Accordion>
+
+  <Accordion title="prompt_builder (PromptBuilder)">
+    **`get_system_prompt() -> dict`** — Assembles and returns `{"role": "system", "content": "…"}`.
+
+    The prompt follows a strict XML-tag taxonomy:
+    - `<SYSTEM.CORE>` — CORE.CONTEXT (date), CORE.IDENTITY (agent persona), CORE.EPISTEMOLOGY (source hierarchy)
+    - `<SYSTEM.OPERATIONS>` — ecosystem, artifacts, memory, safety, UX blocks
+    - `<SYSTEM.PROTOCOLS>` — behavioral guidelines, skills, ICL insights, plan override
+    - `<SYSTEM.TOOLS>` — tool descriptions, each in a `<TOOL>` tag
+    - output format block
+    - termination guidelines block
+
+    Each `construct_*` method returns an `Optional[PromptBlock]`. Return `None` to omit a section entirely. This is the primary override surface for specialist agents.
+
+    **All `construct_*` methods:**
+
+    | Method | XML tag emitted | Omitted when |
+    |--------|----------------|--------------|
+    | `construct_context_block()` | `<CORE.CONTEXT>` | `CONTEXTUAL_INFORMATION` is empty |
+    | `construct_identity_block()` | `<CORE.IDENTITY>` | `agent.SYSTEM_PROMPT` is empty or None |
+    | `construct_epistemology_block()` | `<CORE.EPISTEMOLOGY>` | Never (always injected) |
+    | `construct_ecosystem_block()` | `<OPERATIONS.ECOSYSTEM>` (+ `<ECOSYSTEM.ENVIRONMENT>`, `<ECOSYSTEM.ESCALATION>`, `<ECOSYSTEM.CHILDREN>`) | Children block omitted when `cloning_depth == 0`; escalation block omitted when `parent_agent_id` is None |
+    | `construct_artifacts_block()` | `<OPERATIONS.ARTIFACTS>` | `run_python` tool not registered, or `ARTIFACTS_GUIDANCE` empty |
+    | `construct_memory_block()` | `<OPERATIONS.MEMORY_MANAGEMENT>` | `MEMORY_MANAGEMENT_PROMPT` is empty — MCPToolsAgent sets to `""` |
+    | `construct_safety_block()` | `<OPERATIONS.SAFETY_GUARDRAILS>` | `config.safety_enabled == False` or `SAFETY_ASSESSMENT_PROMPT` empty |
+    | `construct_ux_block()` | `<OPERATIONS.UX_METADATA>` | `ux_manager.get_prompt_block()` returns empty string |
+    | `construct_behavioral_guidelines_block()` | `<PROTOCOLS.BEHAVIORAL_GUIDELINES>` | `BEHAVIORAL_GUIDELINES_PROMPT` empty — MCPToolsAgent sets to `""` |
+    | `construct_skills_block()` | `<PROTOCOLS.SKILLS_LIBRARY>` | KB disabled, `search_insights` tool not registered, or no active `skill` insight type |
+    | `construct_subscribed_insights_block()` | `<PROTOCOLS.EXPLORATION>` | `agent.is_self_learning == False` or `subscribed_insights` empty |
+    | `construct_context_guide_block()` | `<PROTOCOLS.CONTEXT_GUIDE>` | Agent attribute `CONTEXT_GUIDE` empty |
+    | `construct_plan_override_block()` | `<PROTOCOLS.PLAN_OVERRIDE>` | No active plan or plan has no overrides |
+    | `construct_tools_block()` | `<SYSTEM.TOOLS>` | Delegates to `tool_manager.get_tools_block()` |
+    | `construct_format_block()` | `<OUTPUT_FORMAT>` | Agent attribute `FORMAT_PROMPT` empty |
+    | `construct_termination_guidelines_block()` | `<TERMINATION_GUIDELINES>` | Agent attribute `TERMINATION_GUIDELINES_PROMPT` empty |
+    | `construct_mcp_environment_block(context)` | `<MCP_ENVIRONMENT>` | Only in MCPToolsAgent via `PlannerPromptBuilder.construct_mcp_environment_block()`; omitted in base |
+
+    **Override pattern:**
+    ```python
+    class MyAgent(BaseAgent):
+        def _create_prompt_builder(self) -> PromptBuilder:
+            pb = super()._create_prompt_builder()
+            # Option 1: override via class constant (simplest)
+            # → set MEMORY_MANAGEMENT_PROMPT = "" on the class to disable
+            return pb
+
+    class MyAgentPromptBuilder(PromptBuilder):
+        def construct_identity_block(self):
+            return PromptBlock("CORE.IDENTITY", "My agent").add("Custom identity text")
+    ```
+  </Accordion>
+
+  <Accordion title="safety_manager (SafetyManager)">
+    **`check(response_text, context, state) -> SafetyResult`**
+
+    Runs the safety pipeline: lightweight classifier first, then heavy classifier if needed. Returns `SafetyResult` with `.block` (bool), `.clarification_needed` (bool), `.reason` (str).
+
+    If `clarification_needed`, the guardrails phase injects a `_CLARIFICATION_HIBERNATE_MARKER` message into state and triggers hibernation. On resume, the marker is read and the agent is instructed to ask the user for clarification before proceeding.
+
+    Controlled by `config.safety_enabled`. The `_CLARIFICATION_HIBERNATE_MARKER` key is preserved through `AgentStateRepository.persist_state()` / `restore_state()` so the marker survives the hibernate → Redis → restore boundary.
+  </Accordion>
+
+  <Accordion title="memory_manager (MemoryManager)">
+    Compresses tool outputs that exceed `config.compress_tool_outputs_over_tokens` tokens. Keeps the most recent `config.compress_tool_outputs_keep_last` outputs verbatim and summarizes older ones. Called during `_observe_phase`.
+  </Accordion>
+
+  <Accordion title="knowledge_manager (KnowledgeManager)">
+    Queries the `KnowledgeBase` for ICL insights relevant to the current task. Retrieved insights are injected into the `construct_subscribed_insights_block()` section of the system prompt. Controlled by `config.kb_enabled`.
+  </Accordion>
+
+  <Accordion title="session_manager (SessionManager)">
+    **`check_cancellation(context) -> tuple[bool, Optional[dict]]`** — Polls `TaskCancellationManager` and the Backend `/agent/task/{session_id}/status` endpoint. Returns `(True, summary_dict)` if cancellation was requested.
+  </Accordion>
+
+  <Accordion title="state_repository (AgentStateRepository)">
+    **`persist_state(context, state)`** — Serializes messages, scratchpad, plan state, and active persona to `agent_history:{agent_id}` in Redis (TTL 24h). Also writes to the KnowledgeBase when a parent agent ID is set.
+
+    **`restore_state(context, agent_uuid) -> dict`** — Reads `agent_history:{agent_uuid}` from Redis. Returns `{"messages": list, "agent_type": str, "remaining_iter": int, "scratchpad_lines": list, "plan_state": dict, …}`.
+  </Accordion>
+
+  <Accordion title="budget_alert_manager (BudgetAlertManager)">
+    **`register_rule(rule: BaseAlertRule)`** — Add an alert rule.
+
+    **`check_alerts(context, state, current_step, *, wait_loop_only=False) -> Optional[str]`** — Evaluate all rules. Returns aggregated alert text or `None`. `wait_loop_only=True` runs only rules with `run_in_wait_loop=True` (safe for 1s tick frequency in the batch-mode wait loop).
+
+    **`unregister_rule(rule: BaseAlertRule)`** — Remove a specific rule instance.
+  </Accordion>
+
+  <Accordion title="forced_summarization_manager (ForcedSummarizationManager)">
+    **`maybe_force_summarize(context, state, llm_params, session_id) -> BaseAgentState`**
+
+    Fires when `len(messages) / max_context_tokens >= forced_summarization_pct` (default 90%). Calls the LLM with a `_FORCED_SUMMARY_PROMPT_CACHE` system prompt to compress the message history. Preserves the first system message and first user message; replaces the rest with `[FORCED CONTEXT SUMMARY]`. Output is capped at 4000 tokens to ensure net context reduction. Sets `_recently_forced=True` to prevent immediate re-trigger.
+  </Accordion>
+
+  <Accordion title="ux_manager (UXInteractionManager / NullUXManager)">
+    **Injected type:** `UXInteractionManager` (live sessions) or `NullUXManager` (background/test contexts).
+
+    `UXInteractionManager` is a side-channel for real-time frontend communication that runs independently of the main chat-message pipeline.
+
+    ---
+
+    **`emit_ui_meta(session_id, data) -> bool`**
+
+    Emits a `ui_meta` Socket.IO event to the frontend for the given session. Used for streaming status indicators, progress updates, and intermediate state that should not become a persisted chat message. Returns `True` on success, `False` on failure or if the session has no active Socket.IO subscriber.
+
+    Callers such as `WebEndpoint` use the return value to decide whether to emit a fallback chat-callback message. A `False` return (no subscriber) triggers the fallback path; `None` would silently skip it, creating a 24-hour hibernate trap.
+
+    ---
+
+    **`emit_plan_snapshot(session_id, plan_event) -> bool`**
+
+    Emits a `plan_snapshot` Socket.IO event carrying a structured plan-step update. Used by `BrokerAgent` and the CUA orchestrator to stream plan state to the frontend task panel.
+
+    ---
+
+    **`process_response(response_text) -> str`**
+
+    Post-processes raw LLM output before it enters the agent loop:
+
+    1. Strips any `ui_meta` block embedded in the response and emits it via `emit_ui_meta()`.
+    2. **Rejects `mode=ask_human`** — if the response contains an `ask_human` directive in the `ui_meta` block, the directive is stripped and not forwarded. This prevents a fake ask-human prompt from colliding on the `chat_messages` primary key, which would cause a 500 error or silent deduplication loss.
+
+    Returns the cleaned response text (with `ui_meta` blocks removed).
+
+    ---
+
+    **`NullUXManager`** — Null Object Pattern implementation used when no frontend connection is available (background workers, automated tests, offline agents).
+
+    | Method | Return value | Notes |
+    |--------|-------------|-------|
+    | `emit_ui_meta(...)` | `False` | Not `None` — callers rely on the boolean |
+    | `emit_plan_snapshot(...)` | `False` | Same constraint |
+    | `process_response(text)` | `text` unchanged | Pass-through |
+
+    <Warning>
+      `NullUXManager.emit_ui_meta()` returns `False`, not `None`. If you implement a custom null manager, ensure the return type is `bool`. Returning `None` causes callers that check the return value for the hibernate-prevention path to silently skip the fallback, trapping the agent in a 24-hour wait state.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Class Attributes for Subclass Customization
+
+Override any of these class-level attributes in a subclass to change agent behaviour without touching instance methods.
+
+| Attribute | Type | Default | Purpose |
+|---|---|---|---|
+| `SYSTEM_PROMPT` | `str` | `""` | Persona and role injected into `CORE.IDENTITY` |
+| `DELEGATION_DESCRIPTION` | `str` | `""` | Shown in `SubAgentManagerTool.description` for the agent type |
+| `ARTIFACTS_GUIDANCE` | `str` | `""` | Extra artifacts-handling instructions injected via `PromptBuilder.construct_artifacts_block()`. Override in specialist agents that handle file output. |
+| `ACTION_PREFIX` | `str` | `""` | Optional text prepended to the action-format section of the tools block. Allows specialist agents to add action-syntax reminders. |
+| `TERMINATE_GUARD_ENABLED` | `bool` | `False` | If `True`, `CommunicateTool` checks `TerminateGuard` before allowing termination |
+| `CONTEXTUAL_INFORMATION` | `str` | (date template) | Format string for `CORE.CONTEXT`; receives `current_date` |
+| `TERMINATION_GUIDELINES_PROMPT` | `str` | `""` | Extra termination directives appended to the `TERMINATION_GUIDELINES` prompt block. Used by `MCPToolsAgent` to inject the `FAITHFULNESS` rule. |
+| `MEMORY_MANAGEMENT_PROMPT` | `str` | (default template) | Override to `""` to disable the memory-management section of the system prompt. `MCPToolsAgent` sets this to `""`. |
+| `SAFETY_ASSESSMENT_PROMPT` | `str` | (default template) | Override to `""` to disable the safety-assessment section. `MCPToolsAgent` sets this to `""`. |
+| `BEHAVIORAL_GUIDELINES_PROMPT` | `str` | (default template) | Override to `""` to disable the behavioral-guidelines section. `MCPToolsAgent` sets this to `""`. |
+| `subagent_classes` | `dict[str, type]` | `{}` | Allowed child agent types. Empty = cannot spawn sub-agents |
+| `state_class` | `type[BaseAgentState]` | `BaseAgentState` | Polymorphic state dataclass. Override with a `BaseAgentState` subclass to add custom fields (e.g. `CUAState`). |
+| `SubscribedInsights` | `list[BaseInsightType]` | `[]` | Class-level list of insight types. Copied to `subscribed_insights` at init. `SubAgentProfileInsightType` is always appended automatically when `cloning_depth > 0`. |
+| `trajectory_logger` | `Callable \| None` | `None` | Optional hook called by `log_trajectory()` to persist the full step record externally. |
+
+---
+
+## `BaseAgentState`
+
+```python
+@dataclass
+class BaseAgentState:
+    messages: list[dict]
+    remaining_iter: int
+    task_description: str = ""
+    agent_id: str = ""
+    status: str = "ACTIVE"
+    is_terminated: bool = False
+    is_persisted: bool = False
+    scratchpad_lines: list[str] = field(default_factory=list)
+    lifecycle_mode: Literal["continuous", "batch", "time"] = "continuous"
+    lifecycle_batch_size: int = 10
+    lifecycle_timeout: int = 60
+    step_num: int = 0
+    time_limit_seconds: float = NO_TIME_LIMIT
+    forbidden_tools: list[str] = field(default_factory=list)
+    forbidden_mcp_providers: list[str] = field(default_factory=list)
+```
+
+State is immutable-style: all mutations return a new `BaseAgentState` via `apply_update(state, update)`. Update types: `AddMessages`, `AddActionResult`, `UpdateProps`, `UpdateScratchpad`, `ReplaceHistory`.
+
+---
+
+## `AgentContext`
+
+```python
+@dataclass
+class AgentContext:
+    session_id: str
+    user_id: str
+    device_id: Optional[str]
+    task_id: str
+    plan_step_id: Optional[str]
+    spawn_id: Optional[str]
+    session_llm: httpx.AsyncClient          # shared HTTP client for LLM calls
+    redis_client: Optional[Redis]
+    cancellation_manager: Optional[TaskCancellationManager]
+    ws_client: Optional[AgentSocketIOClient]
+    send_chat_message_callback: Optional[Callable]
+    status_callback: Optional[Callable]
+    send_screenshots_callback: Optional[Callable]
+```

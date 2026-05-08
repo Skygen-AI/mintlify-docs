@@ -1,213 +1,338 @@
 ---
-title: "Automate a Cloud PC from Python"
-description: "Full end-to-end script — auth, provision, stream, send prompt, retrieve screenshots."
+title: "Tutorial: Cloud PC Automation with Python"
+description: "Use the Skygen API to start a Cloud PC session, run a GUI automation task, and capture screenshots."
 ---
 
-This tutorial shows the full flow to drive a Cloud PC from a Python script. You will authenticate, create a Cloud PC, link it as a device, open a session, send a prompt ("open Firefox and go to example.com"), watch the agent work in real time, and retrieve screenshots.
+## Overview
 
-<Info>
-**Prereqs.** Python 3.10+, `httpx` and `python-socketio>=5`. A Skygen account with billing (Cloud PC is paid). `CLOUD_PC_ENABLED=true` on the deployment.
-</Info>
+A Cloud PC is an E2B-backed virtual desktop that the Skygen agent controls remotely. In this tutorial, you will:
 
-Install:
+1. Authenticate with the Skygen API
+2. Start a Cloud PC session
+3. Send an agent task that performs GUI automation on the Cloud PC
+4. Stream the agent's progress via Socket.IO
+5. Retrieve screenshots captured during the task
+
+Total time: approximately 30 minutes.
+
+---
+
+## Prerequisites
+
+- A Skygen account with Cloud PC access (Standard plan)
+- Python 3.9+ with `httpx` and `python-socketio` installed
+- Your Skygen API token
 
 ```bash
-pip install httpx python-socketio
+pip install httpx python-socketio[asyncio_client]
 ```
 
-## 1. Authenticate
+---
+
+## Step 1: Authenticate
 
 ```python
 import httpx
 
-API = "https://api.skygen.ai"
-EMAIL = "you@example.com"
-PASSWORD = "strong-password"
+BASE_URL = "https://api.skygen.ai"
 
-res = httpx.post(
-    f"{API}/auth/token",
-    data={"username": EMAIL, "password": PASSWORD},
-    headers={"Content-Type": "application/x-www-form-urlencoded"},
+# Option A: Use your existing JWT token
+TOKEN = "your-skygen-jwt-token"
+
+# Option B: Log in to obtain a token
+resp = httpx.post(
+    f"{BASE_URL}/auth/login",
+    json={"email": "you@example.com", "password": "your-password"},
 )
-TOKEN = res.json()["access_token"]
+TOKEN = resp.json()["access_token"]
+
+headers = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+}
+
+# Verify auth
+me = httpx.get(f"{BASE_URL}/auth/me", headers=headers).json()
+print(f"Authenticated as: {me['email']}")
 ```
 
-## 2. Create the Cloud PC
+---
+
+## Step 2: Check Cloud PC status
+
+Before starting a task, check if a Cloud PC is available for your account:
 
 ```python
-res = httpx.post(
-    f"{API}/cloud-pc/connect",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"name": "Python automation"},
-)
-body = res.json()
-cloud_pc_id = body["cloud_pc_id"]
-stream_url = body["stream_url"]
+resp = httpx.get(f"{BASE_URL}/cloud-pc/status", headers=headers)
+status = resp.json()
+print(f"Cloud PC status: {status}")
+# Example: {"status": "idle", "sandbox_id": null} — ready to provision
+# Or: {"status": "running", "sandbox_id": "e2b-sandbox-xyz"} — already active
 ```
 
-## 3. Wait for `ACTIVE`
+---
+
+## Step 3: Create a chat session
+
+All agent tasks run inside a chat session. Create one:
 
 ```python
-import time
-
-while True:
-    res = httpx.get(
-        f"{API}/cloud-pc/status?cloud_pc_id={cloud_pc_id}",
-        headers={"Authorization": f"Bearer {TOKEN}"},
-    )
-    status = res.json()["status"]
-    if status == "active":
-        break
-    if status in {"error", "terminated"}:
-        raise RuntimeError(f"Cloud PC failed: {status}")
-    time.sleep(2)
-```
-
-## 4. Link as a device
-
-```python
-res = httpx.post(
-    f"{API}/cloud-pc/link-device",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"cloud_pc_id": cloud_pc_id},
+resp = httpx.post(
+    f"{BASE_URL}/chat/sessions",
+    headers=headers,
+    json={"title": "Cloud PC Automation Task"},
 )
-device_id = res.json()["device_id"]
+session = resp.json()
+SESSION_ID = session["id"]
+print(f"Session created: {SESSION_ID}")
 ```
 
-## 5. Create a session bound to the device
+---
 
-```python
-res = httpx.post(
-    f"{API}/sessions",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"title": "Firefox demo", "device_id": device_id},
-)
-session_id = res.json()["id"]
-```
+## Step 4: Set up real-time progress monitoring
 
-## 6. Subscribe to progress (Socket.IO)
+Before sending the task, connect to Socket.IO to stream progress:
 
 ```python
 import asyncio
 import socketio
 
 sio = socketio.AsyncClient()
+progress_events = []
 
-@sio.on("agent_response", namespace="/user")
-async def on_response(data):
-    print(f"assistant: {data['message']['content']}")
+@sio.on("chat_message", namespace="/user")
+async def on_chat_message(data):
+    meta = data.get("meta_data", {})
+    msg_type = meta.get("type")
+    if msg_type == "ui_meta_update":
+        ui_meta = meta.get("ui_meta", {})
+        action = ui_meta.get("action_type", "")
+        title = ui_meta.get("title", "")
+        print(f"  [{action}] {title}")
+        progress_events.append(data)
+    elif data.get("role") == "assistant":
+        content = data.get("content", "")
+        if content:
+            print(f"\nAgent: {content[:200]}")
 
-@sio.on("ui_meta_update", namespace="/user")
-async def on_update(data):
-    p = data.get("payload", {})
-    print(f"[{p.get('mode')}/{p.get('stage')}] {p.get('title', '')}")
+@sio.on("session_updated", namespace="/user")
+async def on_session_updated(data):
+    waiting = data.get("meta_data", {}).get("waiting_for_input", False)
+    if waiting:
+        print("Agent is waiting for user input (ask_human)")
 
-@sio.on("mode_progress", namespace="/user")
-async def on_mode_progress(data):
-    print(f"mode={data['mode']} stage={data['stage']} progress={data.get('progress')}")
-
-async def main():
+async def connect_socket():
     await sio.connect(
-        API.replace("https://", "wss://"),
+        BASE_URL,
         auth={"token": TOKEN},
         namespaces=["/user"],
         transports=["websocket"],
     )
-    await sio.wait()
+    print("Socket.IO connected")
 
-asyncio.run(main())
+asyncio.run(connect_socket())
 ```
 
-## 7. Send the prompt (from another process or thread)
+---
+
+## Step 5: Send the automation task
+
+Send a task that instructs the agent to use the Cloud PC:
 
 ```python
-res = httpx.post(
-    f"{API}/sessions/{session_id}/messages",
-    headers={
-        "Authorization": f"Bearer {TOKEN}",
-        "agent_mode": "cua",
-    },
+TASK_PROMPT = """
+Use the Cloud PC to complete the following task:
+
+1. Open a web browser (Firefox or Chromium)
+2. Navigate to https://news.ycombinator.com
+3. Take a screenshot of the front page
+4. Extract the titles of the top 5 stories
+5. Open a text editor (gedit or mousepad)
+6. Type the 5 story titles as a numbered list
+7. Take a final screenshot showing the text editor
+
+Report back with the 5 story titles.
+"""
+
+resp = httpx.post(
+    f"{BASE_URL}/chat/sessions/{SESSION_ID}/messages",
+    headers=headers,
     json={
-        "role": "user",
-        "content": "Open Firefox and navigate to example.com. Take a screenshot when the page finishes loading.",
+        "content": TASK_PROMPT,
+        "mode": "cua",  # Computer Use Agent mode
     },
 )
+print(f"Task sent: {resp.status_code}")
+print(f"Watch live at: https://app.skygen.ai/chat/{SESSION_ID}")
 ```
 
-The agent picks up the message, opens Firefox on the Cloud PC, navigates, screenshots, and replies.
+---
 
-## 8. Retrieve screenshots
+## Step 6: Wait for task completion
 
-Agent screenshots upload directly to S3. Fetch the list:
+Poll the session status until the agent finishes:
 
 ```python
-res = httpx.get(
-    f"{API}/screenshots/agent/session/{session_id}",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-)
-for s in res.json()["items"]:
-    print(s["step_number"], s["url"])  # presigned download URLs
+import time
+
+def wait_for_completion(session_id: str, timeout: int = 300) -> dict:
+    """Poll for task completion. Returns the final session state."""
+    start = time.time()
+    while time.time() - start < timeout:
+        resp = httpx.get(
+            f"{BASE_URL}/chat/sessions/{session_id}",
+            headers=headers,
+        )
+        session = resp.json()
+        meta = session.get("meta_data", {})
+        
+        status = meta.get("task_status")
+        waiting = meta.get("waiting_for_input", False)
+        
+        print(f"Status: {status}, waiting_for_input: {waiting}")
+        
+        if status in ("completed", "failed", "cancelled"):
+            return session
+        if waiting:
+            print("Agent needs input — check the web UI")
+            return session
+        
+        time.sleep(5)
+    
+    raise TimeoutError(f"Task did not complete within {timeout}s")
+
+final_session = wait_for_completion(SESSION_ID)
+print(f"Task finished with status: {final_session['meta_data'].get('task_status')}")
 ```
 
-## 9. Heartbeat (if the Cloud PC runs longer than a minute)
+---
 
-While you're interacting, hit heartbeat every 60 seconds to keep the sandbox alive:
+## Step 7: Retrieve screenshots
+
+After the task completes, fetch all screenshots captured by the agent:
 
 ```python
-httpx.post(
-    f"{API}/cloud-pc/heartbeat",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"cloud_pc_id": cloud_pc_id, "is_active": True},
+resp = httpx.get(
+    f"{BASE_URL}/screenshots/agent/session/{SESSION_ID}",
+    headers=headers,
 )
+screenshots = resp.json()
+print(f"Captured {screenshots['count']} screenshots:")
+
+for shot in screenshots["screenshots"]:
+    print(f"  Step {shot['step_number']}: {shot['url']} ({shot['size']} bytes)")
 ```
 
-Each heartbeat deducts 1 token (~0.0069 USD).
-
-## 10. Pause and terminate
+### Download a screenshot
 
 ```python
-# Pause (backs up state, keeps backup for 30 days)
-httpx.post(
-    f"{API}/cloud-pc/disconnect",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"cloud_pc_id": cloud_pc_id},
-)
+import os
 
-# ... later, resume is fast (3-10s)
-httpx.post(
-    f"{API}/cloud-pc/connect",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-    json={"cloud_pc_id": cloud_pc_id},
-)
+os.makedirs("screenshots", exist_ok=True)
 
-# Or terminate permanently
-httpx.delete(
-    f"{API}/cloud-pc/{cloud_pc_id}",
-    headers={"Authorization": f"Bearer {TOKEN}"},
-)
+for shot in screenshots["screenshots"]:
+    img_resp = httpx.get(
+        f"{BASE_URL}{shot['url']}",
+        headers=headers,
+    )
+    filename = f"screenshots/step_{shot['step_number']:04d}.png"
+    with open(filename, "wb") as f:
+        f.write(img_resp.content)
+    print(f"Downloaded: {filename}")
 ```
 
-## Common mistakes
+---
 
-<Warning>
-**402 on `POST /cloud-pc/connect`.** Your account lacks a payment method or has insufficient tokens. Add a card and buy credit, or set a subscription override as admin.
-</Warning>
+## Step 8: Read the agent's final message
 
-<Note>
-**Status stuck at `CREATING` > 5 minutes.** Background recovery marks stale transitions as `TERMINATED` after 5 minutes. Retry the connect call — you'll get a fresh instance.
-</Note>
+Get the assistant's final response to see the extracted story titles:
 
-<Note>
-**No `ui_meta_update` events.** Verify your Socket.IO connection is in the `/user` namespace and authenticated with a valid token. WebSocket disconnects on token expiry.
-</Note>
+```python
+messages_resp = httpx.get(
+    f"{BASE_URL}/chat/sessions/{SESSION_ID}/messages",
+    headers=headers,
+)
+messages = messages_resp.json()
 
-<Note>
-**"Operation already in progress" (409).** Another connect or disconnect is running. The lock self-releases after 60 seconds. Wait and retry.
-</Note>
+# Find the last assistant message
+for msg in reversed(messages["items"]):
+    if msg["role"] == "assistant" and msg.get("content"):
+        print("\nAgent's final response:")
+        print(msg["content"])
+        break
+```
 
-## What to read next
+---
 
-- [Cloud PC](/concepts/cloud-pc) — full lifecycle and pricing
-- [Devices](/concepts/devices) — device model
-- [Chat sessions](/concepts/chat-sessions) — Socket.IO event catalog
-- [Agent modes](/concepts/agent-modes) — when to use `cua` vs `auto`
+## Complete example
+
+Here is the complete script combining all steps:
+
+```python
+import asyncio
+import httpx
+import time
+import os
+
+BASE_URL = "https://api.skygen.ai"
+TOKEN = "your-skygen-jwt-token"
+headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+def create_session() -> str:
+    resp = httpx.post(f"{BASE_URL}/chat/sessions", headers=headers,
+                      json={"title": "HN Scraper"})
+    return resp.json()["id"]
+
+def send_task(session_id: str) -> None:
+    httpx.post(f"{BASE_URL}/chat/sessions/{session_id}/messages",
+               headers=headers,
+               json={"content": "Open Firefox, go to news.ycombinator.com, "
+                                 "screenshot it, list the top 5 titles.",
+                     "mode": "cua"})
+
+def wait(session_id: str, timeout: int = 300) -> None:
+    start = time.time()
+    while time.time() - start < timeout:
+        s = httpx.get(f"{BASE_URL}/chat/sessions/{session_id}",
+                      headers=headers).json()
+        status = s.get("meta_data", {}).get("task_status")
+        if status in ("completed", "failed"):
+            print(f"Done: {status}")
+            return
+        time.sleep(5)
+
+def get_screenshots(session_id: str) -> None:
+    data = httpx.get(f"{BASE_URL}/screenshots/agent/session/{session_id}",
+                     headers=headers).json()
+    os.makedirs("output", exist_ok=True)
+    for s in data["screenshots"]:
+        img = httpx.get(f"{BASE_URL}{s['url']}", headers=headers)
+        fn = f"output/step_{s['step_number']:04d}.png"
+        with open(fn, "wb") as f:
+            f.write(img.content)
+        print(f"Saved: {fn}")
+
+if __name__ == "__main__":
+    sid = create_session()
+    print(f"Session: {sid}")
+    send_task(sid)
+    wait(sid)
+    get_screenshots(sid)
+    print("Done!")
+```
+
+---
+
+## Troubleshooting
+
+**Agent asks to start Cloud PC**  
+Your Cloud PC is not running. Click "Start Cloud PC" in the ask_human prompt or provision one via `POST /cloud-pc/start`. The agent will resume automatically when the PC is ready.
+
+**Task times out**  
+Increase the `timeout` parameter. Complex GUI tasks on a fresh Cloud PC (browser startup, page load) can take 2–3 minutes. The default 300-second timeout is usually sufficient.
+
+**Screenshots are empty**  
+The agent may not have reached the screenshot step. Check the action history via `GET /action-history?session_id={id}` to see where it stopped.
+
+**Permission denied on proxy URL**  
+Ensure you include the `Authorization` header when downloading screenshots from `/screenshots/proxy/`. The proxy enforces ownership.

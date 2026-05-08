@@ -1,0 +1,1361 @@
+---
+title: "Agent Utilities Reference"
+description: "Complete reference for all modules in Agent/Utilities/: ModelRouter, LLM_Providers, Hibernation, Context, Toolkits, TerminateGuard, PlanManager, PromptEngine, AttachmentEmitter, CommunicationEndpoints, and helper modules."
+---
+
+# Agent Utilities
+
+The `Agent/Utilities/` directory contains all shared infrastructure used across agent classes. These modules are not agent-specific — they are composable building blocks that `BaseAgent` and specialist agents assemble at construction time.
+
+---
+
+## ModelRouter
+
+**File:** `Agent/Utilities/ModelRouter.py`
+
+See the full [LLM Routing Reference](/reference/agent/llm-routing) for the complete API.
+
+`ModelRouter` is a thin policy layer over `ModelCatalog` and `CircuitBreakerRegistry`. The public entry point is the module-level function `choose_model_route()`, which calls the singleton `ModelRouter` instance's `Choose()` method.
+
+```python
+from Utilities.ModelRouter import choose_model_route, RoutingParams
+
+decision = choose_model_route(
+    payload={"messages": [...]},
+    routing_params=RoutingParams(requires_heavy_reasoning=True),
+    config=agent_config,
+    agent_name="PlannerAgent",
+)
+# decision.model, decision.provider, decision.tier, decision.reason
+```
+
+---
+
+## LLM_Providers
+
+**Directory:** `Agent/Utilities/LLM_Providers/`
+
+### ModelRegistry
+
+**File:** `Agent/Utilities/LLM_Providers/ModelRegistry.py`
+
+Typed registry of available LLM models. `BuildDefaultCatalog()` returns the catalog wired with all built-in models. Custom models can be added with `catalog.Register(ModelDescriptor(...))`.
+
+See [LLM Routing — ModelCatalog](/reference/agent/llm-routing#modelcatalog) for the full API.
+
+### ProviderFactory
+
+**File:** `Agent/Utilities/LLM_Providers/ProviderFactory.py`
+
+Registry-based factory that maps model names to provider implementations. The primary entry point is `llm_request()`:
+
+```python
+response = await llm_request(
+    payload={"model": "google/gemini-2.5-flash", "messages": [...]},
+    session=backend_session,
+    session_id=session_id,
+    agent_type="PlannerAgent",
+    user_id=user_id,
+)
+```
+
+`llm_request()` automatically:
+- Applies Anthropic-style ephemeral cache control to the last 4 messages
+- Selects the provider via the registry matcher chain
+- Tracks API cost via `track_api_cost()`
+- Supports streaming via `stream=True`
+
+Provider registration uses `register(key, factory, matcher)`:
+
+```python
+register(
+    key="my_provider",
+    factory=lambda: MyProvider(),
+    matcher=lambda model: model.startswith("my/"),
+)
+```
+
+### CircuitBreakerRegistry
+
+**File:** `Agent/Utilities/LLM_Providers/CircuitBreakerRegistry.py`
+
+Tracks provider availability. The default registry is obtained via `GetDefaultRegistry()`. `ModelRouter` calls `IsOpen(provider_key)` to skip providers with known failures.
+
+The Gemini circuit probe is registered automatically in `ProviderFactory`:
+
+```python
+_GetCircuitRegistry().Register("gemini", _probe_gemini_circuit)
+```
+
+### OpenAICompatibleProvider
+
+**File:** `Agent/Utilities/LLM_Providers/OpenAICompatibleProvider.py`
+
+Concrete `BaseProvider` subclass for any OpenAI-compatible API (OpenRouter, Groq, Cerebras). Configured at construction with `base_url_env` and `api_key_env` environment variable names.
+
+### CerebrasProvider
+
+**File:** `Agent/Utilities/LLM_Providers/CerebrasProvider.py`
+
+Provider for Cerebras Inference API. Registered for `llama-3.3-70b` and `qwen-3-235b-a22b-instruct-2507`.
+
+### GeminiProvider
+
+**File:** `Agent/Utilities/LLM_Providers/GeminiProvider.py`
+
+Provider file for Google Generative AI. Note: despite its presence, `ProviderFactory` currently routes Gemini models via OpenRouter (using `OpenAICompatibleProvider`), not directly via this provider. This file may be used for direct Gemini API access in non-default configurations.
+
+---
+
+## Context
+
+**Directory:** `Agent/Utilities/Context/`
+
+### Primitives
+
+**File:** `Agent/Utilities/Context/Primitives.py`
+
+Core dataclasses passed between agent components.
+
+#### `AgentContext`
+
+Frozen (immutable) dataclass holding all per-session infrastructure references. Passed through every agent call.
+
+```python
+@dataclass(frozen=True)
+class AgentContext:
+    session_id: str
+    user_id: str
+    device_id: str
+    task_id: str
+    ws_client: Any                      # AgentSocketIOClient
+    backend_url: str
+    session_llm: Any                    # LLM session object
+    backend_session: Any                # HTTP/WS session for Backend calls
+    http_session: Any                   # aiohttp.ClientSession
+    redis_client: Any
+    cost_tracker: Any                   # CostTracker
+    cancellation_manager: Any           # TaskCancellationManager
+    status_callback: Optional[Callable]
+    send_chat_message_callback: Optional[Callable]
+    agent_auth_token: Optional[str]
+    plan_step_id: Optional[str]         # Active PlanStep ID (set by spawner)
+    spawn_id: Optional[str]             # Unique spawn identifier for sub-agent
+    emplogent_id: Optional[str]         # Employment agent ID
+    playbook_tasks: Optional[list]      # Pre-defined task list from playbook
+    device_platform: Optional[str]      # "windows" | "linux" | "darwin" | None
+```
+
+`to_dict()` returns a log-safe subset of the context, excluding connection objects (`ws_client`, `backend_session`, `http_session`, `redis_client`, `cost_tracker`, `cancellation_manager`, callbacks).
+
+#### `ToolError` and subclasses
+
+```python
+@dataclass(kw_only=True)
+class ToolError(Exception):
+    id: str = "unknown"
+    message: str
+    payload: Any = None
+```
+
+Subclasses:
+- `ConnectionFaultError` — network or backend connectivity failure
+- `ToolTimeoutError` — tool execution exceeded timeout
+
+#### `ToolInput`
+
+```python
+@dataclass(kw_only=True)
+class ToolInput:
+    name: str
+    args: dict
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+```
+
+#### `StateUpdate` ABC and subclasses
+
+All state mutations flow through a `StateUpdate` subclass:
+
+| Class | Description |
+|---|---|
+| `AddMessages(messages: list)` | Appends messages to `state.messages` |
+| `AddActionResult(result: Any)` | Appends to `state.action_results` |
+| `ReplaceHistory(new_history: list)` | Replaces entire `state.messages` list |
+| `UpdatePerception(screenshot_path, summary)` | Updates `CUAState.screenshot_path` and `world_model_summary` |
+| `UpdateSiphonProgress(chunks: int)` | Increments `SiphonState.processed_chunks` |
+| `UpdateProps(props: dict)` | Generic scalar update — calls `state.update_props(**props)` |
+| `UpdateScratchpad(action, texts, lines, line_range)` | Edits `state.scratchpad_lines` |
+
+**`UpdateProps.terminal()`** is a classmethod factory:
+
+```python
+UpdateProps.terminal()
+# Equivalent to UpdateProps(props={"is_terminated": True, "is_persisted": True})
+```
+
+**`UpdateScratchpad`** actions: `"append"`, `"edit"`, `"delete"`, `"clear"`.
+
+#### `ThinkOutput`
+
+```python
+@dataclass
+class ThinkOutput:
+    reasoning: str
+    safety_assessment: str
+    actions: list
+    memory_actions: list
+```
+
+#### `Tier1Vote`
+
+```python
+Tier1Vote = NamedTuple("Tier1Vote", [
+    ("checker_name", str),
+    ("is_safe", bool),
+    ("reason", str),
+])
+```
+
+---
+
+### State
+
+**File:** `Agent/Utilities/Context/State.py`
+
+Agent state dataclasses. State is immutable — mutations produce new instances via `replace()`.
+
+```python
+NO_TIME_LIMIT = "NO_LIMIT"   # String sentinel (NOT -1.0) for unlimited time
+DEFAULT_PERSONA = "I am Skygen..."
+```
+
+#### `BaseAgentState`
+
+```python
+@dataclass(kw_only=True)
+class BaseAgentState:
+    # Identity
+    agent_id: Optional[str] = None
+
+    # Evolutionary data
+    messages: List[Dict[str, Any]] = field(default_factory=list)  # NOT 'history'
+    action_results: List[Any] = field(default_factory=list)
+    scratchpad_lines: List[str] = field(default_factory=list)
+
+    # Orchestrator lifecycle
+    lifecycle_mode: Literal["continuous", "batch", "time"] = "continuous"
+    lifecycle_batch_size: int = 10
+    lifecycle_timeout: int = 60
+    step_num: int = 0         # NOT 'current_step'
+    remaining_iter: int = 100
+    is_terminated: bool = False
+    is_persisted: bool = False
+
+    # Sentinel & hibernation
+    status: Literal["ACTIVE", "HIBERNATED", "PAUSED", "TERMINATED", "FAILED"] = "ACTIVE"
+    # Note: there is NO 'is_paused' field — use status == "PAUSED"
+    wake_reason: Optional[str] = None
+
+    # Task scope
+    task_description: str = ""
+    allowed_tools: Optional[List[str]] = None
+    forbidden_tools: Optional[List[str]] = None
+    forbidden_mcp_providers: Optional[List[str]] = None
+
+    # Time management
+    task_start_time: float = field(default_factory=time.time)
+    time_limit_seconds: Union[float, str] = NO_TIME_LIMIT  # "NO_LIMIT" or float seconds
+    accept_criteria: Optional[str] = None   # Free-form description of successful completion
+
+    requires_vision: bool = False
+```
+
+Methods:
+- `add_messages(new_messages)` → new state with messages appended
+- `add_action_result(result)` → new state with result appended
+- `replace_history(new_history)` → new state with messages replaced
+- `update_props(**kwargs)` → new state with scalar fields updated (ignores unknown keys)
+
+#### `CUAState(BaseAgentState)`
+
+```python
+@dataclass(kw_only=True)
+class CUAState(BaseAgentState):
+    screenshot_path: Optional[str] = None
+    world_model_summary: Optional[str] = None
+```
+
+Method: `update_perception(screenshot_path=None, summary=None)` → new state.
+
+#### `SiphonState(CUAState)`
+
+```python
+@dataclass(kw_only=True)
+class SiphonState(CUAState):
+    data_source: Dict = field(default_factory=dict)
+    processed_chunks: int = 0
+```
+
+Method: `increment_chunks(amount=1)` → new state.
+
+#### `PlannerState(BaseAgentState)`
+
+```python
+@dataclass(kw_only=True)
+class PlannerState(BaseAgentState):
+    active_persona: str = DEFAULT_PERSONA
+    boost_remaining_steps: int = 0      # Steps remaining on SOTA model (0 = not boosted)
+    boost_cooldown_remaining: int = 0   # Steps until boost can be used again
+```
+
+---
+
+### Engine
+
+**File:** `Agent/Utilities/Context/Engine.py`
+
+```python
+def apply_update(
+    current_state: T,
+    update: Union[StateUpdate, List[StateUpdate], None],
+) -> T
+```
+
+Applies one or more `StateUpdate` commands to a state, returning a new state. Normalizes `None` → no-op, single update → list of one. All state transitions go through this function to maintain immutability.
+
+---
+
+### AsyncContext
+
+**File:** `Agent/Utilities/Context/AsyncContext.py`
+
+Async utilities for inter-agent coordination.
+
+#### `SharedEventLog`
+
+Append-only log of events shareable across coroutines.
+
+```python
+class SharedEventLog:
+    def add(self, event: dict) -> None
+    async def wait_for_new_events(self) -> None
+    def read_batch(self, since_timestamp: float) -> list[dict]
+```
+
+#### `Inbox`
+
+Async message queue for an agent. Each agent has one inbox; messages are sent by the broker or other agents.
+
+```python
+class Inbox:
+    messages: asyncio.Queue
+    anchors: Dict[str, str]
+    is_task_completed: bool
+    owner_agent_id: str
+
+    async def send(
+        content: str,
+        msg_type: str = "INFO",
+        *,
+        message_id: Optional[str] = None,
+        sender_agent_id: Optional[str] = None,
+    ) -> str
+```
+
+Message types: `"INFO"`, `"STOP"`, `"FLUSH"`, `"CHILD_DONE"`.
+
+Additional methods:
+- `stop_task(reason)` — sends `STOP` message
+- `drain()` — empties all queued messages
+- `peek_all()` — returns all messages without consuming
+- `wait_for_message()` — coroutine that blocks until a message arrives
+
+---
+
+## Hibernation
+
+**Directory:** `Agent/Utilities/Hibernation/`
+
+The hibernation system allows agents to sleep while waiting for external events (timers, user replies, visual conditions) without holding a worker thread.
+
+### HibernationController
+
+**File:** `Agent/Utilities/Hibernation/Controller.py`
+
+High-level facade. See the [BrokerAgent documentation](/reference/agent/agents#hibernation-management) for integration details.
+
+```python
+controller = HibernationController(
+    store=SentinelStore(redis_client),
+    registry=HibernationStrategyRegistry(),
+    waker=BrokerWaker(internal_queue),
+)
+
+# Put an agent to sleep
+task = await controller.Hibernate(
+    session_id=session_id,
+    user_id=user_id,
+    device_id=device_id,
+    config={"strategy": "timer", "timeout_seconds": 60},
+)
+
+# Wake a specific task by ID
+await controller.Wake(task_id, reason="User replied")
+
+# Wake all tasks for a session (race-safe atomic HDEL)
+woken_count = await controller.WakeSession(session_id)
+
+# Wake all tasks for a user (used by MCP OAuth callback)
+# Returns count of woken sessions
+woken_count = await controller.WakeUserSessions(user_id)
+
+# Clean up child sentinels when parent task completes
+await controller.CancelChildrenOf(parent_session_id)
+```
+
+**Public methods:**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Hibernate` | `(session_id, user_id, device_id, config) -> SentinelTask` | Put a session to sleep; registers strategy and stores task in Redis. |
+| `Wake` | `(task_id, *, reason="Externally awoken", role="system") -> bool` | Force-wake a single hibernating task by ID. Returns `True` if the task existed. The `role` param controls whether the wake turn is injected as `system` (default) or `user` (for inbox-triggered wakes). |
+| `WakeSession` | `(session_id, *, reason, role) -> int` | Wake all hibernating tasks for a session. Returns count of woken tasks. |
+| `WakeUserSessions` | `(user_id, *, reason, role) -> int` | Wake all hibernating tasks belonging to a user. Used by push events like MCP OAuth callback. Returns count of woken sessions. |
+| `CancelChildrenOf` | `(parent_session_id) -> int` | Cancel orphaned child-agent sentinels whose parent has completed; prevents phantom-wake hallucinations. |
+
+### SentinelTask
+
+**File:** `Agent/Utilities/Hibernation/Task.py`
+
+Persistent record of a hibernated session. Stored in Redis via `SentinelStore`.
+
+```python
+@dataclass
+class SentinelTask:
+    id: str                          # UUID
+    session_id: str
+    user_id: str
+    device_id: str
+    trigger_type: str                # Strategy name, e.g. "timer"
+    config: dict                     # Strategy-specific config
+    expires_at: float                # Unix timestamp
+    parent_session_id: Optional[str] # Set for sub-agent sentinels
+    is_subagent: bool
+    original_payload: Optional[dict] # Task payload to re-queue on wake
+    target_type: str                 # "screen" or other
+    created_at: float
+```
+
+### SentinelStore
+
+**File:** `Agent/Utilities/Hibernation/Store.py`
+
+Redis-backed storage for `SentinelTask` objects. Uses a Redis ZSET (`sentinel:tasks`, scored by `next_check_at`) and a HASH (`sentinel:task_data`).
+
+#### Redis Keys
+
+| Key | Type | Purpose |
+|---|---|---|
+| `sentinel:tasks` | ZSET | Step-timed task IDs, score = next wake check time |
+| `sentinel:task_data` | HASH | JSON-serialized `SentinelTask` records |
+| `sentinel:lock:{task_id}` | String | Distributed per-task lock (TTL 30s) |
+| `sentinel:pending_user_wake:{user_id}` | String | Wake event stash for race window (TTL 300s) |
+
+#### Write Methods
+
+| Method | Description |
+|---|---|
+| `Schedule(task, next_check_at)` | HSET + ZADD — persist task and enqueue for polling |
+| `Persist(task)` | HSET only — update task data without touching ZADD score |
+| `Reschedule(task_id, next_check_at)` | ZADD only — reschedule without updating task data |
+| `Remove(task_id)` | ZREM + HDEL — fully delete a task |
+| `StashPendingUserWake(user_id, reason)` | SET with TTL 300s — store wake event that found no sleeping sessions |
+| `ConsumePendingUserWake(user_id)` | Atomic GETDEL — read and delete pending wake reason |
+
+#### Read Methods
+
+| Method | Description |
+|---|---|
+| `ReadyTaskIds(before: float)` | ZRANGEBYSCORE 0..before — IDs of tasks ready to check |
+| `Load(task_id)` | HGET — fetch and deserialize a single task |
+| `FindBySession(session_id)` | HSCAN all — return tasks matching `session_id` |
+| `FindByParentSession(parent_session_id)` | HSCAN all — return sub-agent tasks matching parent |
+| `FindByUser(user_id)` | HSCAN all — return tasks matching `user_id` |
+
+#### Locking Methods
+
+| Method | Description |
+|---|---|
+| `TryClaim(task_id, ttl_seconds=30)` | SET NX EX — acquire distributed lock, returns bool |
+| `Release(task_id)` | DEL — release the lock |
+| `ClaimForWake(task_id)` | Atomic HDEL — prevents duplicate wakes across pods; returns True only for the winner |
+
+The `ClaimForWake` pattern is the race prevention mechanism: all pods that receive a wake event call `ClaimForWake(task_id)` and only the one that gets `True` (deleted the hash field) proceeds to publish the wake message.
+
+**Pending wake stash**: When a wake event fires (e.g., MCP OAuth complete) while the session is still executing an LLM turn — so `WakeUserSessions` returns `woken=0` — `StashPendingUserWake` caches the wake reason with 300s TTL. The next `Hibernate()` call for that user calls `ConsumePendingUserWake` and replays the wake immediately.
+
+### Strategies
+
+**Directory:** `Agent/Utilities/Hibernation/Strategies/`
+
+#### `HibernationStrategy` (ABC)
+
+Base class for all strategies. Subclasses implement `Check(task, store, waker)` called by the sentinel engine on each polling tick.
+
+#### TimerStrategy
+
+```
+Name: "timer"
+Config: {"timeout_seconds": float}  # Default: 300.0
+```
+
+Wakes the agent unconditionally after `timeout_seconds`. No polling between schedule and wake — fires once.
+
+#### VisualConditionStrategy
+
+```
+Name: "visual_condition"
+Config: {
+    "condition": str,            # Natural language condition to check
+    "interval_seconds": float,   # Default: 15.0
+    "timeout_seconds": float,    # Default: 300.0
+    "target_type": str,          # Default: "screen"
+}
+```
+
+Re-checks a screenshot every `interval_seconds` using a vision LLM. Wakes when the condition is met or the timeout expires.
+
+### HibernationStrategyRegistry
+
+**File:** `Agent/Utilities/Hibernation/Registry.py`
+
+Maps strategy names to concrete `HibernationStrategy` subclasses. `Build(config)` instantiates the matching strategy from a config dict.
+
+### BrokerWaker
+
+**File:** `Agent/Utilities/Hibernation/BrokerWaker.py`
+
+Implements the `Waker` interface for `BrokerAgent`. On wake, re-enqueues the task's `original_payload` to `internal_queue` so the agent resumes via the normal `worker_loop()`.
+
+---
+
+## Toolkits
+
+**Directory:** `Agent/Utilities/Toolkits/`
+
+### BaseTool
+
+**File:** `Agent/Utilities/Toolkits/actions/BaseTool.py`
+
+Abstract base class for all agent tools.
+
+```python
+class BaseTool(ABC):
+    name: str              # Tool identifier (used in LLM tool calls)
+    description: str       # Shown to the LLM
+    required_args: dict    # {arg_name: description}
+
+    @abstractmethod
+    async def _execute(self, input: ToolInput, context: AgentContext) -> ToolResult:
+        ...
+
+    async def execute(self, input: ToolInput, context: AgentContext) -> ToolResult:
+        """Wraps _execute with error handling. Never raises — returns ToolResult(error=...)."""
+        ...
+```
+
+### Standard action tools
+
+**File:** `Agent/Utilities/Toolkits/actions/base.py`
+
+Base tool set registered by `BaseAgent` for all agents:
+
+| Tool name | Class | Purpose |
+|---|---|---|
+| `communicate` | `CommunicateTool` | Send messages to parent/child agents or the user |
+| `wait` | `WaitTool` | Sleep for N seconds |
+| `manage_scratchpad` | `ManageScratchpadTool` | Read/write a persistent scratchpad |
+| `run_python` | `RunPythonTool` | Execute Python code in the sandbox |
+| `hibernate` | `HibernateTool` | Put the agent into hibernation with a strategy config |
+
+Additional tools are registered per-agent type (`SoftwareEngineerAgent`, `CUA_OrchestratorAgent`, etc.).
+
+### Bash tools
+
+**File:** `Agent/Utilities/Toolkits/actions/bash.py`
+
+`BashTool` subclasses for different execution targets:
+
+| Class | Tool name | Target |
+|---|---|---|
+| `BashDockerTool` | `bash_docker` | Docker container sandbox |
+| `BashLocalTool` | `bash_local` | Local process |
+| `BashRemoteTool` | `bash_remote` | Remote E2B sandbox |
+
+### File editing tool
+
+**File:** `Agent/Utilities/Toolkits/actions/edit_file.py`
+
+`StrReplaceEditorTool` (`str_replace_editor`): performs exact-match string replacement in files. Used by `SoftwareEngineerAgent`. Produces diff summaries in the observe phase.
+
+### Shallow web search
+
+**File:** `Agent/Utilities/Toolkits/actions/shallow_web_search.py`
+
+`ShallowWebSearchTool`: lightweight web search for quick fact lookups. Used by `DataFetcherAgent`.
+
+### Sandbox
+
+**Directory:** `Agent/Utilities/Toolkits/sandbox/`
+
+#### TargetEnv
+
+**File:** `Agent/Utilities/Toolkits/sandbox/target_env.py`
+
+Immutable descriptor of the target OS environment. Controls path normalization, separator style, and environment-specific behaviors.
+
+```python
+@dataclass(frozen=True)
+class TargetEnv:
+    os_type: str          # "linux" | "windows" | "darwin"
+    path_style: str       # "posix" | "windows"
+    home_dir: str         # Default working directory
+    shell: str            # Default shell executable
+```
+
+Factory methods:
+- `TargetEnv.for_linux_cloud()` — Cloud PC Linux environment (`/home/user`, `/bin/bash`)
+- `TargetEnv.for_host()` — current host OS (uses `platform.system()`)
+- `TargetEnv.from_platform(platform_str)` — creates from a platform string
+
+`DEFAULT_LINUX_CLOUD` is the module-level default instance used by most tools.
+
+#### Sandbox implementations
+
+| File | Class | Backend |
+|---|---|---|
+| `docker_sandbox.py` | `DockerSandbox` | Docker container |
+| `local_sandbox.py` | `LocalSandbox` | Local process execution |
+| `remote_sandbox.py` | `RemoteSandbox` | E2B remote sandbox |
+
+#### ProvisionComputeTool
+
+**File:** `Agent/Utilities/Toolkits/actions/ProvisionComputeTool.py`
+
+Tool for provisioning a Cloud PC session within an agent task. Used by `PlannerAgent` when a CUA task requires device allocation.
+
+### Tool providers
+
+**Directory:** `Agent/Utilities/Toolkits/providers/`
+
+MCP tool provider integrations. The `tool_provider.py` base class defines the interface for registering and unregistering tool sets at runtime (used by `MCPToolsAgent` for live integration toggle).
+
+### File toolkit
+
+**File:** `Agent/Utilities/Toolkits/file_toolkit.py`
+
+Tools for file read/write/list operations. Used by `SoftwareEngineerAgent` alongside `StrReplaceEditorTool`.
+
+---
+
+## TerminateGuard
+
+**Directory:** `Agent/Utilities/TerminateGuard/`
+
+### `TerminateGuard`
+
+**File:** `Agent/Utilities/TerminateGuard/Guard.py`
+
+Pre-terminate validator for `communicate(message_type='result')`. Enabled in `PlannerAgent` (`TERMINATE_GUARD_ENABLED = True`). Ensures the agent has not completed prematurely before its task budget is exhausted.
+
+```python
+decision = await guard.Check(
+    final_message=content,
+    context=context,
+    state=state,
+)
+# decision.accept → proceed with termination
+# not decision.accept → inject rejection message into history via decision.AsReflectionMessage()
+```
+
+Constants:
+- `EARLY_THRESHOLD = 0.50` — below this elapsed/TTL ratio triggers deterministic reject
+- `LATE_THRESHOLD = 0.95` — at or above this ratio triggers deterministic accept
+
+Decision zones based on elapsed time / TTL ratio:
+
+| Zone | Condition | Action |
+|---|---|---|
+| `NO_TTL` | `time_limit_seconds == NO_TIME_LIMIT` or no active task | Accept unconditionally |
+| `DETERMINISTIC_REJECT` | elapsed ratio < 0.50 | Reject without LLM |
+| Mid-zone | 0.50 ≤ elapsed ratio < 0.95 | Ask LLM verifier |
+| `DEADLINE_WINDOW` | elapsed ratio ≥ 0.95 | Accept without LLM |
+| `LLM_VERIFIED_ACCEPT` | LLM verifier returned accept=true | Accept |
+| `LLM_VERIFIED_REJECT` | LLM verifier returned accept=false | Reject with hint |
+| `LLM_ERROR` | Verifier call failed | Fail-open (accept) |
+
+The LLM verifier model defaults to `google/gemini-3.1-flash-lite-preview:nitro` and runs with a 30-second timeout.
+
+### `GuardDecision`
+
+**File:** `Agent/Utilities/TerminateGuard/Decision.py`
+
+```python
+class GuardZone(str, Enum):
+    NO_TTL = "no_ttl"
+    DETERMINISTIC_REJECT = "early"
+    LLM_VERIFIED_ACCEPT = "llm_ok"
+    LLM_VERIFIED_REJECT = "llm_no"
+    DEADLINE_WINDOW = "near_end"
+    LLM_ERROR = "llm_err"
+
+@dataclass
+class GuardDecision:
+    accept: bool           # The ONLY field callers must inspect. NOT 'approved'.
+    zone: GuardZone
+    reason: str
+    next_hint: str = ""    # Concrete pivot hint injected when accept=False
+
+    def AsReflectionMessage(self) -> str:
+        """Returns a plain-text system-role message to inject into agent history when rejected."""
+```
+
+**Important:** the acceptance field is `accept: bool`, not `approved: bool`.
+
+---
+
+## PlanManager
+
+**Directory:** `Agent/Utilities/PlanManager/`
+
+Owned by `PlannerAgent`. Tracks a structured multi-step plan with per-step status, sub-steps, attachments, and dependencies.
+
+### `PlanStatus`
+
+**File:** `Agent/Utilities/PlanManager/models.py`
+
+```python
+class PlanStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    SKIPPED = "skipped"     # Infrastructure-only — used by Broker to finalize orphan steps
+```
+
+`PlanStatus.coerce(value)` accepts an `Enum`, `str`, or `None` value.
+
+### `PlanStep`
+
+**File:** `Agent/Utilities/PlanManager/models.py`
+
+```python
+@dataclass
+class PlanStep:
+    id: str
+    title: str                       # Short header (1 line)
+    description: Optional[str]       # Longer narrative explanation
+    status: PlanStatus = PlanStatus.PENDING   # NOT a plain str
+    dependencies: List[str] = field(default_factory=list)   # Step IDs
+    blocked_reason: Optional[str] = None
+    sub_steps: List[Dict] = field(default_factory=list)     # List[Dict], NOT List[PlanStep]
+    attachments: List[Dict] = field(default_factory=list)
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    tool_name: Optional[str] = None
+    compute: Optional[str] = None
+    specialist: Optional[str] = None
+```
+
+Note: `required: bool` and `agent_type` fields do **not** exist. `sub_steps` elements are `{"id", "title", "status"}` dicts, not `PlanStep` instances.
+
+`to_dict()` / `from_dict(data)`: handles legacy snapshots that used only `description` as the title key.
+
+### `PlanSnapshot`
+
+```python
+@dataclass(frozen=True)
+class PlanSnapshot:
+    revision: int
+    steps: List[Dict]     # List of PlanStep.to_dict()
+    plan_markdown: str
+```
+
+### `PlanManager`
+
+**File:** `Agent/Utilities/PlanManager/manager.py`
+
+```python
+manager = PlanManager()
+```
+
+#### CRUD methods
+
+```python
+def add_step(title: str, description: Optional[str] = None, dependencies: Optional[List[str]] = None) -> str
+```
+Appends a new step. Returns its 8-char ID. Auto-blocks if any dependency is not completed.
+
+```python
+def remove_step(raw_id: str) -> bool
+```
+
+```python
+def set_status(raw_id: str, status: PlanStatus, blocked_reason: Optional[str] = None) -> bool
+```
+Pure status transition. Does not touch `last_activated_id`. Returns False if already in target state (no revision bump, no spurious UI emit).
+
+```python
+def set_description(raw_id: str, description: str) -> bool
+```
+
+```python
+def add_sub_step(raw_id: str, title: str, status: PlanStatus = PlanStatus.PENDING) -> Optional[str]
+```
+
+```python
+def add_attachment(raw_id: str, path: str, name: str) -> bool
+```
+
+#### High-level operations
+
+```python
+def batch_create(items: List[Any]) -> List[str]
+```
+Creates N steps from a flat list. Items may be `str`, `dict` (with `title`/`description`), or Pydantic `BaseModel`. Clears existing steps first. Does NOT auto-activate the first step.
+
+```python
+def activate_step(raw_id: str) -> bool
+```
+Marks a step as `IN_PROGRESS` AND registers it as `last_activated_id`. This is the explicit "I just kicked off this step" command. Idempotent.
+
+```python
+def consume_last_activated() -> Optional[str]
+```
+Atomically reads and clears `last_activated_id`. Used by `SubAgentPlanCoordinator` to correlate spawned children with their plan step.
+
+#### Resolver
+
+```python
+def resolve_id(raw_id: Optional[str]) -> Optional[str]
+```
+Resolves a raw ID to a real step ID. Lookup order: exact → numeric index → unique 3+ char prefix → single-step fallback.
+
+#### Queries
+
+```python
+def get_step(raw_id: str) -> Optional[PlanStep]
+def get_steps(status: Optional[PlanStatus] = None) -> List[PlanStep]
+def has_steps() -> bool
+def first_unfinished() -> Optional[PlanStep]
+def to_markdown(include_completed: bool = True) -> str
+```
+
+#### Snapshot / Persistence
+
+```python
+def snapshot() -> PlanSnapshot
+```
+Builds a UI-ready snapshot. Consumed by `BrokerAgent._publish_plan_snapshot`.
+
+```python
+def to_dict() -> Dict[str, Any]
+def from_dict(data: Dict[str, Any]) -> PlanManager  # classmethod
+```
+Full serialization for Redis checkpoints.
+
+---
+
+### `PlanReporter`
+
+**File:** `Agent/Utilities/PlanManager/reporter.py`
+
+Coordinates plan update delivery to two independent channels: the Frontend (via Socket.IO/ux_manager) and any registered `PlanSnapshotSink` implementations (e.g. `SessionMdReporter`). Each channel has its own idempotency revision counter (`_last_frontend_revision`, `_last_sink_revision`) — the same snapshot is never emitted twice on the same channel.
+
+```python
+class PlanSnapshotSink(ABC):
+    @abstractmethod
+    async def receive(self, snapshot: PlanSnapshot) -> None: ...
+
+reporter = PlanReporter(ux_manager=ux_manager)
+reporter.add_sink(session_md_reporter)
+reporter.set_frontend_publisher(publisher_fn)
+did_emit = await reporter.emit(manager, context)
+```
+
+### `SessionMdReporter`
+
+**File:** `Agent/Utilities/PlanManager/reporter.py`
+
+Implements `PlanSnapshotSink`. Debounces plan snapshot writes to the `SESSION.md` file by cancelling any in-flight write task and scheduling a new one after `debounce_seconds` (default `DEFAULT_DEBOUNCE_SECONDS = 0.5`).
+
+```python
+SessionMdReporter(
+    ws_client,
+    device_id: str,
+    target_env=None,
+    debounce_seconds: float = 0.5,
+)
+```
+
+### `SubAgentPlanCoordinator`
+
+**File:** `Agent/Utilities/PlanManager/lifecycle.py`
+
+Correlates spawned child agent IDs with plan step IDs. When a child agent finishes (success or failure), the coordinator calls `set_status()` on the corresponding `PlanStep` via `PlanManager`.
+
+---
+
+## PromptEngine
+
+**Directory:** `Agent/Utilities/PromptEngine/`
+
+### `PromptBlock`
+
+**File:** `Agent/Utilities/PromptEngine/BlockBuilder.py`
+
+Composable prompt block system using a Composite pattern. Each block renders as an XML-like tagged section.
+
+```python
+# Constructor — NOT PromptBlock(name=..., text=...)
+block = PromptBlock(
+    tag_name="safety_rules",          # Converted to uppercase in output
+    description="Optional attribute", # Rendered as description="..." on opening tag
+    name="Optional name attribute",   # Rendered as name="..." on opening tag
+)
+
+# Fluent composition — None items are silently skipped
+block.add("Some text content")
+block.add(PromptBlock("nested_block").add("nested content"))
+block.add(None)  # no-op
+
+# Render to string
+text = block.render(indent_level=0)
+# Output:
+# <SAFETY_RULES description="Optional attribute" name="Optional name attribute">
+# Some text content
+# <NESTED_BLOCK>
+# nested content
+# </NESTED_BLOCK>
+# </SAFETY_RULES>
+```
+
+The `add()` method returns `self` for fluent chaining. `__bool__()` returns `True` if `render().strip()` is non-empty.
+
+Description double-quote characters are escaped as `&quot;` in the rendered attribute.
+
+---
+
+## AttachmentEmitter
+
+**File:** `Agent/Utilities/AttachmentEmitter.py`
+
+Abstract base class for emitting file attachments with agent messages. Enforces safe path normalization for the target OS: uses `posixpath` for Linux Cloud PCs and `ntpath` for Windows targets, regardless of the host OS. Paths are validated to lie under an allowed prefix (e.g. `/home/user/`) before being emitted.
+
+```python
+class AttachmentEmitter(ABC):
+    def prepare_attachments(self, file_paths: list[str]) -> list[FileInfo]: ...
+    def build_meta(self, files: list[FileInfo]) -> dict: ...
+```
+
+`CloudPCAttachmentEmitter` is the concrete implementation for Cloud PC sessions. It constructs the `emitted_files` payload attached to `communicate(result=...)` messages.
+
+---
+
+## FileInfo
+
+**File:** `Agent/Utilities/FileInfo.py`
+
+Lightweight file descriptor used in attachment payloads:
+
+```python
+@dataclass
+class FileInfo:
+    path: str            # Absolute path on the target system
+    name: str            # Display filename
+    size: Optional[int]  # Size in bytes
+    mime_type: Optional[str]
+```
+
+---
+
+## Communication Endpoints
+
+**Directory:** `Agent/Utilities/CommunicationEndpoints/`
+
+Defines the endpoint abstraction used by `CommunicateTool` and `WebEndpoint.AskText/AskChoice` for sending messages to the user and handling responses.
+
+### `UserEndpoint` (ABC)
+
+**File:** `Agent/Utilities/CommunicationEndpoints/UserEndpoint.py`
+
+```python
+class UserEndpoint(ABC):
+    Name: ClassVar[str]           # Endpoint identifier key
+    DisplayLabel: ClassVar[str]   # Human-readable label
+
+    @abstractmethod
+    async def SendInform(self, message: str, context: Any) -> None: ...
+    @abstractmethod
+    async def SendResult(self, message: str, context: Any) -> None: ...
+    @abstractmethod
+    async def AskText(self, prompt: str, *, context: Any) -> EndpointReply: ...
+    @abstractmethod
+    async def AskChoice(self, prompt: str, choices: list, *, context: Any) -> EndpointReply: ...
+
+    def SupportsAttachments(self) -> bool: return False
+```
+
+### `EndpointReply`
+
+```python
+@dataclass
+class EndpointReply:
+    status: str                           # "received" | "cancelled" | "timeout" | "error" | "hibernate"
+    value: Any = None                     # The user's reply (for "received")
+    summary: str = ""
+    hibernate_config: Optional[dict] = None   # Set when status="hibernate"
+```
+
+### `EndpointUnavailable`
+
+Exception raised by endpoints when they cannot fulfill a request.
+
+### `WebEndpoint`
+
+**File:** `Agent/Utilities/CommunicationEndpoints/WebEndpoint.py`
+
+```python
+class WebEndpoint(UserEndpoint):
+    Name = "web"
+    DisplayLabel = "Web chat"
+```
+
+Constructor: `WebEndpoint(send_chat_message_callback=None, attachment_emitter=None, ux_manager=None)`
+
+- `SendInform()` — tags the message with `communicate_kind=inform` to prevent the frontend treating it as terminal.
+- `SendResult()` — degrades silently if callback is absent (no exception raised).
+- `AskText(prompt, *, context)` → calls `_EmitAskAndHibernate()`
+- `AskChoice(prompt, choices, *, context)` → normalizes choices to `{"id", "label"}` dicts → calls `_EmitAskAndHibernate()`
+
+`_EmitAskAndHibernate()` behavior:
+- If prompt is empty: returns `EndpointReply(status="hibernate", hibernate_config={...})` silently.
+- Otherwise: emits `ask_human` UI frame to frontend, then returns `EndpointReply(status="hibernate", hibernate_config={"trigger_type": "timer", "timeout_seconds": USER_REPLY_TIMEOUT_SECONDS, "pending_question_type": "user_reply", ...})`.
+
+This implements the ARCH-001 hibernate-on-ask pattern — the agent suspends and the Backend resumes it when the user replies, rather than blocking the worker thread.
+
+### `CLIEndpoint`
+
+**File:** `Agent/Utilities/CommunicationEndpoints/CLIEndpoint.py`
+
+```python
+class CLIEndpoint(UserEndpoint):
+    Name = "cli"
+    DisplayLabel = "Terminal (stdin/stdout)"
+    _ASK_TIMEOUT_SECONDS = 300.0
+```
+
+Constructor: `CLIEndpoint(stream_in=None, stream_out=None, lock=None, ask_timeout=300.0)`
+
+- `SendInform()` / `SendResult()` print to stdout prefixed with `[AGENT]` / `[AGENT FINAL]`.
+- `AskText()` acquires a lock, calls `_ReadLine()` with timeout via `asyncio.wait_for(run_in_executor(...))`.
+- `AskChoice()` loops printing choices until a valid index or `id`/`label` match is entered.
+
+### `EndpointRegistry`
+
+**File:** `Agent/Utilities/CommunicationEndpoints/EndpointRegistry.py`
+
+Lazy-instantiating registry of named endpoints.
+
+```python
+registry = EndpointRegistry()
+registry.Register("web", factory=lambda: WebEndpoint(...), default=True)
+registry.Register("cli", factory=lambda: CLIEndpoint(...))
+
+endpoint = registry.Get("web")          # Lazy instantiation from factory
+default = registry.Default()            # Gets the default endpoint instance
+name = registry.DefaultName()
+names = registry.EnabledNames()         # List[str]
+```
+
+`Register(name, factory, *, default=False)`: warns on overwrite, invalidates cached instance. Setting `default=True` registers the endpoint under both its name and `_default`.
+
+`__len__()`, `__contains__()`, `__iter__()` are all supported.
+
+### `BuildDefaultRegistry`
+
+**File:** `Agent/Utilities/CommunicationEndpoints/EndpointFactory.py`
+
+```python
+def BuildDefaultRegistry(
+    *,
+    send_chat_message_callback=None,
+    attachment_emitter=None,
+    ux_manager=None,
+    enable_cli: Optional[bool] = None,
+) -> EndpointRegistry
+```
+
+Constructs the standard registry used by `BrokerAgent`. Web is registered first (becomes default) when `send_chat_message_callback` is provided. CLI is registered if `enable_cli=True` or if the `AGENT_CLI_ENDPOINT` env var is set; CLI becomes default only if no web endpoint was registered.
+
+---
+
+## Helper modules
+
+### `utils.py`
+
+**File:** `Agent/Utilities/utils.py`
+
+General-purpose utilities:
+
+- `encode_image_for_llm_with_limit(path)` — Base64-encodes an image with size capping; returns a data URI string for `image_url` content blocks.
+- Token estimation helpers used by context management.
+
+### `format_utils.py`
+
+**File:** `Agent/Utilities/format_utils.py`
+
+String and message formatting utilities. Key function:
+
+```python
+def repair_json_truncated(raw: str) -> str
+```
+
+Attempts to close truncated JSON strings produced by context-length cutoffs. Fixes unclosed strings, arrays, and objects by adding the missing delimiters. Returns the raw string unchanged if it parses cleanly. Does not guarantee valid JSON for deeply malformed inputs.
+
+### `message_history_converter.py`
+
+**File:** `Agent/Utilities/message_history_converter.py`
+
+Converts between internal message list format and provider-specific formats. Functions:
+- `to_openai_messages(messages)` — converts to OpenAI-compatible list
+- `to_gemini_messages(messages)` — converts to Gemini native format
+- `merge_consecutive_same_role(messages)` — collapses adjacent same-role messages (required by some providers)
+- `trim_to_token_budget(messages, max_tokens, encoding)` — trims from the oldest messages first while preserving system messages
+
+### `backend_url.py`
+
+**File:** `Agent/Utilities/backend_url.py`
+
+Resolves Backend service URLs from environment variables. Used by `AgentSocketIOClient` and tool implementations that call Backend HTTP endpoints.
+
+### `url_utils.py`
+
+**File:** `Agent/Utilities/url_utils.py`
+
+URL parsing and normalization utilities.
+
+### `E2BSandboxAdapter.py`
+
+**File:** `Agent/Utilities/E2BSandboxAdapter.py`
+
+Adapter for E2B cloud sandbox execution. Wraps E2B Python SDK to provide the sandbox interface expected by `RemoteSandbox` and `SoftwareEngineerAgent`.
+
+Supports two modes controlled by which SDK object is passed to the constructor:
+
+| Mode | SDK type | Notes |
+|------|----------|-------|
+| `"desktop"` | `e2b_desktop.Sandbox` | Full GUI desktop. Mouse/keyboard + VNC stream. |
+| `"async"` | `e2b.AsyncSandbox` | Code execution only. No GUI tools. |
+
+Sync SDK calls are dispatched via `asyncio.to_thread()`. GUI actions in `"async"` mode are serialized through `_request_lock` (one GUI action at a time).
+
+#### Constructor
+
+```python
+E2BSandboxAdapter(
+    sandbox: AsyncSandbox | e2b_desktop.Sandbox,
+    *,
+    owns_sandbox: bool = False,   # if True, __del__ closes the sandbox
+    default_device_id: str = "e2b_desktop",
+    display: str = ":0",          # X display for xrandr/xdotool in async mode
+)
+```
+
+#### `classmethod create_desktop(...) → E2BSandboxAdapter`
+
+Factory for desktop mode. Calls `E2BDesktopSandbox.create(template, resolution, timeout)` via `asyncio.to_thread`, starts VNC stream if `start_stream=True`.
+
+#### Method Reference
+
+**Screen / Cursor**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `get_platform() → str` | `"Linux"` | Static; used by CUA grounding. |
+| `get_screen_size() → Tuple[int, int]` | `(width, height)` | Desktop: `desk.get_screen_size()`. Async: parses `xrandr` output. |
+| `get_cursor_position() → Tuple[int, int]` | `(x, y)` | Desktop: `desk.get_cursor_position()`. Async: parses `xdotool getmouselocation`. |
+| `capture_screenshot() → bytes` | PNG bytes | Desktop: `desk.screenshot("bytes")`. Async: `_dispatch_locked("SCREENSHOT")`. |
+| `screenshot_png_bytes() → bytes` | PNG bytes | Alias for `capture_screenshot()`. |
+
+**Mouse & Keyboard**
+
+| Method | Notes |
+|--------|-------|
+| `click(x, y, button="left")` | `"left"`, `"right"`, `"middle"`. Desktop: `desk.mouse.click()`. |
+| `double_click(x, y)` | Two `click()` calls with 50 ms gap. |
+| `move_mouse(x, y)` | Desktop: `desk.mouse.move()`. Async: `_dispatch_locked("MOUSE_MOVE")`. |
+| `scroll(direction="down", amount=1)` | `"up"/"down"`. Desktop: `desk.mouse.scroll()`. |
+| `type_text(text, interval=0.0)` | Desktop: `desk.keyboard.type()`. |
+| `press_key(key: str \| List[str])` | Single key or chord. Desktop: `desk.keyboard.press()`. |
+| `drag(from_pos, to_pos)` | Mouse button down → move → up. |
+
+**Window Management**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `open_file_or_app(path_or_app) → str` | status string | Runs `xdg-open` via `_e2b_open_app_shell()`. |
+| `launch_app(application, uri=None)` | — | Wraps `open_file_or_app()`. |
+| `get_current_window_id() → str` | xdotool window id | `xdotool getactivewindow`. |
+| `get_application_windows(application) → List[str]` | window id list | `xdotool search --class`. |
+| `get_window_title(window_id) → str` | title string | `xdotool getwindowname`. |
+| `activate_window(title, strict=False, by_class=False)` | — | `xdotool search … windowactivate`. |
+| `close_window(title, strict=False, by_class=False) → bool` | success | `xdotool search … windowclose`. |
+
+**Command Execution**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `execute_command(command, shell=False, timeout=120) → Dict` | `{status, output, error, returncode}` | Accepts `str` or `List[str]`. |
+| `run_python(code, timeout=30) → Dict` | `{status, output, error, return_code}` | Writes to `/tmp/e2b_rp_*.py`, runs with `python3`, cleans up. |
+| `run_bash_script(script, timeout=100, working_dir=None) → Dict` | `{status, output, error, returncode}` | Prepends `#!/bin/bash`, writes temp file, runs, cleans up. |
+
+**File I/O**
+
+| Method | Notes |
+|--------|-------|
+| `read_file_bytes(file_path) → bytes` | Reads via E2B SDK `files.read(..., format="bytes")`. |
+| `write_file_bytes(file_path, data)` | Writes via E2B SDK `files.write()`. |
+| `list_directory_tree(path) → Dict` | `find <path> -maxdepth 3` → `{type, name, children[]}`. |
+
+**VNC Stream (desktop mode only)**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `get_stream_url(auto_connect=True, view_only=False, require_auth=False) → str` | VNC URL | `require_auth=True` fetches auth key first. Raises `NotImplementedError` in async mode. |
+
+**Utilities**
+
+| Method | Notes |
+|--------|-------|
+| `wait(seconds)` | Desktop: `desk.wait(ms)`. Async: `asyncio.sleep()`. |
+| `get_accessibility_tree() → str` | Returns `"<desktop/>"` — stub for interface compatibility. |
+| `get_wallpaper() → None` | Stub. |
+
+### `e2b_desktop_runtime.py`
+
+**File:** `Agent/Utilities/e2b_desktop_runtime.py`
+
+Runtime wrapper for E2B desktop sandbox sessions (used when `sandbox_type="remote"` with a desktop environment).
+
+### `RemoteVMAdapter.py`
+
+**File:** `Agent/Utilities/RemoteVMAdapter.py`
+
+Adapter for Cloud PC remote VM connections. Handles WebSocket message dispatch for GUI actions.
+
+---
+
+## Embedding Providers
+
+**Directory:** `Agent/Utilities/Embedding_Providers/`
+
+Embedding model integrations used by `DataFetcherAgent`'s RAG pipeline and by `ReasoningOverlapAlertRule` for loop detection.
+
+The embedding model is configured via `AgentConfig.reasoning_overlap_embedding_model` (default: `perplexity/pplx-embed-v1-0.6b`).
+
+### BaseEmbeddingProvider
+
+**File:** `Agent/Utilities/Embedding_Providers/Base.py`
+
+Abstract base class for all embedding providers.
+
+```python
+class BaseEmbeddingProvider(ABC):
+    @property
+    @abstractmethod
+    def api_key_env_var(self) -> str: ...
+
+    @abstractmethod
+    def _create_client(self): ...
+
+    @abstractmethod
+    def prepare_payload(self, payload: dict) -> dict: ...
+
+    @abstractmethod
+    async def execute_request(self, payload: dict) -> dict: ...
+```
+
+**Lazy client creation:** the HTTP/SDK client is not created in `__init__`. The first call to `get_client()` calls `_create_client()` and caches the result.
+
+**`close()`** — graceful shutdown. Tries `await client.aclose()` first (async); falls back to `asyncio.to_thread(client.close())` for sync clients; finally drops the reference.
+
+### EmbeddingProviderFactory
+
+**File:** `Agent/Utilities/Embedding_Providers/EmbeddingProviderFactory.py`
+
+Matcher-registry that routes embedding requests to the correct provider based on the model name string. Providers are registered with three arguments:
+
+```python
+factory.register(key, factory_fn, matcher_fn)
+```
+
+- `key` — unique string identifier.
+- `factory_fn` — callable that returns a `BaseEmbeddingProvider` instance (called once; result is cached).
+- `matcher_fn(model_name: str) -> bool` — routing predicate.
+
+**Routing rules:**
+
+| Provider | Matcher condition | Env var |
+|----------|------------------|---------|
+| Gemini | `"gemini" in model and not model.startswith("google")` | `GEMINI_API_KEY` |
+| OpenRouter (default) | fallback for everything else | `OPENROUTER_API_KEY` |
+
+**Public API:**
+
+```python
+async def embedding_request(
+    payload: dict,
+    session: str,
+    session_id: str,
+    agent_type: str,
+    user_id: str
+) -> dict
+```
+
+Selects the provider for `payload["model"]`, calls `execute_request()`, and records cost via the cost tracker. Returns the raw provider response dict.
+
+**`close_all_embedding_providers()`** — calls `close()` on every cached provider instance. Call during agent shutdown.
+
+### Provider Implementations
+
+**`GeminiEmbeddingProvider`** (`Agent/Utilities/Embedding_Providers/GeminiEmbeddingProvider.py`)
+
+Uses the `google-genai` package. Async call:
+
+```python
+await client.aio.models.embed_content(model=model, contents=contents)
+```
+
+Reads `GEMINI_API_KEY`.
+
+**`OpenRouterEmbeddingProvider`** (`Agent/Utilities/Embedding_Providers/OpenRouterEmbeddingProvider.py`)
+
+Uses `AsyncOpenAI` pointed at `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`). Reads `OPENROUTER_API_KEY`.
+
+Connection settings:
+
+| Constant | Value |
+|----------|-------|
+| `EMBEDDING_TIMEOUT` | `httpx.Timeout(30.0, connect=5.0)` |
+| `EMBEDDING_MAX_RETRIES` | `2` |
+
+---
+
+## Local Adapters
+
+**Directory:** `Agent/Utilities/LocalAdapters/`
+
+Full documentation — including `LocalPlaywrightClient` (all 11 tools), `LocalDeviceAdapter`, `DeviceActionRegistry`, `PlaywrightToolRegistry`, `AsyncDockerTerminal`, and `AsyncLocalTerminal` — is in the dedicated reference page:
+
+[Local Adapters Reference](/reference/agent/local-adapters)

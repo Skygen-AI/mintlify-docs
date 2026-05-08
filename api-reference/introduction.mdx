@@ -1,54 +1,275 @@
 ---
 title: "API Reference"
-description: "REST API for the Skygen platform. Every endpoint, request shape, and response example."
+description: "Skygen REST API — base URL, authentication, response format, pagination, and rate limits."
 ---
 
-The Skygen API is organized around REST. It uses predictable resource-oriented URLs, returns JSON, and uses standard HTTP response codes and verbs. All requests are authenticated with a Bearer JWT access token (see [Authentication](/guides/authentication)) unless the endpoint is explicitly public.
+The Skygen REST API is built on FastAPI and follows RESTful conventions. All endpoints accept and return JSON. Real-time events are delivered via Socket.IO (see WebSocket section below).
 
 ## Base URL
 
-```
-https://api.skygen.ai
-```
-
-{/* TODO: confirm production host; some endpoints may currently live on api-dev.skygen.ai */}
+| Environment | Base URL |
+|-------------|---------|
+| Production | `https://api.skygen.ai` |
+| Development | `https://dev.skygen.ai` |
+| Local | `http://localhost:8000` |
 
 ## Authentication
 
-Every authenticated request must include an access token in the `Authorization` header.
+All API endpoints (except `POST /auth/token`, `POST /auth/register`, `GET /auth/ping`, `POST /auth/forgot-password`, and `GET /auth/google`) require authentication.
 
-```http
-Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+### Bearer Token
+
+Pass the JWT in the `Authorization` header:
+
+```bash
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```
 
-Access tokens expire after 60 minutes. Use the refresh flow to obtain a new one. See [Authentication](/guides/authentication) for the full flow, including OAuth, email verification, password reset, and device KID rotation.
+### Cookie (Browser clients)
 
-## Content type
+Browser clients automatically send the `skygen_session` `HttpOnly` cookie set during login. No `Authorization` header is needed.
 
-All request bodies must be JSON with `Content-Type: application/json`, except the login endpoint, which uses `application/x-www-form-urlencoded` (OAuth2 password flow).
+### Getting a token
+
+```bash
+curl -s -X POST https://api.skygen.ai/auth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=you@example.com&password=your-password"
+```
+
+Tokens are valid for **30 days**. There is no refresh endpoint — re-authenticate when the token expires.
+
+See the [Authentication guide](/guides/authentication) for the full auth flow including Google OAuth.
+
+## Response Format
+
+All responses are JSON. Successful responses return the resource directly:
+
+```json
+{
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "title": "My session",
+  "created_at": "2026-05-08T10:00:00Z"
+}
+```
+
+List endpoints return paginated envelopes:
+
+```json
+{
+  "items": [...],
+  "total": 42,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+Error responses use the `detail` field:
+
+```json
+{
+  "detail": "Session not found"
+}
+```
+
+FastAPI validation errors (HTTP 422) return a structured `detail` array:
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "content"],
+      "msg": "field required",
+      "type": "value_error.missing"
+    }
+  ]
+}
+```
 
 ## Pagination
 
-List endpoints support `limit` and `offset` query parameters. Maximum page size is typically 100. Check the per-endpoint reference for exact bounds.
+List endpoints support `limit` and `offset` query parameters:
 
-```http
-GET /sessions?limit=20&offset=40
+| Parameter | Type | Default | Max |
+|-----------|------|---------|-----|
+| `limit` | integer | varies | 100 |
+| `offset` | integer | 0 | — |
+
+```bash
+# Get sessions 21-40
+curl "https://api.skygen.ai/sessions?limit=20&offset=20" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-## Versioning
+## Data Types
 
-Skygen maintains a single stable API. Breaking changes will be announced via the [changelog](https://skygen.ai/changelog) and gated behind a `v2` path prefix (see `/billing/v2` for the first example).
+| Type | Format | Example |
+|------|--------|---------|
+| IDs | UUID v4 string | `"3fa85f64-5717-4562-b3fc-2c963f66afa6"` |
+| Timestamps | ISO 8601 UTC | `"2026-05-08T10:00:00Z"` |
+| Booleans | JSON boolean | `true`, `false` |
+| Soft-deleted | `deleted_at` timestamp | `null` = active, datetime = deleted |
 
-## Errors
+All primary keys are UUIDs. IDs from different resource types never collide.
 
-See the [Errors reference](/errors) for status codes, response format, and retry strategy.
+## Rate Limits
 
-## Real-time events
+Auth endpoints have per-IP rate limits:
 
-Some flows rely on Socket.IO for real-time updates (message streaming, device status, agent progress). Connect to the `/user` namespace with your access token. See [Agents](/concepts/agents) for subscription patterns.
+| Endpoint | Behavior when exceeded |
+|----------|----------------------|
+| `POST /auth/token` | HTTP 429 |
+| `POST /auth/forgot-password` | HTTP 429 |
+| `POST /auth/reset-password` | HTTP 429 |
 
-## SDKs
+Other endpoints are not rate-limited at the application layer in the current version (network-level rate limiting via AWS WAF applies in production).
 
-{/* TODO: add SDK links once client libraries are published */}
+## API Versioning
 
-Official SDKs are on the roadmap. For now, use any standard HTTP client (cURL, `httpx`, `fetch`, `requests`).
+The current API has no version prefix — all endpoints are at `/`. Breaking changes will be announced with a deprecation period. Non-breaking additions (new fields, new endpoints) may be deployed at any time.
+
+## Real-Time Events (Socket.IO)
+
+For real-time updates, connect to the Socket.IO server at the same base URL. Three namespaces are available:
+
+| Namespace | Purpose | Auth |
+|-----------|---------|------|
+| `/user` | Frontend notifications (session events, message events) | User JWT |
+| `/device` | Device commands and heartbeats | Device KID |
+| `/agent` | Agent subscriptions and events | Agent token |
+
+### Connecting to `/user`
+
+```javascript
+import { io } from "socket.io-client";
+
+const socket = io("https://api.skygen.ai/user", {
+  auth: { token: "Bearer eyJ..." },
+  transports: ["websocket"],
+});
+
+socket.on("message_created", (msg) => {
+  console.log("New message:", msg);
+});
+
+socket.on("session_updated", (session) => {
+  console.log("Session updated:", session);
+});
+```
+
+### Key events from `/user`
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `message_created` | ChatMessageRead | Agent sent a new message |
+| `message_updated` | ChatMessageRead | Agent updated an in-progress message |
+| `session_created` | ChatSessionRead | New session created |
+| `session_updated` | ChatSessionRead | Session metadata changed |
+| `session_deleted` | `{ session_id, permanent }` | Session deleted |
+| `session_restored` | ChatSessionRead | Deleted session restored |
+| `scheduled_task_created` | ScheduledTaskRead | New scheduled task |
+| `scheduled_task_updated` | ScheduledTaskRead | Task enabled/disabled/modified |
+| `scheduled_task_deleted` | `{ task_id }` | Task deleted |
+
+## API Endpoints Overview
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="key">
+    `POST /auth/register` `POST /auth/token` `POST /auth/logout`
+    `GET /auth/google` `POST /auth/google-mobile/token`
+    `POST /auth/forgot-password` `POST /auth/reset-password`
+  </Card>
+  <Card title="Sessions" icon="message">
+    `POST /sessions` `GET /sessions` `GET /sessions/{id}`
+    `PATCH /sessions/{id}` `DELETE /sessions/{id}`
+    `POST /sessions/{id}/restore`
+  </Card>
+  <Card title="Messages" icon="paper-plane">
+    `POST /sessions/{id}/messages`
+    `GET /sessions/{id}/messages`
+    `GET /sessions/{id}/messages/{msg_id}`
+  </Card>
+  <Card title="Devices" icon="desktop">
+    `POST /devices` `GET /devices` `GET /devices/{id}`
+    `PATCH /devices/{id}` `DELETE /devices/{id}`
+  </Card>
+  <Card title="Scheduled Tasks" icon="clock">
+    `POST /scheduled-tasks` `GET /scheduled-tasks`
+    `PATCH /scheduled-tasks/{id}` `DELETE /scheduled-tasks/{id}`
+    `PATCH /scheduled-tasks/{id}/toggle` `POST /scheduled-tasks/{id}/run`
+    `GET /scheduled-tasks/{id}/runs`
+  </Card>
+  <Card title="Knowledge Base" icon="book">
+    `POST /knowledge/save` `POST /knowledge/retrieve`
+    `POST /knowledge/update/{id}` `GET /knowledge/insights/{user_id}`
+  </Card>
+  <Card title="Billing" icon="credit-card">
+    `GET /billing/status` `GET /billing/pricing`
+    `POST /billing/subscribe` `POST /billing/cancel`
+    `GET /billing/transactions`
+  </Card>
+  <Card title="Analytics" icon="chart-bar">
+    `POST /analytics/events` `POST /analytics/app-crash`
+    `POST /analytics/app-load-time` `POST /analytics/session-started`
+    `POST /analytics/session-ended`
+  </Card>
+  <Card title="MCP Integrations" icon="plug">
+    `GET /mcp/integrations/available`
+    `POST /mcp/integrations/connect`
+    `DELETE /mcp/integrations/{id}`
+    `GET /mcp/triggers`
+  </Card>
+  <Card title="E2B Sandboxes" icon="cloud">
+    `POST /e2b/sandboxes` `GET /e2b/sandboxes/{id}`
+    `POST /e2b/sandboxes/{id}/actions`
+    `DELETE /e2b/sandboxes/{id}`
+  </Card>
+</CardGroup>
+
+## Interactive API Explorer
+
+Use the API Reference tab above to explore all endpoints interactively. The reference is generated from the OpenAPI schema at `https://api.skygen.ai/openapi.json`.
+
+```bash
+# Download OpenAPI schema
+curl https://api.skygen.ai/openapi.json > openapi.json
+```
+
+## Client Libraries
+
+There is no official Skygen SDK at this time. The API is straightforward enough to use with any HTTP client. Examples in this documentation use `curl` and Python `httpx`.
+
+For Python, we recommend `httpx` for its async support:
+
+```bash
+pip install httpx
+```
+
+```python
+import httpx
+
+BASE_URL = "https://api.skygen.ai"
+
+class SkygenClient:
+    def __init__(self, token: str):
+        self.headers = {"Authorization": f"Bearer {token}"}
+        self.client = httpx.AsyncClient(base_url=BASE_URL, headers=self.headers)
+
+    async def create_session(self, title: str) -> dict:
+        resp = await self.client.post("/sessions", json={"title": title})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def send_message(self, session_id: str, content: str) -> dict:
+        resp = await self.client.post(
+            f"/sessions/{session_id}/messages",
+            json={"content": content, "role": "user", "client_version": "1.0.0"}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def list_messages(self, session_id: str) -> list:
+        resp = await self.client.get(f"/sessions/{session_id}/messages")
+        resp.raise_for_status()
+        return resp.json()
+```

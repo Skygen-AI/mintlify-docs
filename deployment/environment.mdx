@@ -1,220 +1,454 @@
 ---
-title: "Environment variables"
-description: "Every setting the backend, worker, and agent read at startup — grouped by domain."
+title: "Environment Variables"
+description: "Complete reference for all Backend environment variables — type, default, and description for every setting in settings.py."
 ---
 
-All configuration lives in `Backend/app/settings.py` as Pydantic `BaseSettings`, loaded from `.env` or real env vars in production. Prod secrets are synced from AWS Secrets Manager via ExternalSecrets.
+All Backend configuration is driven by environment variables loaded via Pydantic `BaseSettings` from a `.env` file or the process environment. This page documents every variable in `Backend/app/settings.py`.
 
-## Required in production
+<Note>
+  In production, sensitive values are stored in AWS Secrets Manager and synced to Kubernetes via ExternalSecrets. Non-sensitive values live in the environment-specific ConfigMap.
+</Note>
 
-These MUST be set or the service will not start correctly.
+## Core / Required
 
-| Var | Purpose |
-|-----|---------|
-| `SECRET_KEY` | JWT signing key, minimum 32 chars |
-| `AGENT_API_TOKEN` | Backend ↔ Agent shared bearer token |
-| `MCP_CRYPTO_KEY` | AES key for encrypting custom-connector secrets |
-| `DATABASE_URL` | PostgreSQL async connection string |
-| `RABBITMQ_URL` | RabbitMQ broker URL |
-| `REDIS_URL` | Redis for Socket.IO + caching |
-| `API_BASE_URL` | Public backend URL (for OAuth redirects) |
-| `BACKEND_URL` | Internal backend URL (worker → backend) |
-| `ALLOWED_ORIGINS` | CORS allowlist |
-| `ENVIRONMENT` | `development` or `production` |
-| `INTERNAL_SERVICE_TOKEN` | Inter-service auth (backend ↔ worker) |
+These variables have no safe defaults and must be set in every environment.
 
-## Authentication
+<ParamField body="DATABASE_URL" type="string" required>
+  PostgreSQL connection string including credentials. Format: `postgresql+asyncpg://user:password@host:5432/dbname`. In production, this points to PgBouncer, not Postgres directly.
+</ParamField>
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `SECRET_KEY` | — | HS256 signing |
-| `ALGORITHM` | `HS256` | JWT algorithm |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `43200` (30 days) | Token TTL |
-| `REGISTRATION_MODE` | `open` | `open` or `invite_only` |
-| `CLIENT_VERSION_CHECK_ENABLED` | `true` | Enforce `MIN_CLIENT_VERSION` header |
-| `MIN_CLIENT_VERSION` | `1.0.0` | Minimum semver |
+<ParamField body="RABBITMQ_URL" type="string" required>
+  RabbitMQ AMQP URL. Example: `amqp://user:pass@rabbitmq:5672/vhost`.
+</ParamField>
 
-### OAuth providers
+<ParamField body="SEND_MESSAGE_TO_AGENT_QUEUE" type="string" required>
+  RabbitMQ queue name for sending messages to the agent. Supports `{device_id}` interpolation for per-device routing. Example: `content` or `agent-{device_id}`.
+</ParamField>
 
-Google:
+<ParamField body="ANSWER_AGENT_QUEUE" type="string" required>
+  RabbitMQ queue name for agent responses back to the backend worker.
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Web OAuth |
-| `GOOGLE_ANDROID_CLIENT_ID` | Android app |
-| `GOOGLE_IOS_CLIENT_ID` | iOS app |
+## Security
 
-Per-integration MCP OAuth clients (one pair each): `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `CALENDAR_*`, `DRIVE_*`, `DOCS_*`, `SHEETS_*`, `CONTACTS_*`, `YOUTUBE_*`.
+<ParamField body="SECRET_KEY" type="string" required>
+  HMAC secret for JWT signing. Must be at least 32 characters. The server will refuse to start in production if this is not set or too short.
+</ParamField>
 
-Also `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`, `SLACK_CLIENT_ID`/`SLACK_CLIENT_SECRET`/`SLACK_SIGNING_SECRET`, `MICROSOFT_CLIENT_ID`/`MICROSOFT_CLIENT_SECRET`.
+<ParamField body="ALGORITHM" type="string" default="HS256">
+  JWT signing algorithm. Should remain `HS256` unless you have a specific reason to change it.
+</ParamField>
 
-## Database and queues
+<ParamField body="ACCESS_TOKEN_EXPIRE_MINUTES" type="integer" default="43200">
+  JWT token lifetime in minutes. Default is 30 days (43,200 minutes).
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `DATABASE_URL` | `postgresql+asyncpg://user:pass@host:5432/db` |
-| `RABBITMQ_URL` | `amqp://user:pass@host:5672/` |
-| `REDIS_URL` | `redis://host:6379/0` |
-| `SEND_MESSAGE_TO_AGENT_QUEUE` | Queue name, supports `{device_id}` placeholder |
-| `ANSWER_AGENT_QUEUE` | Response queue name |
-| `QUEUE_METRICS_ENABLED` | `true` in prod, disable locally to reduce noise |
+<ParamField body="AGENT_API_TOKEN" type="string" required>
+  Bearer token used by the Agent service to call protected backend endpoints (e.g. Knowledge Base, billing). Must match the token configured in the Agent service.
+</ParamField>
 
-## Email
+<ParamField body="MCP_CRYPTO_KEY" type="string" required>
+  Encryption key for MCP connector credentials. Must be set to a strong random key. The server will error on startup if this is the default value `qwerty1234567890`.
+</ParamField>
 
-Resend is preferred (set `RESEND_API_KEY`); SMTP is the fallback.
+## Redis
 
-| Var | Purpose |
-|-----|---------|
-| `MAIL_ENABLED` | Toggle all email sending |
-| `RESEND_API_KEY` | Resend API key |
-| `MAIL_SERVER` | SMTP host (MailHog local, `email-smtp.us-east-1.amazonaws.com` SES prod) |
-| `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD` | SMTP credentials |
-| `MAIL_FROM`, `MAIL_FROM_NAME` | Sender display |
-| `MAIL_STARTTLS`, `MAIL_SSL_TLS`, `USE_CREDENTIALS` | Transport options |
-| `FRONTEND_URL` | For password reset + verification links |
+<ParamField body="REDIS_URL" type="string" default="">
+  Redis connection URL for distributed Socket.IO state and session locks. Example: `redis://redis:6379/0`. Required for multi-replica deployments.
+</ParamField>
 
-### Resend campaigns
+## Agent Internal Communication
 
-| Var | Purpose |
-|-----|---------|
-| `RESEND_TRIGGERS_ENABLED` | Toggle campaign logic |
-| `RESEND_AUDIENCE_ID` | Main audience |
-| `RESEND_INACTIVE_AUDIENCE_ID` | Inactive users |
-| `RESEND_CHURNED_AUDIENCE_ID` | Churned users |
-| `USER_INACTIVITY_THRESHOLD_DAYS` | Days before inactive (default 3) |
+<ParamField body="AGENT_INTERNAL_URL" type="string" default="http://agent-service:8080">
+  Internal HTTP URL for Backend-to-Agent calls (e.g. playbook extraction). In EKS, use the K8s service name.
+</ParamField>
+
+<ParamField body="BACKEND_URL" type="string" default="http://backend:8000">
+  Internal URL for Worker-to-Backend communication. In ECS with Service Discovery: `http://backend:8000`. For local dev: `http://localhost:8000`.
+</ParamField>
+
+<ParamField body="API_BASE_URL" type="string" default="https://kdev.skygen.ai">
+  Public API URL used for OAuth redirect URIs. Production: `https://api.skygen.ai`. Dev: `https://dev.skygen.ai`.
+</ParamField>
+
+## Frontend URLs
+
+<ParamField body="FRONTEND_URL" type="string" default="http://localhost:3000">
+  WebApp origin (no path). Production: `https://skygen.ai`. Used for constructing email verification links, OAuth callbacks, Stripe redirects, etc.
+</ParamField>
+
+<ParamField body="MAIN_SITE_URL" type="string" default="https://skygen.ai">
+  Next.js marketing site URL. Used for public email links (e.g. homepage download anchors). Defaults to production so dev builds produce clickable links.
+</ParamField>
+
+<ParamField body="WEBAPP_BASE_PATH" type="string" default="">
+  Path prefix for WebApp routing. Production: `/app`. Empty for local dev (WebApp at root).
+</ParamField>
+
+## Authentication Cookies
+
+<ParamField body="AUTH_COOKIE_NAME" type="string" default="skygen_session">
+  Name of the `HttpOnly` JWT session cookie. Dev override: `skygen_session_dev` to prevent collision with prod on shared `.skygen.ai` domain.
+</ParamField>
+
+<ParamField body="SKYGEN_LOGGED_IN_COOKIE_NAME" type="string" default="skygen_logged_in">
+  Name of the public UI-marker cookie (boolean flag, not a JWT). Dev override: `skygen_logged_in_dev`.
+</ParamField>
+
+<ParamField body="AUTH_COOKIE_DOMAIN" type="string" default="">
+  Cookie `Domain` attribute. Empty = host-only (correct for localhost). Production: `.skygen.ai` (leading dot covers all subdomains).
+</ParamField>
+
+<ParamField body="AUTH_COOKIE_SECURE" type="boolean" default="false">
+  Set to `true` in production to require HTTPS for the session cookie.
+</ParamField>
+
+<ParamField body="AUTH_COOKIE_SAMESITE" type="string" default="lax">
+  Cookie `SameSite` policy. `lax` allows top-level navigations (email links) while blocking CSRF on cross-site POST.
+</ParamField>
+
+<ParamField body="AUTH_COOKIE_MAX_AGE_SECONDS" type="integer" default="2592000">
+  Cookie expiry in seconds. Default: 30 days (matches `ACCESS_TOKEN_EXPIRE_MINUTES`).
+</ParamField>
+
+<ParamField body="AUTH_LEGACY_UPGRADE_DISABLED" type="boolean" default="false">
+  When `true`, `POST /auth/upgrade-session` returns HTTP 410. Set after the localStorage-to-cookie migration is complete.
+</ParamField>
+
+## Storage (S3 / MinIO)
+
+<ParamField body="MINIO_ENDPOINT" type="string" default="">
+  S3-compatible endpoint URL. For AWS S3: leave empty and use AWS credential chain. For MinIO: `http://minio:9000`.
+</ParamField>
+
+<ParamField body="MINIO_ACCESS_KEY" type="string" default="">
+  S3 access key ID.
+</ParamField>
+
+<ParamField body="MINIO_SECRET_KEY" type="string" default="">
+  S3 secret access key.
+</ParamField>
+
+<ParamField body="MINIO_BUCKET" type="string" default="">
+  Default S3 bucket for screenshots and general file uploads.
+</ParamField>
+
+<ParamField body="ATTACHMENTS_BUCKET" type="string" default="">
+  S3 bucket for message attachments.
+</ParamField>
+
+<ParamField body="MINIO_PUBLIC_URL" type="string" default="">
+  Public base URL for presigned URLs. Leave empty to use the endpoint URL.
+</ParamField>
+
+<ParamField body="AWS_S3_REGION" type="string" default="">
+  AWS region for S3 operations. Example: `us-east-1`.
+</ParamField>
+
+## E2B (Cloud PC)
+
+<ParamField body="E2B_API_KEY" type="string" default="">
+  API key for the E2B sandbox service. Required when `CLOUD_PC_ENABLED=true`.
+</ParamField>
+
+<ParamField body="E2B_DEFAULT_TIMEOUT" type="integer" default="3600">
+  Default sandbox session timeout in seconds (1 hour).
+</ParamField>
+
+<ParamField body="CLOUD_PC_ENABLED" type="boolean" default="false">
+  Feature flag for Cloud PC (persistent E2B desktop). Set to `true` to enable the Cloud PC feature.
+</ParamField>
+
+<ParamField body="CLOUD_PC_S3_BUCKET" type="string" default="skygen-cloudpc-profiles">
+  S3 bucket for Cloud PC filesystem snapshots (backup/restore).
+</ParamField>
+
+<ParamField body="CLOUD_PC_TEMPLATE_ID" type="string" default="desktop">
+  E2B sandbox template to use when creating Cloud PCs.
+</ParamField>
+
+<ParamField body="CLOUD_PC_AUTO_PAUSE_MINUTES" type="integer" default="5">
+  Minutes of inactivity before a Cloud PC is auto-paused.
+</ParamField>
+
+<ParamField body="CLOUD_PC_MAX_IDLE_MINUTES" type="integer" default="30">
+  Maximum idle time before auto-pause even if heartbeats are still arriving.
+</ParamField>
+
+<ParamField body="CLOUD_PC_MAX_BACKUP_SIZE_MB" type="integer" default="500">
+  Maximum allowed Cloud PC filesystem snapshot size in MB.
+</ParamField>
+
+<ParamField body="CLOUD_PC_COST_PER_HOUR_USD" type="float" default="0.1656">
+  Raw E2B cost per hour (2 vCPU, 4 GiB RAM).
+</ParamField>
+
+<ParamField body="CLOUD_PC_MARGIN_MULTIPLIER" type="float" default="2.5">
+  Markup multiplier applied to `CLOUD_PC_COST_PER_HOUR_USD` for user billing.
+</ParamField>
+
+<ParamField body="MULTI_PARALLEL_CLOUD_PC_ENABLED" type="boolean" default="false">
+  Enables multi-parallel Cloud PC mode. When `false`, legacy single-CPC-per-user behavior applies.
+</ParamField>
+
+## Scheduler
+
+<ParamField body="STALE_RUN_TIMEOUT_MINUTES" type="integer" default="30">
+  Number of minutes before a scheduled task run that has not updated its status is marked as stale and timed out.
+</ParamField>
 
 ## Billing (Stripe)
 
-| Var | Purpose |
-|-----|---------|
-| `BILLING_ENABLED` | Toggle paywalls and token deduction |
-| `STRIPE_SECRET_KEY` | Server-side (`sk_live_…`) |
-| `STRIPE_PUBLISHABLE_KEY` | Client-side (`pk_live_…`), exposed to WebApp |
-| `STRIPE_WEBHOOK_SECRET` | For HMAC verification of Stripe webhooks |
-| `STRIPE_PRICE_ID_STANDARD` | Monthly subscription price ID |
-| `STRIPE_PRICE_ID_OVERAGE` | Metered overage price ID |
-| `STRIPE_METER_EVENT_NAME` | `token_overage` |
-| `SUBSCRIPTION_PRICE_USD` | Default `14.99` |
-| `MONTHLY_TOKENS_INCLUDED` | Default `2000` |
-| `TOKEN_MARGIN_MULTIPLIER` | Default `1.5` |
-| `TOKENS_PER_DOLLAR` | Default `131.58` |
-| `OVERAGE_PRICE_PER_TOKEN` | Default `0.0075` |
+<ParamField body="BILLING_ENABLED" type="boolean" default="true">
+  Master billing switch. Set to `false` to bypass all billing checks (useful for internal deployments).
+</ParamField>
 
-## MCP / Integrations
+<ParamField body="STRIPE_SECRET_KEY" type="string" default="">
+  Stripe secret key (`sk_test_...` or `sk_live_...`).
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `COMPOSIO_API_KEY` | Composio integration |
-| `COMPOSIO_WEBHOOK_SECRET` | HMAC for Composio webhooks |
-| `COMPOSIO_ENABLED` | Feature flag |
-| `KB_ENABLED` | Knowledge base toggle |
-| `SAFETY_ENABLED` | Safety checks toggle |
+<ParamField body="STRIPE_PUBLISHABLE_KEY" type="string" default="">
+  Stripe publishable key (`pk_test_...` or `pk_live_...`).
+</ParamField>
 
-### Telegram (custom provider)
+<ParamField body="STRIPE_WEBHOOK_SECRET" type="string" default="">
+  Stripe webhook signing secret (`whsec_...`). Used to verify webhook authenticity.
+</ParamField>
 
-`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
+<ParamField body="STRIPE_PRICE_ID_STANDARD" type="string" default="">
+  Stripe Price ID for the $14.99/month subscription.
+</ParamField>
 
-## Cloud PC
+<ParamField body="STRIPE_PRICE_ID_OVERAGE" type="string" default="">
+  Stripe Price ID for metered overage (pay-per-token billing).
+</ParamField>
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `CLOUD_PC_ENABLED` | `false` | Feature gate |
-| `CLOUD_PC_S3_BUCKET` | `skygen-cloudpc-profiles` | Backup bucket |
-| `CLOUD_PC_TEMPLATE_ID` | `desktop` | E2B template |
-| `CLOUD_PC_AUTO_PAUSE_MINUTES` | `5` | Inactivity threshold |
-| `CLOUD_PC_MAX_IDLE_MINUTES` | `30` | Max idle before forced pause |
-| `CLOUD_PC_MAX_BACKUP_SIZE_MB` | `500` | Backup size cap |
-| `CLOUD_PC_COST_PER_HOUR_USD` | `0.1656` | Per-hour compute cost |
-| `CLOUD_PC_MARGIN_MULTIPLIER` | `2.5` | Markup |
+<ParamField body="STRIPE_METER_EVENT_NAME" type="string" default="token_overage">
+  Stripe Billing meter event name for tracking overage. Must match the meter created in your Stripe dashboard.
+</ParamField>
 
-### E2B
+<ParamField body="SUBSCRIPTION_PRICE_USD" type="float" default="14.99">
+  Monthly subscription price in USD.
+</ParamField>
 
-`E2B_API_KEY`, `E2B_DEFAULT_TIMEOUT` (default `3600s`).
+<ParamField body="MONTHLY_TOKENS_INCLUDED" type="integer" default="2000">
+  Tokens included in the base subscription per month.
+</ParamField>
 
-## Storage (S3/MinIO)
+<ParamField body="TOKEN_MARGIN_MULTIPLIER" type="float" default="1.5">
+  Multiplier applied to raw LLM API cost when converting to Skygen tokens.
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `MINIO_ENDPOINT` | S3 API endpoint |
-| `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | Credentials |
-| `MINIO_BUCKET` | Main artifacts bucket |
-| `ATTACHMENTS_BUCKET` | User files bucket |
-| `MINIO_PUBLIC_URL` | Public CDN URL |
-| `AWS_S3_REGION` | Default `us-east-1` |
-| `FILE_PARSE_MAX_SIZE_MB` | Default `10` |
+<ParamField body="TOKENS_PER_DOLLAR" type="float" default="131.58">
+  Normalization constant used in token pricing calculations.
+</ParamField>
 
-## Audio (RunPod Whisper)
+<ParamField body="OVERAGE_PRICE_PER_TOKEN" type="float" default="0.0075">
+  Price per token beyond the included monthly allowance ($14.99 / 2000 tokens).
+</ParamField>
 
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `RUNPOD_API_KEY` | — | RunPod API |
-| `RUNPOD_ENDPOINT_ID` | `worker-faster_whisper` | Endpoint |
-| `WHISPER_MODEL` | `turbo` | Model size |
-| `WHISPER_TRANSCRIPTION_FORMAT` | `plain_text` | Output format |
-| `WHISPER_ENABLE_VAD` | `true` | Voice activity detection |
-| `WHISPER_COST_PER_SECOND` | `0.0004` | Cost for billing |
+## Registration
 
-## Agent and Knowledge
+<ParamField body="REGISTRATION_MODE" type="string" default="open">
+  Controls who can register. `open` = anyone can register. `invite_only` = requires a valid invite code.
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `GEMINI_API_KEY` | Gemini 768-dim embeddings for KB |
-| `AGENT_API_TOKEN` | Backend ↔ Agent auth |
-| `AGENT_INTERNAL_URL` | Internal agent URL (playbook extraction) |
+## Email (Amazon SES)
+
+<ParamField body="MAIL_ENABLED" type="boolean" default="true">
+  Set to `false` to disable all outbound email (useful in dev/test environments).
+</ParamField>
+
+<ParamField body="MAIL_FROM" type="string" default="noreply@skygen.ai">
+  From address for outbound emails. Must be a verified identity in Amazon SES.
+</ParamField>
+
+<ParamField body="MAIL_FROM_NAME" type="string" default="Skygen AI">
+  Display name for the from address.
+</ParamField>
+
+<ParamField body="MAIL_REPLY_TO_SUPPORT" type="string" default="support@skygen.ai">
+  Reply-To address for helpdesk/support emails.
+</ParamField>
+
+<ParamField body="AWS_SES_REGION" type="string" default="us-east-1">
+  AWS region for SES API calls.
+</ParamField>
+
+<ParamField body="AWS_SES_CONFIGURATION_SET" type="string" default="">
+  Optional SES configuration set name for tracking email bounces and complaints.
+</ParamField>
+
+<ParamField body="EMAIL_UNSUBSCRIBE_BASE_URL" type="string" default="https://api.skygen.ai/email/unsubscribe">
+  Base URL for email unsubscribe links. A `?token=...` parameter is appended.
+</ParamField>
+
+<ParamField body="EMAIL_SEND_CONCURRENCY" type="integer" default="10">
+  Maximum concurrent SES send calls during the inactive-users batch email job.
+</ParamField>
+
+<ParamField body="EMAIL_TRIGGERS_ENABLED" type="boolean" default="true">
+  Controls lifecycle emails (inactivity, uninstall, welcome). Transactional emails (verification, password reset, helpdesk) are not affected.
+</ParamField>
+
+<ParamField body="FRONTEND_URL" type="string" default="http://localhost:3000">
+  Also used to construct links in emails. See Frontend URLs section above.
+</ParamField>
 
 ## Analytics
 
-| Var | Purpose |
-|-----|---------|
-| `ANALYTICS_ENABLED` | Master toggle |
-| `GA4_MEASUREMENT_ID` | GA4 `G-XXXXXXXXXX` |
-| `GA4_API_SECRET` | Measurement Protocol |
-| `GA4_DEBUG_MODE` | Debug events |
-| `YANDEX_COUNTER_ID` | Yandex Metrica ID |
-| `AMPLITUDE_API_KEY` | Amplitude |
+<ParamField body="ANALYTICS_ENABLED" type="boolean" default="true">
+  Master analytics switch. Set to `false` to disable all event tracking.
+</ParamField>
 
-## Monitoring / Logging
+<ParamField body="GA4_MEASUREMENT_ID" type="string" default="">
+  Google Analytics 4 Measurement ID (format: `G-XXXXXXXXXX`).
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `ENABLE_METRICS` | Prometheus endpoint on `/metrics` |
-| `LOKI_URL` | `http://loki.monitoring.svc.cluster.local:3100` |
-| `GRAFANA_URL` | Public Grafana URL |
-| `LOG_LEVEL` | Default `INFO` |
-| `JSON_LOGS` | `true` in prod for Loki parsing |
+<ParamField body="GA4_API_SECRET" type="string" default="">
+  GA4 Measurement Protocol API secret (required for server-side events).
+</ParamField>
 
-## Alerts
+<ParamField body="GA4_DEBUG_MODE" type="boolean" default="false">
+  Send events to GA4's debug endpoint for validation.
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `RATING_ALERT_TELEGRAM_BOT_TOKEN` | Bot token |
-| `RATING_ALERT_TELEGRAM_CHAT_ID` | Chat ID for low ratings (≤2) |
-| `HELPDESK_TELEGRAM_CHAT_ID` | Chat ID for helpdesk alerts |
+<ParamField body="AMPLITUDE_API_KEY" type="string" default="">
+  Amplitude project API key for advanced analytics.
+</ParamField>
 
-## WebApp build-time vars (Vite)
+<ParamField body="YANDEX_COUNTER_ID" type="string" default="">
+  Yandex Metrica counter ID.
+</ParamField>
 
-These compile into the bundle; changing them requires a rebuild.
+<ParamField body="USER_INACTIVITY_THRESHOLD_DAYS" type="integer" default="3">
+  Days of inactivity before a user is considered inactive and may receive a re-engagement email.
+</ParamField>
 
-| Var | Purpose |
-|-----|---------|
-| `VITE_BACKEND_URL` | API host |
-| `VITE_WS_URL` | Socket.IO host |
-| `VITE_STRIPE_PUBLISHABLE_KEY` | Stripe.js |
-| `VITE_GTM_ID` | Google Tag Manager |
-| `VITE_GOOGLE_ADS_ID` | Google Ads tracking |
+## MCP / Composio
 
-## Secrets management
+<ParamField body="COMPOSIO_API_KEY" type="string" default="">
+  Composio API key (`comp_...`). Different per environment (dev vs prod).
+</ParamField>
 
-Production: AWS Secrets Manager via ExternalSecrets operator.
+<ParamField body="COMPOSIO_WEBHOOK_SECRET" type="string" default="">
+  HMAC secret for verifying incoming Composio webhook payloads.
+</ParamField>
 
-- `skygen/{env}/backend-secrets-us` — DB/Redis/RabbitMQ URLs, OAuth client pairs, billing keys
-- `skygen/{env}/backend-secrets-eu` — `SECRET_KEY`, `AGENT_API_TOKEN`, `MCP_CRYPTO_KEY`, `GEMINI_API_KEY`, `E2B_API_KEY`, `COMPOSIO_API_KEY`, MinIO, Stripe, Resend, Telegram
-- `skygen/{env}/monitoring-*` — Grafana admin, Alertmanager SMTP
+<ParamField body="COMPOSIO_ENABLED" type="boolean" default="true">
+  Feature flag. When `false`, MCP integration endpoints return "service upgrading" errors.
+</ParamField>
 
-ExternalSecret CRDs sync changes into Kubernetes Secrets; pods pick them up on restart.
+## Monitoring / Alerting
 
-## See also
+<ParamField body="LOKI_URL" type="string" default="">
+  Loki log aggregation endpoint for admin session log viewing. Example: `http://loki.monitoring.svc.cluster.local:3100`.
+</ParamField>
 
-- [Deployment overview](/deployment/overview) — services and clusters
-- [Monitoring](/deployment/monitoring) — what these metrics feed
-- [Kubernetes](/deployment/k8s) — how secrets plug into pods
+<ParamField body="RATING_ALERT_TELEGRAM_BOT_TOKEN" type="string" default="">
+  Telegram bot token for low-rating alerts.
+</ParamField>
+
+<ParamField body="RATING_ALERT_TELEGRAM_CHAT_ID" type="string" default="">
+  Telegram chat ID for low-rating alerts.
+</ParamField>
+
+<ParamField body="HELPDESK_TELEGRAM_CHAT_ID" type="string" default="">
+  Telegram chat ID for helpdesk alerts. Reuses `RATING_ALERT_TELEGRAM_BOT_TOKEN`.
+</ParamField>
+
+<ParamField body="QUEUE_METRICS_ENABLED" type="boolean" default="true">
+  Set to `false` in local dev (without RabbitMQ) to suppress periodic connection attempts and metric noise.
+</ParamField>
+
+## Knowledge Base
+
+<ParamField body="GEMINI_API_KEY" type="string" default="">
+  Google Gemini API key for Knowledge Base embedding generation. Required when `KB_ENABLED=true`.
+</ParamField>
+
+<ParamField body="KB_ENABLED" type="boolean" default="true">
+  Enable or disable the Knowledge Base feature entirely.
+</ParamField>
+
+## Safety
+
+<ParamField body="SAFETY_ENABLED" type="boolean" default="true">
+  Enable or disable the safety moderation layer for agent outputs.
+</ParamField>
+
+## Voice / Audio (Whisper)
+
+<ParamField body="RUNPOD_API_KEY" type="string" default="">
+  API key for RunPod Faster Whisper transcription service.
+</ParamField>
+
+<ParamField body="RUNPOD_ENDPOINT_ID" type="string" default="worker-faster_whisper">
+  RunPod endpoint ID for the Whisper worker.
+</ParamField>
+
+<ParamField body="WHISPER_MODEL" type="string" default="turbo">
+  Whisper model variant to use.
+</ParamField>
+
+<ParamField body="WHISPER_TRANSCRIPTION_FORMAT" type="string" default="plain_text">
+  Output format for transcriptions.
+</ParamField>
+
+<ParamField body="WHISPER_ENABLE_VAD" type="boolean" default="true">
+  Enable Voice Activity Detection pre-processing.
+</ParamField>
+
+<ParamField body="WHISPER_COST_PER_SECOND" type="float" default="0.0004">
+  Cost per second of audio transcribed, for billing purposes.
+</ParamField>
+
+## File Parsing
+
+<ParamField body="FILE_PARSE_MAX_SIZE_MB" type="integer" default="10">
+  Maximum file size in MB for document parsing. Configurable from the admin panel.
+</ParamField>
+
+## Google OAuth
+
+<ParamField body="GOOGLE_CLIENT_ID" type="string" default="">
+  Google OAuth2 client ID for "Sign in with Google" (web flow).
+</ParamField>
+
+<ParamField body="GOOGLE_CLIENT_SECRET" type="string" default="">
+  Google OAuth2 client secret (web flow).
+</ParamField>
+
+<ParamField body="GOOGLE_ANDROID_CLIENT_ID" type="string" default="...">
+  Google OAuth2 client ID for Android. Pre-set to the platform's Android client ID.
+</ParamField>
+
+## MCP Per-Integration Google OAuth
+
+Each Google Workspace integration has its own OAuth app to scope permissions minimally:
+
+| Variable | Description |
+|----------|-------------|
+| `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` | Gmail integration |
+| `CALENDAR_CLIENT_ID` / `CALENDAR_CLIENT_SECRET` | Google Calendar |
+| `DRIVE_CLIENT_ID` / `DRIVE_CLIENT_SECRET` | Google Drive |
+| `DOCS_CLIENT_ID` / `DOCS_CLIENT_SECRET` | Google Docs |
+| `SHEETS_CLIENT_ID` / `SHEETS_CLIENT_SECRET` | Google Sheets |
+| `CONTACTS_CLIENT_ID` / `CONTACTS_CLIENT_SECRET` | Google Contacts |
+| `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` | YouTube |
+
+## Client Version Check
+
+<ParamField body="CLIENT_VERSION_CHECK_ENABLED" type="boolean" default="true">
+  When `true`, clients must send `client_version` with every message. Missing or outdated versions receive a prompt to update.
+</ParamField>
+
+<ParamField body="MIN_CLIENT_VERSION" type="string" default="1.0.0">
+  Minimum required client version (semver). Clients below this version are asked to update.
+</ParamField>
+
+## Environment
+
+<ParamField body="ENVIRONMENT" type="string" default="development">
+  Current environment name. Used for Composio user isolation (prefixes `user_id`) and security validation behavior. Values: `development`, `production`.
+</ParamField>

@@ -1,225 +1,252 @@
 ---
-title: "Errors"
-description: "Status codes, response formats, domain-specific error catalog, and retry strategy."
+title: "Error Reference"
+description: "Complete reference for all HTTP error codes, their causes, and how to handle them in client code."
 ---
 
-Skygen uses standard HTTP status codes. Responses are JSON. Different parts of the API use different error schemas, which is a known inconsistency we're migrating toward the `AppError` shape.
-
-## Error response formats
-
-**Legacy** (HTTPException, most of the API):
+All Skygen API errors follow a consistent JSON format:
 
 ```json
 {
-  "detail": "Email already registered"
+  "detail": "Human-readable error message"
 }
 ```
 
-**Pydantic validation** (422):
+For validation errors (HTTP 422), FastAPI returns a structured array:
 
 ```json
 {
   "detail": [
     {
-      "loc": ["body", "email"],
-      "msg": "value is not a valid email address",
-      "type": "value_error.email"
+      "loc": ["body", "field_name"],
+      "msg": "field required",
+      "type": "value_error.missing"
     }
   ]
 }
 ```
 
-**AppError** (v2 billing, newer services):
+## HTTP Status Code Reference
+
+### 400 Bad Request
+
+The request is malformed or violates a business rule.
+
+| Detail message | Cause | Resolution |
+|----------------|-------|------------|
+| `Email already registered` | Registration attempt with an email that already has an account | Use `POST /auth/token` to log in instead |
+| `This email is already registered using Google. Please sign in with Google.` | Email exists but was created via Google OAuth | Use the Google sign-in flow |
+| `Invalid invite code` | Invite code not found in the database | Check the code for typos; request a new code |
+| `This invite code has been deactivated` | Invite code was manually deactivated by an admin | Request a new code |
+| `This invite code has already been used` | Invite code was already redeemed | Each code is single-use |
+| `This invite code has expired` | Invite code past its `expires_at` date | Request a new code |
+| `Invite code is required for registration` | Server is in `invite_only` mode | You must have a valid invite code |
+| `Invalid token` | JWT has no `sub` claim or is structurally invalid | Re-authenticate to get a fresh token |
+| `Invalid or expired token` | JWT failed signature verification or is past expiry | Re-authenticate |
+| `meta dict required` | `PATCH /auth/update-registration-meta` missing `meta` field | Include a non-empty `meta` object |
+| `Session is not deleted` | Attempted to restore a session that is still active | Only deleted sessions can be restored |
+| `Bearer header required` | `POST /auth/upgrade-session` missing `Authorization` header | Add `Authorization: Bearer <token>` |
+
+### 401 Unauthorized
+
+Authentication failed or token is invalid.
+
+| Detail message | Cause | Resolution |
+|----------------|-------|------------|
+| `Incorrect email or password` | Login credentials do not match | Check credentials; use forgot-password if needed |
+| `Not authenticated` | No JWT token or cookie provided | Add `Authorization: Bearer <token>` header |
+| `Invalid token` | Token was issued before the user's last password change | Re-authenticate to get a new token |
+| `Inactive user` | User account has been deactivated by an admin | Contact support |
+| `Could not validate credentials` | Generic JWT validation failure | Re-authenticate |
+| `Invalid Google token` | Google ID token verification failed | Ensure the token is fresh and from an allowed client ID |
+| `Invalid Google token claims` | Google token missing `email` or `sub` | Ensure the Google SDK returns verified tokens |
+| `Google email not verified` | Google account's email is not verified | Verify the Google account's email first |
+
+### 403 Forbidden
+
+Authentication succeeded but the user lacks permission.
+
+| Detail message | Cause | Resolution |
+|----------------|-------|------------|
+| `Forbidden` | Accessing another user's session or resource | Use only resources owned by your user |
+| `Not authorized` | Accessing another user's device | Use only your own devices |
+| `Cannot create session with a device that doesn't belong to you` | `device_id` belongs to a different user | Use a device owned by your account |
+| `Admin access required` | Non-admin accessing an admin-only endpoint | Requires an admin user token |
+
+### 404 Not Found
+
+The requested resource does not exist or was deleted.
+
+| Detail message | Cause | Resource |
+|----------------|-------|---------|
+| `Session not found` | Session ID invalid, deleted, or not yours | Chat sessions |
+| `Device not found` | Device ID invalid, deleted, or not yours | Devices |
+| `Scheduled task not found` | Task ID invalid or belongs to another user | Scheduled tasks |
+| `User not found` | User ID not in database | User management (admin) |
+| `Emplogent not found` | Emplogent ID invalid or not yours | Emplogents |
+| `Message not found` | Message ID invalid | Chat messages |
+
+### 409 Conflict
+
+The request conflicts with the current state of the resource.
+
+| Detail message | Cause | Resolution |
+|----------------|-------|------------|
+| `Device with token kid '...' already exists` | KID collision on device registration | Use a unique KID or omit it to let the server generate one |
+| `Previous run still in progress` | Triggered a scheduled task run when `max_concurrent_runs` is reached | Wait for the current run to finish, or increase `max_concurrent_runs` |
+
+### 410 Gone
+
+The endpoint has been permanently disabled.
+
+| Detail message | Cause |
+|----------------|-------|
+| `legacy upgrade disabled` | `POST /auth/upgrade-session` has been disabled via `AUTH_LEGACY_UPGRADE_DISABLED=true` |
+
+### 422 Unprocessable Entity
+
+The request body is syntactically valid but fails business-rule validation.
+
+| Detail message | Cause |
+|----------------|-------|
+| `scheduled_at must be in the future` | One-time task with a `scheduled_at` in the past |
+| `Invalid time_of_day format, expected HH:MM` | Scheduled task `time_of_day` not in `HH:MM` format |
+| `Could not extract playbook from this session` | Agent could not parse a playbook from the session trajectory |
+| `Session has no messages` | Tried to extract playbook from an empty session |
+| FastAPI validation array | Missing required fields, wrong types, out-of-range values |
+
+### 429 Too Many Requests
+
+Rate limit exceeded.
+
+| Endpoint | Limit |
+|----------|-------|
+| `POST /auth/token` | Per-IP rate limit (exact threshold is environment-specific) |
+| `POST /auth/forgot-password` | Per-IP rate limit |
+| `POST /auth/reset-password` | Per-IP rate limit |
+
+Back off and retry after a brief delay (start with 5 seconds).
+
+### 500 Internal Server Error
+
+Unexpected server-side error. These should be rare. If you encounter one consistently:
+1. Check the `detail` message for context.
+2. Retry once — transient database or network errors may resolve.
+3. If persistent, contact support with the request ID from the response headers (if present) and the timestamp.
+
+### 501 Not Implemented
+
+A feature is not configured on the server.
+
+| Detail message | Cause |
+|----------------|-------|
+| `Google OAuth is not configured on this server` | `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are not set |
+
+### 503 Service Unavailable
+
+A downstream service is unreachable.
+
+| Detail message | Cause |
+|----------------|-------|
+| `Agent service unavailable` | The Agent service did not respond to a playbook extraction request |
+
+---
+
+## Billing Errors
+
+Billing errors are returned as structured payloads when sending a message while in a billing-blocked state. These are returned with HTTP 402:
 
 ```json
 {
-  "error": "payment_required",
-  "detail": "Add a payment method before subscribing",
-  "request_id": "a1b2c3-...",
-  "extra": {"plan_id": "plan_xyz"}
+  "billing_error": {
+    "error_type": "subscription_required",
+    "title": "Subscription Required",
+    "message": "Subscribe to continue using Skygen.",
+    "action": "subscribe"
+  }
 }
 ```
 
-Clients should handle all three. The WebApp's `extractErrorMessage()` normalizes them (see [API client](/webapp/api-client)).
+Common billing error types:
 
-## Status code reference
+| `error_type` | Cause |
+|-------------|-------|
+| `subscription_required` | User has no active subscription |
+| `payment_failed` | Stripe payment failed |
+| `overage_disabled` | Token allowance exhausted and overage billing is disabled |
+| `trial_expired` | Free trial period has ended |
 
-| Code | Name | When |
-|------|------|------|
-| `200` | OK | Success |
-| `201` | Created | New resource |
-| `202` | Accepted | Change pending webhook confirmation |
-| `204` | No Content | DELETE succeeded |
-| `400` | Bad Request | Malformed input or rejected business rule |
-| `401` | Unauthorized | Missing / invalid / expired JWT or agent token |
-| `402` | Payment Required | Subscription expired, token balance exhausted, feature requires paid tier |
-| `403` | Forbidden | Authenticated but not allowed (ownership, admin-only, tier gate, safety block) |
-| `404` | Not Found | Resource missing or not yours |
-| `409` | Conflict | State clash — duplicate device, already-rated ticket, plan change in progress |
-| `410` | Gone | Underlying sandbox/device is gone |
-| `422` | Unprocessable Entity | Pydantic validation |
-| `423` | Locked | Device or Cloud PC busy with another action |
-| `429` | Too Many Requests | Rate limit; check `Retry-After` header (not always set) |
-| `500` | Server Error | Unexpected; check `request_id` and retry |
-| `501` | Not Implemented | Stub endpoint (admin refresh, admin me) |
-| `502` | Bad Gateway | Stripe, upstream API failed |
-| `503` | Service Unavailable | Feature disabled, Stripe/Redis/DB unreachable |
-| `504` | Gateway Timeout | Action submitted but device didn't respond in time |
+---
 
-## By domain
+## Knowledge Base Errors
 
-### Common (all endpoints)
+KB endpoints return 500 on internal embedding or retrieval failures. The error detail includes the underlying exception message for debugging.
 
-- `401 "Could not validate credentials"` — missing/invalid JWT. Refresh via `/auth/token`.
-- `401 "Invalid agent token"` — agent endpoint called without `AGENT_API_TOKEN`.
-- `403 "Administrator privileges required"` — endpoint admin-only.
-- `403 "Not authorized"` — the resource belongs to another user.
-- `403 "Agent endpoints are internal-only"` — `/agent/*`, `/knowledge/*`, `/safety/*` blocked from external ALB.
-- `422` — Pydantic validation; `detail` array points at the invalid field.
-- `500 "Internal server error"` — global exception handler fired; include `request_id` in bug reports.
+---
 
-### Authentication (`/auth/*`)
-
-- `400 "Email already registered"`
-- `400 "This email is already registered using {Provider}. Please sign in with {Provider}."`
-- `400 "Invite code is required for registration"` — when `REGISTRATION_MODE=invite_only`
-- `400 "Invalid invite code"` / `"This invite code has been deactivated"` / `"...has already been used"` / `"...has expired"`
-- `401 "Incorrect email or password"` — login failure (no user enumeration)
-- `429` — login 20/15min, forgot-password 3/hour, reset-password 5/hour, all per IP
-
-### Devices
-
-- `409 "Device with token kid '{kid}' already exists"` — KID already registered to a different user
-- `423` — implicit; device busy with another agent action
-- `429` — KID rotation rate-limited (once per 5 minutes)
-
-### Chat sessions and messages
-
-- `404 "Session not found"`, `"Message not found"` — or belongs to another user
-- `400 "Session is not deleted"` — can't permanent-delete an active session
-- `409 Conflict` on `POST /messages` — device already locked by another session. Response body includes `active_session_id`
-
-### Billing
-
-- `402` with structured body `{error, message, action, reason, extra}` — subscription lapsed, tokens exhausted, card declined
-- `400 "Model profile not available on plan"`
-- `400 "Session not found"` / `"Plan not found"` / `"Invalid billing request"`
-- `400 "Failed to change plan"`
-- `404 "No active subscription"` — on cancel
-- `409 "Already on this plan"`
-- `503 "Payment system unavailable"` / `"Stripe not configured"` — Stripe API unreachable
-- Webhook: `400 "Missing signature"` / `"Invalid signature"` — Stripe webhook HMAC failure
-
-### Cloud PC
-
-- `503 "Cloud PC feature is disabled"` — `CLOUD_PC_ENABLED=false`
-- `402 "Insufficient tokens for Cloud PC"` — balance too low
-- `409 "Cloud PC is not active"` — connect called on non-ACTIVE instance
-- `409 "Can only delete Cloud PC in 'deleted' state"` — need to soft-delete first
-- `410` — underlying E2B sandbox is gone
-- `404 "Cloud PC not found"`
-
-### E2B sandboxes
-
-- `400 "Device type must be 'e2b_sandbox'"`
-- `404 "Sandbox not found"` / `403 "Sandbox does not belong to current user"`
-- `500 "Sandbox operation failed"` — E2B API error
-
-### Knowledge base
-
-- `400` bad format / validation
-- `403` ownership check failed
-- `404 "Knowledge item not found"`
-- `500 "Storage service unavailable"` — S3/DB transient
-
-### MCP integrations
-
-- `400 "Invalid parameters"` / `"Required scope missing"`
-- `404 "No active connection found for '{provider}'"` — need to connect first
-- `502 "OAuth provider unavailable"`
-- `503 "MCP service unavailable"` / `"MCP tool execution failed"`
-
-### Invites
-
-- `400 "Count must be between 1 and 100"` — on batch create
-- `400 "Invite code is already inactive"` — deactivate on already-deactivated
-
-### Admin
-
-- `501 "Not implemented"` — `/admin/api/auth/refresh`, `/admin/api/auth/me`
-- `400 "Email already registered"` — create user
-- `404 "Role not found"`, `"Plan not found"`, `"Session not found"`
-- `409 "View with slug '{slug}' already exists"` — admin landing view create
-- `400 "Cannot delete default view"` — admin landing view delete
-- `502 / 504` — admin prod proxy timeout / upstream error
-
-### Connectors (custom)
-
-- `400 "server_url is required for custom_mcp connectors"`
-- `400 "Invalid server URL: {details}"` — SSRF validation rejected it
-
-### Screenshots
-
-- `500 "Failed to upload screenshot"` — S3/MinIO failure
-- `404 "Screenshot not found"` / `403 "Access denied"`
-
-### Helpdesk
-
-- `400 "Invalid rating"` — rating must be 1–5
-- `409 Conflict` — ticket already rated
-- `404 "Ticket not found"`
-
-## Retry strategy
-
-<Warning>
-**Retryable**: `429`, `502`, `503`, `504`. Exponential backoff with jitter, cap at `Retry-After` when present.
-
-**Non-retryable**: `400`, `401`, `403`, `404`, `409`, `422`. Retrying without changing the request wastes load.
-</Warning>
-
-Starting point: 500ms initial, multiplier 2, max 30s, max 5 attempts.
+## Client-Side Handling Patterns
 
 ```python
-for attempt in range(5):
-    try:
-        return await call()
-    except HttpClientError as e:
-        if e.status not in {429, 502, 503, 504}:
+import httpx
+import time
+
+def api_call_with_retry(method, url, **kwargs):
+    """Simple retry logic for transient errors."""
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {TOKEN}"
+
+    for attempt in range(3):
+        try:
+            resp = httpx.request(method, url, headers=headers, **kwargs)
+
+            if resp.status_code == 401:
+                # Token expired — re-authenticate
+                raise Exception("Token expired, please re-authenticate")
+
+            if resp.status_code == 429:
+                # Rate limited — back off
+                time.sleep(5 * (attempt + 1))
+                continue
+
+            if resp.status_code >= 500:
+                # Server error — retry with backoff
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+
+            resp.raise_for_status()
+            return resp
+
+        except httpx.NetworkError:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
             raise
-        if attempt == 4:
-            raise
-        wait = min(30, 0.5 * (2 ** attempt)) + random.uniform(0, 0.5)
-        await asyncio.sleep(wait)
+
+    raise Exception("Max retries exceeded")
 ```
 
-## Known inconsistencies
+```javascript
+async function apiCall(method, path, body) {
+  const resp = await fetch(`https://api.skygen.ai${path}`, {
+    method,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
 
-<Note>
-**Two error formats in flight.** Legacy `HTTPException` raises `{detail}`. Newer `AppError` subclasses in `core/exceptions.py` raise `{error, message, request_id, ...}`. Migration is ongoing — handle both.
-</Note>
+  if (resp.status === 401) {
+    // Redirect to login
+    window.location.href = "/login";
+    return;
+  }
 
-<Note>
-**`str(e)` leaks internal messages.** Some routers raise `HTTPException(status_code=400, detail=str(e))`. The `detail` can include stack hints or internal error classes. Don't parse these strings for branching logic; use status codes + structured fields.
-</Note>
+  if (!resp.ok) {
+    const error = await resp.json();
+    throw new Error(error.detail || `HTTP ${resp.status}`);
+  }
 
-<Note>
-**No `Retry-After` header on 429.** Rate limits return 429 but don't yet set the header. Use the fixed windows documented per endpoint to back off.
-</Note>
-
-<Note>
-**Generic 500 "Operation failed".** Several admin routers raise `status_code=500, detail="Operation failed"` without context. Correlate with Loki logs using the `request_id` header.
-</Note>
-
-## Middleware and global handlers
-
-- `internal_guard` middleware returns 403 on `/agent/*`, `/knowledge/*`, `/safety/*` from external ALB traffic
-- `logging_middleware` tags every request with a `request_id` and logs duration + status
-- Global `@app.exception_handler(Exception)` catches unhandled → 500 with `{detail, request_id}`
-- `/ready` returns 503 if DB or Redis are unavailable; `/health` is lighter (process alive)
-
-## See also
-
-- [Authentication](/guides/authentication) — 401 / 403 details
-- [Billing](/concepts/billing) — 402 response shape
-- [Devices](/concepts/devices) — 409 / 423 / 429 on KID rotation
-- [API client](/webapp/api-client) — `extractErrorMessage()` normalizer
+  return resp.json();
+}
+```

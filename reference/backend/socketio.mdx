@@ -1,0 +1,838 @@
+---
+title: "Socket.IO Real-Time Layer"
+description: "Three-namespace Socket.IO architecture: device commands, user notifications, and agent event routing — with connection management, authentication, and durable delivery."
+---
+
+## Overview
+
+Skygen's real-time layer runs as a single `python-socketio` `AsyncServer` (ASGI mode) mounted on the FastAPI app at path `socket.io`. It exposes three namespaces, each with distinct authentication, topology, and delivery guarantees:
+
+| Namespace | Clients | Auth | Topology |
+|---|---|---|---|
+| `/device` | OSWorld physical and virtual devices | JWT (device KID) | 1 device → 1 SID |
+| `/user` | Browser/Tauri frontend instances | Cookie or JWT bearer | 1 user → N SIDs (multi-tab) |
+| `/agent` | BrokerAgent processes | AGENT_API_TOKEN | 1 agent → 1 SID, subscriptions in Redis |
+
+**Server configuration** (`app/socketio/server.py`):
+
+- `async_mode='asgi'`
+- `ping_interval=15s`, `ping_timeout=20s`
+- `max_http_buffer_size=1MB`
+- `AsyncRedisManager` with `channel=socketio-{ENVIRONMENT}` — environment-isolated pub/sub for horizontal scaling across pods
+- CORS: whitelist-checked; non-`http(s)` schemes (e.g. `tauri://`) are allowed unconditionally for native desktop apps
+- **No default namespace connect handler** — adding one breaks all custom namespace handlers over WebSocket
+
+---
+
+## /device Namespace
+
+### Authentication
+
+On `connect`, the namespace reads:
+
+- `auth.token` — JWT (same key/algo as HTTP `Authorization: Bearer`)
+- `auth.device_id` — UUID of the connecting device
+
+**Steps:**
+1. Decode JWT → extract `user_id` from `sub` claim.
+2. Look up device in DB; reject if not found or if `device.user_id != user_id`.
+3. Reject `DeviceType.E2B_SANDBOX` devices (sandbox lifecycle is managed by the backend, not by direct socket connection).
+4. Register SID → device_id in `DeviceConnectionManager`.
+5. Join room `device:{device_id}` for broadcast targeting.
+6. Call `_try_flush_pending` — replay any commands persisted while the device was offline.
+
+---
+
+### Inbound Events (Device → Server)
+
+#### `heartbeat`
+
+Periodic keep-alive. Also calls `_try_flush_pending` to dequeue any commands accumulated between heartbeats.
+
+**Payload:** `{}` (empty or ignored)
+
+**Effects:** Refreshes online status; flushes pending command queue.
+
+---
+
+#### `task_result`
+
+Device reports the outcome of a task execution.
+
+**Payload:**
+
+<ParamField body="task_id" type="str" required>ID of the completed task.</ParamField>
+<ParamField body="result" type="dict" required>Execution result from the device.</ParamField>
+<ParamField body="success" type="bool">Whether the task completed successfully.</ParamField>
+
+**Effects:** Routes result to the subscribing agent via `notify_action_result`.
+
+---
+
+#### `device_status`
+
+Device self-reports a status change (online/offline/busy/idle).
+
+**Payload:**
+
+<ParamField body="status" type="str" required>New status string.</ParamField>
+<ParamField body="device_id" type="str">Device UUID (falls back to the registered device for the SID).</ParamField>
+
+**Effects:** Calls `notify_device_status_changed` to broadcast to subscribed agents.
+
+---
+
+#### `get_presigned_upload_url`
+
+Device requests an S3 presigned URL to upload a screenshot or file.
+
+**Payload:**
+
+<ParamField body="filename" type="str" required>Target filename for S3.</ParamField>
+<ParamField body="content_type" type="str">MIME type (default: `image/png`).</ParamField>
+
+**Returns:** `{"url": str, "key": str}` — presigned PUT URL and S3 key.
+
+---
+
+### Outbound Events (Server → Device)
+
+#### `execute_task`
+
+Send an agent task to the device for execution.
+
+**Helper:** `send_execute_task(device_id, task_data)` — fire-and-forget; uses `room=device:{device_id}`.
+
+**Payload:**
+```json
+{
+  "task_id": "uuid",
+  "action": "...",
+  "parameters": {...}
+}
+```
+
+---
+
+#### `desktop_env_execute`
+
+Durable version of `execute_task` for desktop environment commands. Uses the **persist-before-send** pattern:
+
+1. Persist command to Redis pending queue.
+2. Emit over Socket.IO.
+3. Device ACKs → remove from pending queue.
+
+**Helper:** `send_desktop_execute(device_id, command_data)`.
+
+**Dedup:** Before flushing the pending queue, a Redis flag (`device:flush:{device_id}`, TTL=30s) prevents concurrent flush attempts from both `on_connect` and `on_heartbeat`.
+
+---
+
+#### `task_cancelled`
+
+Notify device that a pending task has been cancelled.
+
+**Helper:** `send_task_cancelled(device_id, task_id, reason)`.
+
+**Payload:**
+```json
+{"task_id": "uuid", "reason": "User cancelled"}
+```
+
+---
+
+#### `task_completed`
+
+Notify device that the backend considers the task complete.
+
+**Helper:** `send_task_completed(device_id, task_id, result)` — not used for durable delivery; used by background jobs.
+
+---
+
+### External Helper Functions
+
+| Function | Description |
+|---|---|
+| `send_to_device(device_id, event, data)` | Emit any event to a device room |
+| `send_execute_task(device_id, task_data)` | Send task execution command |
+| `send_desktop_execute(device_id, cmd)` | Durable desktop command (persist-before-send) |
+| `send_task_cancelled(device_id, task_id, reason)` | Cancel signal |
+| `is_device_connected(device_id)` | Local in-memory check |
+| `is_device_connected_distributed(device_id)` | Redis-backed check (cross-pod) |
+| `get_connected_devices()` | List of device IDs on this pod |
+| `get_connected_device_count()` | Count of connected devices on this pod |
+| `get_devices_for_user(user_id)` | All connected device IDs for a user |
+| `send_to_user_devices(user_id, event, data)` | Fan-out to all connected devices for a user |
+
+---
+
+## /user Namespace
+
+### Authentication
+
+On `connect`, the namespace calls `resolve_socket_user(environ, auth, db)`:
+
+1. **Cookie-first**: Check for `access_token` cookie in `environ` HTTP headers. If present and valid, use it.
+2. **Bearer fallback**: If no cookie, use `auth.token` Bearer JWT.
+3. **No fallback on bad cookie**: An invalid or expired cookie does NOT fall back to Bearer. The connection is rejected. This prevents split-brain auth where cookie and Bearer disagree.
+
+After resolving the user:
+1. Register SID in `UserConnectionManager` (1 user → Set of SIDs, for multi-tab support).
+2. Join room `user:{user_id}`.
+3. Call `_replay_cloud_pc_state` — push current Cloud PC status for all alive CPCs to the new connection (snapshot events with `is_snapshot=true`).
+4. Call `_deliver_pending_notifications` — replay Redis-persisted notifications not yet ACKed by any client tab.
+
+---
+
+### Inbound Events (Browser → Server)
+
+#### `notification_ack`
+
+Client acknowledges receipt of a durable notification, preventing re-delivery on next connect.
+
+**Payload:**
+
+<ParamField body="notification_id" type="str" required>ID of the notification to acknowledge.</ParamField>
+
+**Effects:** Removes notification from the user's Redis pending queue. Idempotent.
+
+---
+
+#### `ping`
+
+Simple latency probe.
+
+**Payload:** `{}` or `{"ts": timestamp}`
+
+**Returns:** `{"pong": true, "ts": <original ts>}`
+
+---
+
+#### `mcp_connected`
+
+Client notifies the server that the user has completed an MCP OAuth connection (e.g. after the OAuth redirect lands back on the frontend). This is an **undocumented internal event** used by the frontend MCP connect flow.
+
+**Payload:**
+
+<ParamField body="toolkit" type="str" required>Toolkit slug that was just connected (e.g. `"github"`).</ParamField>
+<ParamField body="connection_id" type="str">Composio connection ID.</ParamField>
+
+**Effects:** Triggers `reconcile_pending_connections` to update connection status in the DB and wake any hibernated agent awaiting the OAuth result.
+
+---
+
+### Outbound Events (Server → Browser)
+
+All outbound events are delivered via `send_to_user(user_id, event, payload)`.
+
+#### Durable Delivery
+
+`send_to_user` implements at-least-once delivery:
+
+1. Emit to all SIDs for the user (multi-tab fan-out).
+2. If `is_persistent=True`: persist to Redis with 1-hour TTL before emitting.
+3. On user re-connect: `_deliver_pending_notifications` replays unACKed persistent notifications.
+4. Client calls `notification_ack` to dequeue.
+5. For cross-pod delivery: `AsyncRedisManager` pub/sub ensures the event reaches the correct pod.
+
+---
+
+#### `display_message`
+
+**Primary unified event** replacing legacy `agent_response` and `ui_meta_update`. Emitted via `emit_display_message(user_id, display_msg)`.
+
+**Payload:**
+```json
+{
+  "message_id": "uuid",
+  "session_id": "uuid",
+  "type": "agent_step | ask_human | plan | result | ...",
+  "content": "text",
+  "role": "assistant | system",
+  "meta_data": {...},
+  "timestamp": "ISO-8601",
+  "is_persistent": false
+}
+```
+
+**Durable flag:** `is_persistent=True` activates Redis-backed replay.
+
+---
+
+#### `agent_response` (legacy)
+
+Preserved for backward compatibility. New code uses `display_message`.
+
+**Helper:** `send_agent_response(user_id, session_id, message)`.
+
+---
+
+#### `ui_meta_update` (legacy)
+
+Agent step progress updates. New code uses `display_message`.
+
+**Helper:** `send_ui_meta_update(user_id, session_id, payload)`.
+
+---
+
+#### `task_progress`
+
+Task lifecycle progress (queued → processing → done).
+
+**Helper:** `send_task_progress(user_id, task_id, status, progress)`.
+
+**Payload:**
+```json
+{"task_id": "uuid", "status": "processing", "progress": 0.5}
+```
+
+---
+
+#### `device_status_update`
+
+Device online/offline/busy status change.
+
+**Helper:** `send_device_status_update(user_id, device_id, status)`.
+
+**Payload:**
+```json
+{"device_id": "uuid", "status": "online"}
+```
+
+---
+
+#### `cloud_pc_status`
+
+Cloud PC lifecycle state change (starting/active/paused/terminated).
+
+**Helper:** `send_cloud_pc_status(user_id, cloud_pc_id, status, meta)`.
+
+**Payload:**
+```json
+{
+  "cloud_pc_id": "uuid",
+  "status": "active",
+  "is_snapshot": false,
+  "meta": {...}
+}
+```
+
+`is_snapshot=true` is set during `_replay_cloud_pc_state` on connect.
+
+---
+
+#### `cloud_pc_control_changed`
+
+Emitted when a user gains or loses active Cloud PC control (e.g. another session takes control).
+
+**Helper:** `send_cloud_pc_control_changed(user_id, cloud_pc_id, controlled_by_session_id)`.
+
+---
+
+#### `admin_notification`
+
+Persistent notification delivered to the user's notification bell. Stored in DB (`AdminNotification` / `UserNotification` models).
+
+**Helper:** `send_admin_notification(user_id, notification_dict)`.
+
+**Payload:**
+```json
+{
+  "id": "uuid",
+  "notification_id": "uuid",
+  "title": "str",
+  "message": "str",
+  "category": "updates | alerts | ...",
+  "icon": "info | warning | ...",
+  "created_at": "ISO-8601"
+}
+```
+
+---
+
+#### `session_created / session_updated / session_deleted / session_restored`
+
+Session lifecycle events (see [Session Service](/reference/backend/session-service)).
+
+---
+
+#### `scheduled_session_created`
+
+Emitted when a trigger-driven agent auto-creates a session on the first message. Prompts the frontend to reload the session list.
+
+**Payload:** `{"session_id": "uuid"}`
+
+---
+
+#### `attachments_ready`
+
+Emitted after S3 upload of agent-emitted files completes. Contains S3-backed attachment URLs.
+
+**Payload:**
+```json
+{
+  "session_id": "uuid",
+  "message_id": "uuid",
+  "attachments": [{"url": "...", "filename": "...", "size": 0}]
+}
+```
+
+---
+
+### External Helper Functions
+
+| Function | Description |
+|---|---|
+| `send_to_user(user_id, event, data, is_persistent)` | Multi-tab fan-out with optional durable delivery |
+| `emit_display_message(user_id, display_msg)` | New unified display event |
+| `send_agent_response(user_id, session_id, message)` | Legacy agent response |
+| `send_ui_meta_update(user_id, session_id, payload)` | Legacy UI meta update |
+| `send_task_progress(user_id, task_id, status, progress)` | Task progress notification |
+| `send_device_status_update(user_id, device_id, status)` | Device status change |
+| `send_cloud_pc_status(user_id, cloud_pc_id, status, meta)` | Cloud PC state push |
+| `send_cloud_pc_control_changed(user_id, cloud_pc_id, session_id)` | Cloud PC control change |
+| `send_admin_notification(user_id, notification_dict)` | Persistent notification |
+| `is_user_connected(user_id)` | Local check (this pod only) |
+| `get_connected_users()` | All user IDs with active connections on this pod |
+
+---
+
+## /agent Namespace
+
+### Authentication
+
+On `connect`, the namespace reads:
+
+- `auth.token` — must exactly match `AGENT_API_TOKEN` environment variable
+- `auth.agent_id` — identifier for the BrokerAgent process
+
+**Timing-safe comparison:** `secrets.compare_digest(auth_token, AGENT_API_TOKEN)` prevents timing-based token enumeration.
+
+After authentication:
+1. Register SID → agent_id in `AgentConnectionManager`.
+2. Join room `agent:{agent_id}` for direct targeting.
+3. **Restore subscriptions**: check in-memory store first, then Redis fallback (`ws:agent:subs:{agent_id}`, TTL=300s). Re-join corresponding resource rooms without re-validating.
+4. Emit `connected` event back to agent with `available_methods` list and `agent_id`.
+
+On `disconnect`:
+1. Unregister from in-memory + Redis.
+2. Clean up session locks for subscribed sessions: call `CloudPCAccessManager.release()` + `unlock_session()` fallback. Prevents 10-minute stale lock after an agent pod restart.
+
+---
+
+### Inbound Events (Agent → Server)
+
+#### `heartbeat`
+
+<ParamField body="agent_id" type="str">Agent identifier (for subscription TTL refresh).</ParamField>
+
+**Effects:**
+1. Refreshes subscription TTL in Redis (300s).
+2. For device subscriptions: calls `_refresh_cloud_pc_activity` to record that a Cloud PC session is still active, preventing idle-timeout.
+
+**Returns:** `{"status": "ok", "subscriptions": ["device:uuid", ...]}`
+
+---
+
+#### `subscribe`
+
+Subscribe the agent to events for a device or session resource.
+
+**Payload:**
+
+<ParamField body="resource_type" type="str" required>`"device"` or `"session"`.</ParamField>
+<ParamField body="resource_id" type="str" required>UUID of the device or session.</ParamField>
+
+**Validation:**
+- For `device`: verify device exists in DB. Special case: `resource_id="chat-only"` is allowed (sessions without device binding).
+- For `session`: verify session exists.
+- On validation error: **fails open** — subscription is registered anyway to avoid agent stalls on transient DB errors.
+
+**Effects:**
+1. Add to in-memory `_subscriptions[agent_id]`.
+2. Persist to Redis (key: `ws:agent:subs:{agent_id}`, TTL=300s).
+3. Join Socket.IO room `resource:{resource_id}`.
+
+**Returns:** `{"status": "subscribed", "resource": "device:uuid"}`
+
+---
+
+#### `unsubscribe`
+
+**Payload:**
+
+<ParamField body="resource_type" type="str" required>`"device"` or `"session"`.</ParamField>
+<ParamField body="resource_id" type="str" required>UUID to unsubscribe from.</ParamField>
+
+**Effects:** Remove from in-memory + Redis; leave room `resource:{resource_id}`.
+
+---
+
+#### `execute_action`
+
+Agent delegates a device action to the backend for execution.
+
+**Payload:**
+
+<ParamField body="device_id" type="str" required>Target device UUID.</ParamField>
+<ParamField body="action" type="str" required>Action type (click, type, key, screenshot, command, etc.).</ParamField>
+<ParamField body="parameters" type="dict">Action-specific parameters.</ParamField>
+<ParamField body="action_id" type="str">Caller-supplied idempotency ID.</ParamField>
+
+**Behavior:**
+1. Verify agent is subscribed to the device. If not: auto-subscribe (fail-open) and log a warning.
+2. Delegate to `execute_device_action_internal`.
+3. Enrich result with `device_id` and `action_id`.
+
+**Returns:** `{"success": bool, "result": {...}, "device_id": str, "action_id": str}`
+
+---
+
+#### `get_device_status`
+
+**Payload:**
+
+<ParamField body="device_id" type="str" required>Device UUID to check.</ParamField>
+
+**Returns:** `{"device_id": str, "connected": bool, "status": str}`
+
+**Fallback order:**
+1. Socket.IO in-memory check (local pod).
+2. Redis distributed check.
+3. DB lookup for `E2B_SANDBOX` devices (never have a Socket.IO connection).
+
+---
+
+#### `get_presigned_upload_url`
+
+Agent requests an S3 presigned URL for file upload.
+
+**Payload:**
+
+<ParamField body="filename" type="str" required>Target filename.</ParamField>
+<ParamField body="content_type" type="str">MIME type.</ParamField>
+
+**Returns:** `{"url": str, "key": str}`
+
+---
+
+#### `ui_meta_update`
+
+Agent sends a UI step/progress update to the user.
+
+**Payload:**
+
+<ParamField body="user_id" type="str" required>Target user UUID.</ParamField>
+<ParamField body="session_id" type="str">Session UUID (used for DB persistence and ownership check).</ParamField>
+<ParamField body="payload" type="dict" required>UI meta payload (mode, status, title, detail, stage, task_group_id, etc.).</ParamField>
+
+**Processing:**
+1. Verify `session.user_id == user_id` (if session provided).
+2. Transform via `DisplayTransformer.transform_ui_meta()` or `transform_plan_update()`.
+3. Emit `display_message` to user immediately (real-time delivery).
+4. **Fire-and-forget**: persist to `chat_messages` (role=system, type=ui_meta_update) for page-refresh recovery. Special persistence paths for `ask_human`, `mcp_connect_prompt`, and `start_cloud_pc_prompt` modes (role=assistant, type=ask_human).
+
+**Special modes persisted as `ask_human`:**
+- `mode=ask_human, stage=input` — inline user input/confirmation form
+- `mode=mcp_connect_prompt` — OAuth connection required prompt
+- `mode=start_cloud_pc_prompt` — Cloud Desktop required prompt
+
+**UUID guard:** `message_id_override` is validated as a real UUID before being set as the DB row's primary key. Non-UUID IDs (LLM hallucinations like `"gmail_connection_confirm"`) are rejected and a DB-generated UUID is used instead.
+
+**Returns:** `{"status": "sent" | "user_offline"}`
+
+---
+
+#### `new_message`
+
+Agent sends a final or intermediate assistant message to be saved and forwarded to the user.
+
+**Payload:**
+
+<ParamField body="user_id" type="str" required>Target user UUID.</ParamField>
+<ParamField body="session_id" type="str" required>Session UUID.</ParamField>
+<ParamField body="message" type="dict" required>Message object with `content`, `role`, and optional `meta_data`.</ParamField>
+
+**Processing:**
+1. Verify session ownership (`session.user_id == user_id`).
+2. **Auto-create trigger sessions**: if `session_id` starts with `"trigger_"` and the session doesn't exist, create it with a descriptive title derived from `TriggerConfiguration`. Emit `scheduled_session_created` + persistent `admin_notification`.
+3. **Idempotency**: skip saving if identical content was saved in the last 60 seconds (dedup window `_DEDUP_WINDOW_SECONDS=60`) or if a backend-terminal message already exists for the session.
+4. Sanitize content: strip sandbox URLs (`strip_sandbox_urls`), strip internal agent names (`sanitize_agent_names`).
+5. **Attachment pipeline** (synchronous if `emitted_files` present): upload files to S3 via `AttachmentPipeline`. If upload fails: strip `emitted_files` from meta, set `error_code=attachment_publish_failed`; only set `status=error` if message was already terminal (prevents premature device unlock).
+6. Persist to `chat_messages` (role=assistant).
+7. Emit `display_message` to user via `emit_display_message`.
+8. **Terminal cleanup**: if `meta_data.status` in (`completed`, `error`, `cancelled`): call `finalize_agent_response()` to unlock session/device, release Cloud PC control, and signal device task completion.
+
+**Returns:** `{"status": "sent" | "user_offline", "message_id": "uuid"}`
+
+---
+
+#### `trigger_step`
+
+Agent reports execution results for a trigger-driven task. Updates the `TriggerEvent` DB row.
+
+**Payload:**
+
+<ParamField body="trigger_event_id" type="str" required>ID of the `TriggerEvent` to update.</ParamField>
+<ParamField body="status" type="str">Execution status. Default: `"completed"`.</ParamField>
+<ParamField body="agent_reasoning" type="str">LLM reasoning text (logged for audit).</ParamField>
+<ParamField body="tools_used" type="list">List of tool names used during execution.</ParamField>
+<ParamField body="actions_taken" type="list">List of actions performed.</ParamField>
+<ParamField body="error_message" type="str">Error message if status is not completed.</ParamField>
+
+**Returns:** `{"status": "ok"}` or `{"status": "error", "message": str}`
+
+---
+
+### Outbound Events (Server → Agent)
+
+All agent-bound events use the envelope:
+
+```json
+{
+  "event_type": "device_status_changed | action_result | confirmation_response | user_followup | user_cancel | agent_pause | task_completed | task_failed",
+  "data": {...},
+  "timestamp": "ISO-8601"
+}
+```
+
+Sent as a Socket.IO `event` message.
+
+---
+
+#### `event` — `device_status_changed`
+
+Broadcast to all agents subscribed to the device via `resource:{device_id}` room.
+
+**Data:**
+```json
+{"device_id": "uuid", "status": "online | offline | busy", "user_id": "uuid"}
+```
+
+---
+
+#### `event` — `action_result`
+
+Result of a device action execution. Targeted to specific agent or broadcast to subscribers.
+
+**Data:**
+```json
+{"device_id": "uuid", "action_id": "str", "result": {...}}
+```
+
+---
+
+#### `event` — `confirmation_response`
+
+User's response to an `ask_human` confirmation prompt.
+
+**Data:**
+```json
+{"session_id": "uuid", "action_id": "str", "response": {...}}
+```
+
+---
+
+#### `event` — `user_followup`
+
+Broadcast to ALL agents: user sent a new message while an agent task is running. Each BrokerAgent self-filters by `session_id`.
+
+**Data:**
+```json
+{"session_id": "uuid", "content": "text", "message_id": "uuid"}
+```
+
+---
+
+#### `event` — `user_cancel`
+
+Broadcast to ALL agents: user cancelled a running or hibernated task. Wakes hibernated agents so they can exit via the standard cancellation path.
+
+**Data:**
+```json
+{"session_id": "uuid", "reason": "User cancelled"}
+```
+
+---
+
+#### `event` — `agent_pause`
+
+Broadcast to ALL agents: pause signal for a session.
+
+**Data:**
+```json
+{"session_id": "uuid"}
+```
+
+---
+
+### External Helper Functions
+
+| Function | Description |
+|---|---|
+| `send_to_agent(agent_id, event, data)` | Direct to agent (SID first, room fallback) |
+| `send_event_to_agent(agent_id, event_type, data)` | Typed event wrapper |
+| `send_user_followup(session_id, content, message_id)` | Broadcast user message to all agents |
+| `send_user_cancel(session_id, reason)` | Broadcast cancel to all agents |
+| `send_agent_pause(session_id)` | Broadcast pause to all agents |
+| `broadcast_to_resource_subscribers(resource_id, event_type, data)` | Room-based broadcast |
+| `notify_device_status_changed(device_id, status, user_id)` | Status change broadcast to subscribers |
+| `notify_action_result(device_id, action_id, result, agent_id)` | Action result (direct or broadcast) |
+| `send_event_to_user_agents(user_id, event_type, data)` | Broadcast event, agents filter by user_id |
+| `is_agent_connected(agent_id)` | Local in-memory check |
+| `get_connected_agents()` | List of agent IDs on this pod |
+
+---
+
+## Socket.IO Managers (`app/socketio/managers.py`)
+
+High-level facades over the low-level namespace functions. Services and routers import these singletons rather than calling namespace functions directly. Three singletons are created at module import time: `socketio_device_manager`, `socketio_user_manager`, `socketio_agent_manager`.
+
+All managers call `redis_init.ensure_initialized()` on `initialize_redis()` — but initialization is idempotent and only needs to happen once at startup.
+
+---
+
+### SocketIODeviceManager
+
+Sends commands to OSWorld/Cloud-PC devices and queries connection state.
+
+| Method | Description |
+|---|---|
+| `initialize_redis()` | Initialize Redis for distributed connection tracking |
+| `send_to_device(device_id, event, data) → bool` | Low-level: send any event to device by ID |
+| `send_execute_task(device_id, task_id, command, payload) → bool` | Emit `execute_task` with timestamp |
+| `send_desktop_execute(device_id, action_type, parameters, action_id, task_id) → bool` | Emit `desktop_env_execute`; generates `action_id` via `uuid4()` if not provided |
+| `send_task_cancelled(device_id, task_id) → bool` | Emit `task_cancelled` signal |
+| `is_device_connected(device_id) → bool` | Check local in-process Socket.IO connections only |
+| `is_device_connected_distributed(device_id) → bool` | Check local first, then Redis registry; falls back gracefully if Redis unavailable |
+| `get_connected_devices(user_id=None) → list[str]` | All connected device IDs; filters by owner `user_id` if provided via `DeviceConnectionManager.get_devices_for_user()` |
+
+**Routing:** `send_to_device` delegates to `device_namespace.send_to_device()` which emits on the `/device` namespace room `device:{device_id}`.
+
+---
+
+### SocketIOUserManager
+
+Delivers notifications to frontend users with **durable delivery** via Redis.
+
+| Method | Description |
+|---|---|
+| `initialize_redis()` | Initialize Redis for distributed tracking and durable delivery |
+| `send_notification(user_id, notification_type, data, persist=True) → bool` | General notification; `persist=True` stores in Redis for offline users |
+| `send_agent_response(user_id, message_data) → bool` | Agent reply message |
+| `send_ui_meta_update(user_id, payload, session_id=None) → bool` | Step progress, task state transitions |
+| `send_task_progress(user_id, progress_data) → bool` | Task lifecycle progress event |
+| `send_device_status_update(user_id, device_id, connection_status, device_name, last_seen) → bool` | Device online/offline push |
+| `send_admin_notification(user_id, notification) → bool` | Persistent admin notification bell |
+| `is_user_connected(user_id) → bool` | Local in-process check |
+| `is_user_connected_distributed(user_id) → bool` | Local + Redis check |
+| `get_connected_users() → list[str]` | All user IDs connected on this pod |
+
+---
+
+### SocketIOAgentManager
+
+Delivers events to BrokerAgent instances and manages resource subscriptions.
+
+| Method | Description |
+|---|---|
+| `initialize_redis()` | Initialize Redis for distributed agent tracking |
+| `send_event(agent_id, event_type, data) → bool` | Direct event to one agent |
+| `broadcast_to_subscribers(resource_id, event_type, data)` | Broadcast to all agents subscribed to `resource_id` (device or session) |
+| `notify_device_status(device_id, status, user_id=None)` | Notify subscribed agents of device online/offline |
+| `notify_action_result(device_id, action_id, result, agent_id=None)` | Deliver action result; direct if `agent_id` provided, else broadcast |
+| `is_agent_connected(agent_id) → bool` | Local in-process check |
+| `get_connected_agents() → list[str]` | All agent IDs connected on this pod |
+
+---
+
+## Connection Managers
+
+### ConnectionMap (base class)
+
+`app/socketio/connection_manager.py`
+
+Bidirectional dict (SID ↔ entity_id) with `asyncio.Lock` protection. All mutations are atomic.
+
+**Key methods:** `register(sid, entity_id)`, `unregister_by_sid(sid)`, `get_entity(sid)`, `get_sid(entity_id)`, `is_connected(entity_id)`, `get_all_ids()`.
+
+**Redis timeout:** All Redis operations are wrapped with `asyncio.wait_for(timeout=2.0s)` to prevent blocking the event loop on Redis unavailability.
+
+---
+
+### DeviceConnectionManager
+
+Extends `ConnectionMap`. Adds `_sid_to_user` dict.
+
+**Extra methods:** `get_devices_for_user(user_id)`, `get_unique_user_ids()`.
+
+---
+
+### UserConnectionManager
+
+**NOT a subclass** of ConnectionMap (1-to-many relationship). `_entity_to_sid` is `Dict[str, Set[str]]`.
+
+**Extra methods:** `get_sids(user_id)` → `Set[str]` (fan-out to all tabs), `get_all_user_ids()`.
+
+---
+
+### AgentConnectionManager
+
+Extends `ConnectionMap`. Adds `_subscriptions: Dict[str, Set[str]]` with Redis persistence.
+
+**Redis key:** `ws:agent:subs:{agent_id}`, TTL=300s (refreshed on heartbeat).
+
+**Subscription methods:**
+- `add_subscription(agent_id, resource)` — in-memory + Redis
+- `remove_subscription(agent_id, resource)` — in-memory + Redis
+- `get_subscriptions(agent_id)` — returns set
+- `is_subscribed(agent_id, resource)` — checks in-memory first; if missing, checks Redis + backfills memory
+
+**Reconnect safety:** On agent reconnect, subscriptions survive if they exist in Redis, without requiring re-subscription from the agent.
+
+---
+
+### RedisInitializer
+
+Manages deferred Redis setup with double-checked locking. Delegates to `websocket_manager.initialize_redis()`. Called once at startup after the event loop is running.
+
+---
+
+## Events Reference
+
+### AgentEventType Enum
+
+| Value | Description |
+|---|---|
+| `CONNECTED` | Welcome event after auth |
+| `DEVICE_STATUS_CHANGED` | Device online/offline |
+| `ACTION_RESULT` | Device action outcome |
+| `CONFIRMATION_RESPONSE` | User reply to ask_human |
+| `USER_FOLLOWUP` | User sent follow-up message |
+| `AGENT_PAUSE` | Pause signal |
+| `TASK_COMPLETED` | Task terminal success |
+| `TASK_FAILED` | Task terminal failure |
+
+### UserEventName Enum
+
+| Value | Description |
+|---|---|
+| `AGENT_RESPONSE` | Legacy assistant message |
+| `UI_META_UPDATE` | Legacy step progress |
+| `TASK_PROGRESS` | Task lifecycle progress |
+| `DEVICE_STATUS_UPDATE` | Device status push |
+| `ADMIN_NOTIFICATION` | Persistent notification bell |
+| `CLOUD_PC_STATUS_CHANGED` | Cloud PC lifecycle |
+| `CLOUD_PC_CONTROL_CHANGED` | Cloud PC control handover |
+| `ATTACHMENTS_READY` | S3 file upload complete |
+| `NEW_MESSAGE` | New chat message (legacy alias) |
+
+### DeviceEventName Enum
+
+| Value | Description |
+|---|---|
+| `EXECUTE_TASK` | Task execution command |
+| `DESKTOP_ENV_EXECUTE` | Durable desktop command |
+| `TASK_CANCELLED` | Cancel signal |
+| `TASK_COMPLETED` | Task complete notification |
+

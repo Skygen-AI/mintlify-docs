@@ -1,0 +1,864 @@
+---
+title: "Zustand Store Reference"
+description: "Complete reference for all 13 slice files in the Skygen Zustand store — state shape, initial values, every action, and usage patterns."
+---
+
+# Zustand Store Reference
+
+The Skygen frontend uses a single **Zustand** store composed of **11 live domain slices**. All slices are merged at creation time via `devtools` middleware. The store is inspectable in Redux DevTools under the name `SkygenStore`.
+
+```typescript
+// store/useStore.ts
+import { useStore } from 'store/useStore';
+
+// Reading state
+const user = useStore((s) => s.user);
+const sessions = useStore((s) => s.sessions);
+
+// Calling an action
+const { login, logout } = useStore();
+
+// Outside React (event handlers, WS callbacks)
+const state = useStore.getState();
+state.addMessage(sessionId, message);
+```
+
+The combined store type is:
+```typescript
+type Store = AuthSlice & SessionSlice & MessageSlice & LiveStateSlice
+  & DeviceSlice & BillingSlice & UISlice & NotificationsSlice
+  & HelpdeskSlice & CloudPcSlice & ScheduledTasksSlice;
+```
+
+<Warning>
+Two additional slice files exist in `store/slices/` — `messageStreamSlice.ts` and `messagePlanSlice.ts` — but they are **not** spread into `useStore.ts` and are dead code. Their functionality was merged into `liveStateSlice`. Do not import from these files. See the [Dead Slices](#dead-slices) section at the bottom.
+</Warning>
+
+---
+
+## authSlice (`store/slices/authSlice.ts`)
+
+### State
+
+```typescript
+user: User | null                  // Authenticated user object from /users/me
+isLoading: boolean                 // true during restoreSession, login, signup (initial: true)
+isAuthenticated: boolean           // Optimistically true if auth_token exists in localStorage at module load
+needsOTPSetup: boolean             // true when user.otp_secret is falsy (initial: false)
+_isLoggingOut: boolean             // Guards restoreSession() against concurrent logout (initial: false)
+```
+
+**Token check at module load time:**
+```typescript
+// Runs synchronously before React renders — prevents login-page flash on reload
+const tokenExists = hasAuthToken(); // reads localStorage.getItem('auth_token')
+// isAuthenticated is initialized to tokenExists (not false)
+```
+
+<Warning>
+`needsOTPSetup` is computed as `!user.otp_secret`, but `otp_secret` is not sent by the backend `UserRead` schema in all environments. Do not rely on this field until the backend contract is confirmed for your deployment.
+</Warning>
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `login` | `(email: string, password: string) => Promise<void>` | POST /auth/token → sets user, sets auth cookie, calls `setPaywallTrigger('login')`, connects `wsClient` + device WebSocket. Throws on error. |
+| `signup` | `(email: string, password: string, displayName?: string, meta?: Record<string, string>) => Promise<void>` | POST /auth/register → atomic login (sets user, connects WS). Sets `needsOTPSetup: true`, calls `setPaywallTrigger('signup')`. |
+| `logout` | `() => Promise<void>` | Stops device WS, disconnects wsClient, removes auth cookie, stops Cloud PC side-effects, POSTs /auth/logout, resets all per-user state across all slices. |
+| `refreshUser` | `() => Promise<void>` | Re-fetches /users/me. If it fails, calls `logout()`. |
+| `restoreSession` | `() => Promise<boolean>` | On app mount: calls `authApi.upgradeSession()` (cookie migration), then GET /users/me. Returns `true` on success, `false` on auth error. Network errors keep the optimistic authenticated state with a 3s retry. |
+| `setNeedsOTPSetup` | `(needsSetup: boolean) => void` | Manually sets the 2FA setup flag. |
+
+<Warning>
+`logout()` spreads `...initialCloudPcState` to reset the Cloud PC slice. Any new per-user fields added to any slice must also be reset inside `logout()` — otherwise state leaks across user sessions.
+</Warning>
+
+---
+
+## sessionSlice (`store/slices/sessionSlice.ts`)
+
+### State
+
+```typescript
+sessions: Session[]               // All chat sessions for the user (initial: [])
+activeSessionId: string | null    // Currently open session ID (initial: null)
+isSessionsLoading: boolean        // (initial: false)
+sessionsLoaded: boolean           // Idempotency guard — prevents duplicate loads (initial: false)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `setSessions` | `(sessions: Session[]) => void` | Directly replaces the sessions array and sets `sessionsLoaded: true`. |
+| `loadSessions` | `() => Promise<void>` | GET /sessions. Skips if `sessionsLoaded \|\| isSessionsLoading`. Does NOT set `sessionsLoaded` on error (allows retry). |
+| `reloadSessions` | `() => Promise<void>` | Force-reloads: resets `sessionsLoaded: false`, then loads unconditionally. |
+| `createSession` | `(deviceId: string \| null, title: string) => Promise<Session>` | POST /sessions. Prepends to list, sets as active. |
+| `setActiveSession` | `(sessionId: string \| null) => void` | Sets `activeSessionId`. Does not trigger message load. |
+| `deleteSession` | `(sessionId: string) => Promise<void>` | DELETE /sessions/{id}. Removes from list, clears `activeSessionId` if it matches. |
+| `closeSession` | `(sessionId: string) => Promise<void>` | Closes (soft-finalizes) a session without deleting it. Updates the session in the list from the server response. |
+| `updateSession` | `(sessionId: string, updates: Partial<Session>) => Promise<void>` | Optimistic update + PATCH /sessions/{id} (currently only `title`). Reloads full list on failure to revert. |
+| `getActiveSession` | `() => Session \| null` | Derived getter — finds session by `activeSessionId` in the `sessions` array. |
+
+---
+
+## messageSlice (`store/slices/messageSlice.ts`)
+
+### State
+
+```typescript
+messagesBySession: Record<string, Message[]>   // Per-session message arrays (initial: {})
+isLoadingMessages: boolean                     // (initial: false)
+_sendingSessionIds: Set<string>               // In-flight guard per session (prevents double-submit) (initial: new Set())
+```
+
+### Exported Types
+
+```typescript
+interface McpConnectPromptData {
+  providers: Array<{
+    toolkit_slug: string;
+    display_name: string;
+    connect_endpoint: string;
+  }>;
+  bundles?: Array<{
+    bundle_name: string;
+    providers: string[];
+    reason: string;
+    connect_endpoints: Array<{ toolkit_slug: string; connect_endpoint: string }>;
+  }>;
+}
+```
+
+### Actions
+
+#### `loadMessages(sessionId: string) => Promise<void>`
+
+Race-safe via per-session monotonic counter — newer calls supersede older in-flight ones.
+
+- Merges server messages with local-only messages (ask_human prompts, pending optimistic messages)
+- Preserves `display_type` and `render_data` from the store when the server omits them
+- After loading: fetches plan via `sessionApi.getPlan()` unless a task is currently active with a live plan
+- Clears live plan and steps if the session already has a frozen terminal plan (handles page reload after task completion)
+
+#### `sendMessage(sessionId, content, otpCode?, deviceId?, isSandbox?, agentMode?, metaData?) => Promise<SendMessageResult>`
+
+- Guards double-submission via `_sendingSessionIds` Set
+- Detects follow-up messages (active task) — skips clearing steps/plan for follow-ups
+- Creates an optimistic `temp-{timestamp}` user message immediately
+- On success: replaces the temp message with the real server response
+- On `payment_required + free_limit_reached`: injects a `billing_notification` system message and opens the paywall
+- Pushes GTM events: `task_created` (fresh tasks only), `message_sent`
+- Returns `SendMessageResult` — never throws
+
+#### `addMessage(sessionId: string, message: Message) => void`
+
+Deduplication logic (evaluated in order):
+1. Skip if `message.id` is already in the session's message array
+2. Skip recent assistant duplicates by content (within 60-second window)
+3. Replace matching `temp-{id}` user message (preserves `files` metadata on the temp entry)
+4. Replace optimistic `cancelled-` assistant message with the real response
+5. Appends and re-sorts by timestamp to maintain chronological order
+
+#### `updateMessage(sessionId: string, messageId: string, updates: Partial<Message>) => void`
+
+In-place update for an existing message.
+
+#### `cancelTask(sessionId: string, deviceId?: string, reason?: string) => Promise<void>`
+
+- POST /agent/task/cancel
+- Finalizes live state: clears typing, task status (`cancelled`), agent steps, uiMeta
+- Clears `waiting_for_input` on the session
+- Inserts an optimistic "Task was cancelled by user." assistant message with `display_type: 'cancelled_message'`
+
+#### `getMessages(sessionId: string) => Message[]`
+
+Synchronous getter — returns `messagesBySession[sessionId] ?? []`.
+
+#### `removeMessage(sessionId: string, messageId: string) => void`
+
+Removes a specific message by ID (used by the `message_deleted` WebSocket event).
+
+#### `clearSessionMessages(sessionId: string) => void`
+
+Removes all messages for a session from the store.
+
+---
+
+## liveStateSlice (`store/slices/liveStateSlice.ts`)
+
+Manages all ephemeral real-time state driven by WebSocket events. Does not persist across page reloads.
+
+### State
+
+```typescript
+typingBySession: Record<string, boolean>                              // (initial: {})
+taskStatusBySession: Record<string, TaskStatus>                       // (initial: {})
+taskStartedAtBySession: Record<string, number>                        // epoch ms, drives elapsed timer (initial: {})
+uiMetaBySession: Record<string, UiMetaUpdatePayload | null>           // (initial: {})
+agentStepsBySession: Record<string, AgentStep[]>                      // (initial: {})
+agentStepsByPlanStep: Record<string, Record<string, AgentStep[]>>     // indexed for fast plan step lookup (initial: {})
+planBySession: Record<string, PlanPayload | null>                     // (initial: {})
+frozenPlanByMessageId: Record<string, FrozenPlanSnapshot>             // snapshots at task completion (initial: {})
+```
+
+### Exported Types and Constants
+
+```typescript
+interface TaskStatus {
+  isActive: boolean;
+  progress?: number;
+  currentStep?: number;
+  totalSteps?: number;
+  description?: string;
+  status?: string;
+  subAgentCount?: number;
+}
+
+interface AgentStep {
+  id: string;
+  payload: UiMetaUpdatePayload;
+  timestamp: string;
+  plan_step_id?: string;    // correlated to plan; undefined for orphan steps
+}
+
+interface FrozenPlanSnapshot {
+  plan: PlanPayload | null;
+  agentSteps: AgentStep[];
+  agentStepsByPlanStep: Record<string, AgentStep[]>;
+}
+
+interface SessionBlockedState {
+  blocked: boolean;
+  errorCode?: DispatchFailureErrorCode;
+  activeSessionId?: string;
+  deviceId?: string;
+}
+
+interface CloudPcLiveContext {
+  cloudPCList?: Array<{ cloud_pc_id: string; status: string; is_agent_active: boolean }>;
+  cloudPcBySession?: Record<string, { cloudPcId: string | null }>;
+  currentSessionId?: string;
+}
+
+const TERMINAL_TASK_STATUSES = ['completed', 'finished', 'idle', 'done', 'error', 'cancelled', 'paused', 'stopped'] as const;
+
+const DISPATCH_FAILURE_ERROR_CODES = ['device_busy', 'cloud_pc_in_another_session', 'cloud_pc_not_ready'] as const;
+type DispatchFailureErrorCode = typeof DISPATCH_FAILURE_ERROR_CODES[number];
+
+const DISPATCH_RECOVERED_META_TYPE = 'dispatch_recovered';
+```
+
+### Exported Helper Functions
+
+```typescript
+// Returns true when status is in TERMINAL_TASK_STATUSES
+isTerminalTaskStatus(status: string | undefined | null): boolean
+
+// A session is sealed when isActive===false AND status is terminal.
+// Sealed sessions reject stale late-arriving WebSocket events.
+isSessionSealed(status: TaskStatus | undefined): boolean
+
+// Pure function — scans messages from the end to find if the latest system
+// message is a dispatch failure (device_busy / cloud_pc_*) with no recovery
+// message since. Used to drive blocked-state UI.
+isSessionBlockedByDispatchFailure(
+  messages: Message[] | undefined,
+  cloudPcContext?: CloudPcLiveContext
+): SessionBlockedState
+
+// Assigns plan_step_id to orphan agent steps (mutates in place).
+correlateOrphanSteps(
+  orphanSteps: AgentStep[],
+  planSteps: PlanStep[],
+  activeStepId?: string
+): void
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `setTyping` | `(sessionId: string, isTyping: boolean) => void` | Updates `typingBySession`. |
+| `setTaskStatus` | `(sessionId: string, status: TaskStatus) => void` | Updates `taskStatusBySession`. Auto-manages `taskStartedAtBySession`: sets epoch on `isActive` becoming true (if not already set), deletes it on `isActive` becoming false. |
+| `setTaskStartedAt` | `(sessionId: string, ts: number \| null) => void` | Manually seeds the elapsed timer anchor. Pass `null` to clear. |
+| `updateTaskProgress` | `(sessionId: string, progress: TaskProgressParams) => void` | Maps `TaskProgressParams` fields onto `TaskStatus`. |
+| `setUiMeta` | `(sessionId: string, payload: UiMetaUpdatePayload \| null) => void` | Replaces the current ui_meta payload for the session. |
+| `addAgentStep` | `(sessionId: string, payload: UiMetaUpdatePayload, timestamp: string) => void` | Adds or deduplicates an agent step. Primary dedup by `step_id`; fallback MCP dedup by `(tool, status)` for legacy steps. Auto-correlates to active plan step. |
+| `clearAgentSteps` | `(sessionId: string) => void` | Empties both `agentStepsBySession` and `agentStepsByPlanStep` for the session. |
+| `setPlan` | `(sessionId: string, payload: PlanPayload \| null) => void` | Updates the plan. Rejects payloads with lower `plan_version` than current. Auto-correlates existing orphan steps to plan steps. |
+| `clearPlan` | `(sessionId: string) => void` | Sets `planBySession[sessionId]` to `null`. |
+| `finalizePlan` | `(sessionId: string, finalStatus: 'completed' \| 'error') => void` | Marks all non-terminal plan steps as `completed` or `error`. Skips already-`completed`/`skipped` steps. |
+| `completeAllSteps` | `(sessionId: string, finalStatus?: 'completed' \| 'error') => void` | Sets all agent steps' `payload.status` to `finalStatus` (default `'completed'`). Updates both `agentStepsBySession` and `agentStepsByPlanStep`. |
+| `freezePlanForMessage` | `(sessionId: string, messageId: string) => void` | Snapshots `{ plan, agentSteps, agentStepsByPlanStep }` into `frozenPlanByMessageId[messageId]`. Idempotent — skips if entry already exists. Skips if both plan and steps are empty. |
+
+### Session Seal Concept
+
+A session is "sealed" when `taskStatus.isActive === false` AND `taskStatus.status` is a terminal value. Sealed sessions reject stale in-flight WebSocket events.
+
+```typescript
+import { isSessionSealed } from 'store/slices/liveStateSlice';
+
+const status = useStore.getState().taskStatusBySession[sessionId];
+if (isSessionSealed(status)) return; // Drop stale event
+```
+
+The seal is broken when `sendMessage()` sets `isActive: true` for the next user message, or when `unsealSession()` fires on a `user_message` display_message event (covers scheduled tasks and cross-device sends).
+
+---
+
+## deviceSlice (`store/slices/deviceSlice.ts`)
+
+### State
+
+```typescript
+devices: Device[]              // (initial: [])
+selectedDeviceId: string | null  // (initial: null)
+isDevicesLoading: boolean        // (initial: false)
+devicesLoaded: boolean           // Idempotency guard (initial: false)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `loadDevices` | `() => Promise<void>` | GET /devices. Skips if `devicesLoaded \|\| isDevicesLoading`. |
+| `selectDevice` | `(deviceId: string \| null) => void` | Sets `selectedDeviceId`. |
+| `registerDevice` | `(data: CreateDeviceRequest) => Promise<Device>` | POST /devices. Appends the new device to the list. |
+| `deleteDevice` | `(deviceId: string) => Promise<void>` | DELETE /devices/{id}. Removes from list; clears `selectedDeviceId` if it matches. |
+| `updateDeviceStatus` | `(deviceId: string, status: DeviceStatus) => void` | Updates `connection_status` and `last_seen` for a device. If the device is unknown (registered from another client), resets `devicesLoaded` and triggers `loadDevices()` to re-fetch. |
+| `getSelectedDevice` | `() => Device \| null` | Derived getter. |
+| `getOnlineDevices` | `() => Device[]` | Returns devices with `connection_status === 'online'`. |
+
+---
+
+## billingSlice (`store/slices/billingSlice.ts`)
+
+### State
+
+```typescript
+status: BillingStatus | null       // (initial: null)
+pricing: PricingInfo | null        // (initial: null)
+plans: Plan[]                      // Sorted by sort_order then price_usd (initial: [])
+isStatusLoading: boolean           // (initial: false)
+isPricingLoading: boolean          // (initial: false)
+isPlansLoading: boolean            // (initial: false)
+onboardingDone: boolean            // Persisted in platform.storage under key 'skygen_onboarding_done' (initial: false)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `loadStatus` | `(silent?: boolean) => Promise<void>` | GET /billing/status. When `silent=true` skips the `isStatusLoading` spinner (used for background refresh). |
+| `loadPricing` | `() => Promise<void>` | GET /billing/pricing. |
+| `loadPlans` | `() => Promise<void>` | GET /admin/api/plans/public/active (no auth). Sorts by `sort_order` then `price_usd`. |
+| `markOnboardingComplete` | `() => void` | Sets `onboardingDone: true` and persists to platform storage. |
+| `checkOnboardingStatus` | `() => void` | Reads `onboardingDone` from platform storage (async, sets state on resolution). |
+| `setupCard` | `(planId?: string) => Promise<SetupCardResponse>` | POST /billing/setup-card. Returns Stripe SetupIntent data. |
+| `confirmCard` | `(setupIntentId: string, promptEventId?: string) => Promise<BillingStatus>` | POST /billing/confirm-card. Updates `status` from response. |
+| `createCheckoutSession` | `(planId: string, promptEventId?: string) => Promise<CheckoutSessionResponse>` | POST /billing/checkout. Returns Stripe Checkout URL. |
+| `subscribe` | `(planId?: string) => Promise<SubscriptionResponse>` | POST /billing/subscribe. Reloads status after success. |
+| `changePlan` | `(planId: string) => Promise<SubscriptionResponse>` | POST /billing/change-plan. Reloads status after success. |
+| `cancel` | `(atPeriodEnd?: boolean) => Promise<void>` | POST /billing/cancel (default `atPeriodEnd=true`). Reloads status after success. |
+| `enableOverage` | `() => Promise<void>` | POST /billing/overage/enable. Reloads status. |
+| `disableOverage` | `() => Promise<void>` | POST /billing/overage/disable. Reloads status. |
+| `canAccess` | `() => boolean` | Derived getter: `status?.can_access ?? false`. Gates message sending. |
+| `setModelProfile` | `(profile: string) => Promise<void>` | POST /billing/model-profile. Updates `status` from response. |
+
+### Paywall Trigger Flow
+
+```
+authSlice.login()  →  setPaywallTrigger('login')   [in uiSlice]
+authSlice.signup() →  setPaywallTrigger('signup')  [in uiSlice]
+  └─ MainLayout evaluates when billing status loads
+       └─ openPaywall(reason) → uiSlice.showPaywall = true
+```
+
+Note: `openPaywall` and `setPaywallTrigger` live in **uiSlice**, not billingSlice.
+
+---
+
+## uiSlice (`store/slices/uiSlice.ts`)
+
+Manages UI state that does not belong to any domain slice.
+
+### State
+
+```typescript
+theme: 'light' | 'dark'                            // Persisted in platform storage under 'skygen_theme' (initial: 'light')
+sidebarOpen: boolean                               // Persisted in localStorage under 'skygen_sidebar_open'; sync-read on init (initial: true)
+activeModal: string | null                         // (initial: null)
+confirmations: ConfirmationRequest[]               // Queue of pending agent confirmation requests (initial: [])
+processingConfirmationId: string | null            // Tracks confirmation being processed after user response (initial: null)
+showPaywall: boolean                               // (initial: false)
+paywallReason: 'post_registration' | 'post_login' | 'tokens_exhausted' | null  // (initial: null)
+paywallTrigger: 'login' | 'signup' | null         // (initial: null)
+pendingVoiceTranscriptions: Record<string, string> // Voice text keyed by sessionId (initial: {})
+chooseDeviceRequested: boolean                     // Cross-component signal to open ChooseDeviceModal (initial: false)
+chooseDeviceExpandOnSelect: boolean                // When true, picker sets viewMode='split' after selection (initial: false)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `setTheme` | `(theme: 'light' \| 'dark') => void` | Persists to storage, updates `document.documentElement` class. |
+| `toggleTheme` | `() => void` | Flips between `'light'` and `'dark'`. |
+| `initTheme` | `() => void` | Reads saved theme from platform storage asynchronously and applies it. |
+| `toggleSidebar` | `() => void` | Flips `sidebarOpen`, persists to localStorage. |
+| `setSidebarOpen` | `(open: boolean) => void` | Sets `sidebarOpen`, persists to localStorage. |
+| `openModal` | `(modalId: string) => void` | Sets `activeModal`. |
+| `closeModal` | `() => void` | Sets `activeModal: null`. |
+| `addConfirmation` | `(confirmation: ConfirmationRequest) => void` | Appends to `confirmations` queue. Deduplicates by id. |
+| `removeConfirmation` | `(confirmationId: string) => void` | Removes from queue by id. |
+| `getConfirmation` | `(confirmationId: string) => ConfirmationRequest \| undefined` | Synchronous lookup by id. |
+| `setProcessingConfirmation` | `(confirmationId: string \| null) => void` | Sets `processingConfirmationId`. |
+| `openPaywall` | `(reason: 'post_registration' \| 'post_login' \| 'tokens_exhausted') => void` | Sets `showPaywall: true`. Guard: no-op when already on `/subscriptions` path. |
+| `closePaywall` | `() => void` | Sets `showPaywall: false, paywallReason: null`. |
+| `setPaywallTrigger` | `(trigger: 'login' \| 'signup' \| null) => void` | Sets `paywallTrigger`. Called by auth actions before billing status loads. |
+| `setVoiceTranscription` | `(sessionId: string, text: string) => void` | Stores voice transcription text for a session (e.g. completed while TaskInput was unmounted). |
+| `consumeVoiceTranscription` | `(sessionId: string) => string \| null` | Reads and removes the pending transcription for a session. Returns `null` if none. |
+| `requestChooseDevice` | `(opts?: { expand?: boolean }) => void` | Sets `chooseDeviceRequested: true`. When `expand: true`, also sets `chooseDeviceExpandOnSelect: true` so the picker opens with split-view intent. |
+| `clearChooseDeviceRequest` | `() => void` | Clears `chooseDeviceRequested` (does NOT clear `chooseDeviceExpandOnSelect` — that is consumed later by handleDeviceSelect). |
+
+---
+
+## notificationsSlice (`store/slices/notificationsSlice.ts`)
+
+### State
+
+```typescript
+notifications: NotificationItem[]           // All loaded notifications (initial: [])
+unreadNotifications: NotificationItem[]     // Unread subset (initial: [])
+unreadCount: number                         // (initial: 0)
+isNotificationsLoading: boolean             // (initial: false)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `loadUnread` | `() => Promise<void>` | GET /notifications/unread. Sets `unreadNotifications` and `unreadCount`. |
+| `loadAll` | `(skip?: number, limit?: number) => Promise<NotificationsListResponse>` | GET /notifications (default skip=0, limit=50). Replaces array on skip=0; appends for pagination. Returns the response. |
+| `loadCount` | `() => Promise<void>` | GET /notifications/count. Updates `unreadCount` only. |
+| `markAsRead` | `(id: string) => Promise<void>` | POST /notifications/{id}/read. Skips API call for `temp-` IDs. Calls `markAsReadOptimistic` after success. |
+| `markAsReadOptimistic` | `(id: string) => void` | Immediately marks notification as read in both arrays and decrements `unreadCount`. No-op if already read. |
+| `markAllAsRead` | `() => Promise<void>` | POST /notifications/read-all. Clears `unreadNotifications`, marks all `notifications` as read, sets `unreadCount: 0`. |
+| `addNotification` | `(notification: NotificationItem) => void` | Prepends to both `notifications` and `unreadNotifications` (if not read). Increments `unreadCount`. Used by the `admin_notification` WebSocket event. |
+| `resetNotifications` | `() => void` | Resets all notification state to initial values. |
+
+---
+
+## helpdeskSlice (`store/slices/helpdeskSlice.ts`)
+
+### State
+
+```typescript
+tickets: Ticket[]                      // List of user's support tickets (initial: [])
+currentTicket: HelpdeskTicketDetail | null  // Currently viewed ticket with full message history (initial: null)
+ticketLoadError: string | null         // Error message from loadTicket() (initial: null)
+kbArticles: KBArticle[]               // Knowledge base articles (initial: [])
+isHelpdeskLoading: boolean             // True when any load is in progress (initial: false)
+_loadingCount: number                  // Internal concurrent load counter (initial: 0)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `loadTickets` | `(status?: string) => Promise<void>` | GET /helpdesk/tickets (optionally filtered by status). Increments `_loadingCount` to handle concurrent loads. |
+| `loadTicket` | `(id: string) => Promise<void>` | GET /helpdesk/tickets/{id}. Clears `currentTicket` before the call to prevent stale flash. Sets `ticketLoadError` on failure. |
+| `createTicket` | `(title: string, description: string, category?: string, priority?: string) => Promise<Ticket>` | POST /helpdesk/tickets. Prepends to `tickets` list. |
+| `replyToTicket` | `(ticketId: string, content: string) => Promise<void>` | POST /helpdesk/tickets/{id}/replies. Appends message to `currentTicket.messages` (deduplicates by id). Updates `message_count` in `tickets` list. |
+| `rateTicket` | `(ticketId: string, rating: number, comment?: string) => Promise<void>` | POST /helpdesk/tickets/{id}/rate. Updates `satisfaction_rating` and `satisfaction_comment` in both `currentTicket` and `tickets` list. |
+| `loadKBArticles` | `(search?: string, category?: string) => Promise<void>` | GET /helpdesk/kb. Sets `kbArticles`. |
+| `addTicketReply` | `(ticketId: string, message: HelpdeskMessage) => void` | Appends a reply to `currentTicket.messages` (deduplicates by id). Used by the `ticket_reply` WebSocket event. |
+| `updateTicketInList` | `(ticket: Ticket) => void` | Updates an existing ticket in `tickets` via merge. If ticket is in `currentTicket`, merges there too. Does NOT prepend partial objects — prevents crashes from incomplete WS payloads. |
+
+---
+
+## cloudPcSlice (`store/slices/cloudPcSlice.ts`)
+
+Manages per-session Cloud PC bindings. Each session can be bound to one Cloud PC; the same user can have multiple sessions with different Cloud PCs.
+
+### Per-Session State Map
+
+```typescript
+// Primary data: per-session entries (source of truth)
+cloudPcBySession: Record<string, PerSessionCloudPcState>   // (initial: {})
+showIsolationBanner: boolean                               // Data isolation banner (initial: false)
+
+interface PerSessionCloudPcState {
+  cloudPcId: string | null;
+  streamUrl: string | null;
+  streamAuthKey: string | null;
+  sandboxId: string | null;
+  linkedDeviceId: string | null;
+  status: CloudPCStatus;         // 'none' | 'creating' | 'resuming' | 'restoring' | 'active' | 'pausing' | 'paused' | 'terminated' | 'error'
+  controller: CloudPCController; // null | 'user' | 'ai'
+  viewMode: CloudPCViewMode;     // 'hidden' | 'pip' | 'split' | 'fullscreen'
+}
+```
+
+### Backward-Compatible Global Fields
+
+These are kept in sync from the per-session entry of the currently connected session via `_syncGlobalFromSession`:
+
+```typescript
+cloudPCStatus: CloudPCStatus         // (initial: 'none')
+activeCloudPcId: string | null       // (initial: null)
+streamUrl: string | null             // (initial: null)
+streamAuthKey: string | null         // (initial: null)
+sandboxId: string | null             // (initial: null)
+linkedDeviceId: string | null        // (initial: null)
+viewMode: CloudPCViewMode            // (initial: 'hidden')
+isConnecting: boolean                // (initial: false)
+isDisconnecting: boolean             // (initial: false)
+isStatusLoading: boolean             // (initial: false)
+connectError: string | null          // (initial: null)
+connectErrorStatus: number | null    // HTTP status code of last connect error (initial: null)
+billingRequired: boolean             // true when billing check blocks connect (initial: false)
+actionCooldown: boolean              // true for 3s after connect/disconnect (initial: false)
+controller: CloudPCController        // (initial: null)
+connectedSessionId: string | null    // (initial: null)
+lastStatusReason: string | null      // Human-readable translation of backend reason code (initial: null)
+```
+
+### Multi Cloud PC Catalog
+
+```typescript
+cloudPCList: CloudPCListItem[]          // All Cloud PCs for the account (initial: [])
+maxCloudPCs: number                     // Max allowed Cloud PCs (initial: 1)
+maxConcurrentActiveCpcs: number         // Max simultaneous sandbox-holding CPCs (initial: 1)
+isListLoading: boolean                  // (initial: false)
+```
+
+### Conflict State
+
+```typescript
+// Set when connect returns 409 cloud_pc_busy
+cloudPcBusy: {
+  cloudPcId: string;
+  activeSessionId: string;
+  pendingSessionId: string | null;
+  pendingCloudPcId: string;
+  pendingName: string | undefined;
+} | null                               // (initial: null)
+
+// Set when connect returns 409 concurrent_limit_reached
+concurrentLimitReached: {
+  limit: number;
+  current: number;
+  pausedCpcIds: string[];
+  pendingSessionId: string | null;
+  pendingName: string | undefined;
+} | null                               // (initial: null)
+```
+
+### File Manager State
+
+```typescript
+isFileManagerOpen: boolean             // (initial: false)
+isHistoryOpen: boolean                 // (initial: false)
+currentPath: string                    // (initial: '/home/user')
+files: FileEntry[]                     // Current directory listing (initial: [])
+filesLoading: boolean                  // (initial: false)
+fileOperationError: string | null      // (initial: null)
+```
+
+### Right Panel & Misc
+
+```typescript
+turnOffDialogOpen: boolean             // (initial: false)
+rightPanelMode: 'cloud-desktop' | 'file-preview' | 'hidden'  // (initial: 'cloud-desktop')
+previewFile: {
+  name: string;
+  s3Key?: string;
+  filePath?: string;
+  size?: number;
+  downloadUrl?: string;
+  resolving?: boolean;
+} | null                               // (initial: null)
+```
+
+### Actions
+
+#### Lifecycle
+
+| Action | Signature | Description |
+|---|---|---|
+| `connectCloudPC` | `(urlSessionId?: string \| null, cloudPcId?: string, name?: string) => Promise<void>` | POST /cloud-pc/connect. Checks billing; blocks if `actionCooldown`. On 409 `cloud_pc_busy` sets `cloudPcBusy`; on 409 `concurrent_limit_reached` sets `concurrentLimitReached`. Starts heartbeat, control renewal, visibility handler, links device. Calls `reloadSessions()` after success. |
+| `forceReattachCloudPC` | `() => Promise<void>` | Retries connect with `force_reattach=true` using data from `cloudPcBusy`. Clears `cloudPcBusy` before retry. |
+| `disconnectCloudPC` | `(disconnectReason?: string, disconnectErrorStatus?: number) => Promise<void>` | POST /cloud-pc/disconnect. Stops heartbeats, control renewal, visibility handler. Removes session entry. Resets to `initialCloudPcState` (preserves `cloudPCList`, `maxCloudPCs`, `maxConcurrentActiveCpcs`). Starts cooldown. |
+| `fetchCloudPCStatus` | `() => Promise<void>` | GET /cloud-pc/status. Updates global and per-session state. |
+| `fetchCloudPCList` | `() => Promise<void>` | GET /cloud-pc/list. Updates `cloudPCList`, `maxCloudPCs`, `maxConcurrentActiveCpcs`. |
+| `restoreCloudPC` | `() => Promise<void>` | On reconnect/mount: fetches list, reconciles against saved sessions in localStorage. Restarts heartbeats for active CPCs. Preserves per-session `viewMode` across reconnect. |
+| `resetCloudPC` | `() => void` | Synchronous reset: stops timers, removes session entry, clears to initial state (preserves list/max fields). |
+| `pauseCpcForSession` | `(sessionId: string) => Promise<void>` | POST /cloud-pc/disconnect for a specific session's CPC. Only fires for sandbox-holding states. Fire-and-forget — errors don't surface. |
+| `reconcileCloudPcBindings` | `(sessions, cloudPCList) => void` | Reconciles `cloudPcBySession` against server truth. Idempotent. Skips while `isDisconnecting`. |
+| `syncGlobalsFromActiveSession` | `(sessionId: string \| null) => void` | Re-points global backward-compat fields to the given session's per-session entry. Call when switching active chat. |
+
+#### Conflict Clearers
+
+| Action | Signature | Description |
+|---|---|---|
+| `clearBillingRequired` | `() => void` | Sets `billingRequired: false`. |
+| `clearActionCooldown` | `() => void` | Immediately clears `actionCooldown` and cancels the cooldown timer. |
+| `clearCloudPcBusy` | `() => void` | Clears `cloudPcBusy`. |
+| `clearConcurrentLimitReached` | `() => void` | Clears `concurrentLimitReached`. |
+
+#### WebSocket Handlers
+
+| Action | Signature | Description |
+|---|---|---|
+| `updateCloudPCStatus` | `(status: CloudPCStatus, extra?: {...}) => void` | Handles `cloud_pc_status_changed` WS event. Routes update to the correct session by `session_id` > `cloud_pc_id` lookup > `connectedSessionId`. Seeds a new per-session entry for snapshot-replay events. Ignored while `isDisconnecting`. |
+| `setCloudPCController` | `(controller: CloudPCController, cloudPcId?: string) => void` | Handles `cloud_pc_control_changed` WS event. |
+| `handleCloudPcSessionReleased` | `(sessionId: string, cloudPcId: string) => void` | Handles `cloud_pc_session_released` WS event. Drops local binding; shows error if the user is viewing the released chat. |
+| `handleCloudPcSessionRebound` | `(sessionId: string, cloudPcId: string) => void` | Handles `cloud_pc_session_rebound` WS event. Triggers `fetchCloudPCList()` so reconcile re-seeds the entry. |
+
+#### Control
+
+| Action | Signature | Description |
+|---|---|---|
+| `takeControl` | `(sessionId: string) => Promise<TakeControlResponse>` | POST /cloud-pc/control. Sets `controller`, starts control renewal. |
+| `resumeAI` | `(sessionId: string) => Promise<void>` | POST /cloud-pc/control/release. Stops control renewal, resets `controller`. No-op (warns) if backend says no paused agent. |
+
+#### View
+
+| Action | Signature | Description |
+|---|---|---|
+| `setViewMode` | `(mode: CloudPCViewMode) => void` | Updates global `viewMode` and per-session entry. |
+| `setTurnOffDialogOpen` | `(open: boolean) => void` | Opens/closes the Turn Off confirmation dialog. |
+| `openFilePreview` | `(file: {...}) => void` | Sets `previewFile`. |
+| `closeFilePreview` | `() => void` | Sets `previewFile: null`. |
+
+#### File Operations
+
+| Action | Signature | Description |
+|---|---|---|
+| `toggleFileManager` | `() => void` | Toggles `isFileManagerOpen`; closes history. |
+| `toggleHistory` | `() => void` | Toggles `isHistoryOpen`; closes file manager. |
+| `loadFiles` | `(path?: string) => Promise<void>` | GET /cloud-pc/files. Uses `currentPath` if path omitted. |
+| `downloadFile` | `(filePath: string) => Promise<void>` | GET /cloud-pc/files/download → triggers browser download. |
+| `uploadFile` | `(file: File, destPath: string) => Promise<void>` | S3 presigned upload: GET upload URL → PUT to S3 → POST callback. Refreshes directory. |
+| `deleteFile` | `(path: string) => Promise<void>` | DELETE /cloud-pc/files. Refreshes directory. |
+| `createFolder` | `(path: string) => Promise<void>` | POST /cloud-pc/files/mkdir. Refreshes directory. |
+| `clearFileOperationError` | `() => void` | Sets `fileOperationError: null`. |
+
+### Exported Helper Selectors
+
+```typescript
+// Returns the per-session entry for a given session, or null
+getSessionCloudPc(state: any, sessionId: string | null): PerSessionCloudPcState | null
+
+// Finds which session ID owns a given cloud_pc_id
+findSessionByCloudPcId(state: any, cloudPcId: string): string | null
+```
+
+### `mapToDisplayStatus(status, isPro, isCurrentSession)`
+
+Converts `CloudPCStatus` to `CloudDesktopDisplayStatus` for the UI:
+
+| `CloudPCStatus` | `CloudDesktopDisplayStatus` | Notes |
+|---|---|---|
+| `none`, `paused`, `terminated`, `pausing` | `available` | `pausing` treated as available — backend `connect()` handles stale PAUSING states |
+| `active` (current session) | `in_use` | |
+| `active` (other session) | `in_another_session` | |
+| `creating`, `resuming`, `restoring` | `starting` | |
+| `error` | `error` | |
+| any (not Pro) | `upgrade_required` | |
+
+### Heartbeat + Control Renewal
+
+Managed by `store/cloudPcHeartbeat.ts` — external timers that call Cloud PC API endpoints. All timers are stopped by `stopAllCloudPcSideEffects()` on logout.
+
+---
+
+## scheduledTasksSlice (`store/slices/scheduledTasksSlice.ts`)
+
+### State
+
+```typescript
+scheduledTasks: ScheduledTask[]        // (initial: [])
+completedRuns: ScheduledTaskRun[]      // Past task execution records (initial: [])
+isScheduledTasksLoading: boolean       // (initial: false)
+isCompletedRunsLoading: boolean        // (initial: false)
+saveWorkflowSessionId: string | null   // Session to extract a playbook from (initial: null)
+```
+
+### Actions
+
+| Action | Signature | Description |
+|---|---|---|
+| `loadScheduledTasks` | `() => Promise<void>` | GET /scheduled-tasks. Replaces `scheduledTasks`. |
+| `createScheduledTask` | `(body: ScheduledTaskCreate) => Promise<ScheduledTask>` | POST /scheduled-tasks. Prepends to list. |
+| `updateScheduledTask` | `(id: string, body: ScheduledTaskUpdate) => Promise<ScheduledTask>` | PATCH /scheduled-tasks/{id}. Replaces matching entry in list. |
+| `toggleScheduledTask` | `(id: string, is_enabled: boolean) => Promise<void>` | PATCH /scheduled-tasks/{id} with `{ is_enabled }`. Replaces matching entry. |
+| `deleteScheduledTask` | `(id: string) => Promise<void>` | DELETE /scheduled-tasks/{id}. Removes from list. |
+| `runScheduledTaskNow` | `(id: string) => Promise<void>` | POST /scheduled-tasks/{id}/run. Triggers `loadScheduledTasks()` to refresh `next_run_at`. |
+| `loadCompletedRuns` | `() => Promise<void>` | GET /scheduled-tasks/runs. Sets `completedRuns`. |
+| `extractPlaybook` | `(sessionId: string) => Promise<PlaybookData>` | POST /scheduled-tasks/extract-playbook. Returns playbook data; caller handles storing it. |
+| `setSaveWorkflowSessionId` | `(sessionId: string \| null) => void` | Sets `saveWorkflowSessionId` to signal the save-workflow modal to open for that session. |
+
+---
+
+## Cross-Slice Calls
+
+Slices that need to invoke another slice's actions cast `get()` to the combined type to avoid circular imports:
+
+```typescript
+// In messageSlice:
+const store = get() as unknown as FullMessageStore;
+store.setTyping(sessionId, true);         // liveStateSlice
+store.setTaskStatus(sessionId, {...});    // liveStateSlice
+store.clearAgentSteps(sessionId);         // liveStateSlice
+store.openPaywall('tokens_exhausted');    // uiSlice
+store.setPlan(sessionId, payload);        // liveStateSlice
+
+// In authSlice:
+get().setPaywallTrigger('login');         // uiSlice
+```
+
+The intersection type (`FullMessageStore`, `FullStore`, etc.) is defined locally in each slice file to avoid circular imports.
+
+---
+
+## WebSocket → Store Data Flow
+
+```
+Socket.IO event
+    │
+    ▼
+wsClient.on('<event>', handler)       // api/websocket/wsClient.ts
+    │  (internal pub/sub, singleton)
+    ▼
+useChatWebSocket hook handlers        // hooks/useChatWebSocket.ts
+    │  reads useStore.getState() to avoid stale closures
+    ▼
+Store action (e.g. addMessage, setTaskStatus)
+    │
+    ▼
+Zustand state update → React re-render
+```
+
+<Info>
+WebSocket handlers use `useStore.getState()` instead of closed-over state values. This avoids the React stale closure problem — the handler always reads the current store state at the time of the event, not the state captured when the `useEffect` ran.
+</Info>
+
+---
+
+## Loading Sequences
+
+### App startup
+
+```
+App mounts → ProtectedRoute checks isAuthenticated
+  │
+  ├─ true  → MainLayout mounts
+  │            │
+  │            └─ useMainLayoutInit()
+  │                 loadSessions()
+  │                 loadDevices()
+  │                 billingSlice.loadStatus()
+  │                 billingSlice.loadPricing()
+  │                 billingSlice.loadPlans()
+  │                 notificationsSlice.loadUnread()
+  │                 cloudPcSlice.restoreCloudPC()
+  │
+  └─ false → authSlice.restoreSession() (App-level effect)
+               authApi.upgradeSession()     ← cookie migration
+               authApi.getCurrentUser()
+               wsClient.connect(userId, token)
+               platform.desktop?.startDeviceWebSocket()
+```
+
+### Chat session load
+
+```
+setActiveSession(sessionId)
+    │
+    └─ useEffect in ChatPage
+         messageSlice.loadMessages(sessionId)
+           ├─ sessionApi.getMessages(sessionId)
+           ├─ sessionApi.getPlan(sessionId)
+           └─ Clears stale live plan if terminal frozen plan found
+```
+
+---
+
+## Patterns and Pitfalls
+
+<AccordionGroup>
+  <Accordion title="Idempotency guards">
+    `loadSessions()` and `loadDevices()` check `sessionsLoaded || isSessionsLoading` before making a network call. This prevents duplicate fetches when multiple components mount simultaneously. Use `reloadSessions()` to force a refresh.
+  </Accordion>
+
+  <Accordion title="Optimistic updates">
+    `sendMessage()` adds a `temp-{timestamp}` message to the store immediately, then replaces it with the real server response. If the send fails, the temp message is updated with `status: 'error'`.
+
+    `updateSession()` applies changes locally before the PATCH request. If the request fails, it reloads the full session list to revert.
+  </Accordion>
+
+  <Accordion title="Session-sealed guard">
+    Before updating `typingBySession` or `taskStatusBySession` from a WebSocket event, the hook checks `isSessionSealed()`. Sealed sessions are in a terminal state — stale late-arriving events are dropped. The seal is broken when `sendMessage()` sets `isActive: true` for the next user message.
+  </Accordion>
+
+  <Accordion title="Plan version guard">
+    `setPlan()` rejects payloads with a lower `plan_version` than the currently stored plan. This prevents stale plan snapshots from overwriting live updates during reconnects.
+  </Accordion>
+
+  <Accordion title="Message deduplication">
+    `addMessage()` runs three dedup checks: by `id`, by `(role, content, timestamp)` for recent assistant messages, and temp-message replacement by `(role, content)`. The `new_message` WebSocket event also checks `displayHandledIdsRef` to skip messages already handled by `display_message`.
+  </Accordion>
+
+  <Accordion title="Cloud PC action cooldown">
+    `cloudPcSlice` enforces a 3-second `actionCooldown` after every connect or disconnect. Use `clearActionCooldown()` before an intentional connect from the device picker so a recent Turn Off does not silently block it.
+  </Accordion>
+
+  <Accordion title="Logout state reset contract">
+    `authSlice.logout()` explicitly resets fields from every slice. When adding new per-user fields to any slice, they MUST also be reset in `logout()`. The Cloud PC slice is reset by spreading `...initialCloudPcState`, which is why `initialCloudPcState` is exported.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Dead Slices
+
+<Warning>
+The following two slice files exist in `store/slices/` but are **NOT** registered in `useStore.ts`. They are dead code. Do not import from them.
+</Warning>
+
+### messageStreamSlice (`store/slices/messageStreamSlice.ts`) — DEPRECATED
+
+Originally managed typing and task status. Superseded by `liveStateSlice`, which absorbed all its state and actions plus added plan management and agent steps. Its interface is a strict subset of `LiveStateSlice`.
+
+```typescript
+// State (all now in liveStateSlice):
+typingBySession: Record<string, boolean>
+taskStatusBySession: Record<string, TaskStatus>
+uiMetaBySession: Record<string, UiMetaUpdatePayload | null>
+
+// Actions (all now in liveStateSlice):
+setTyping(sessionId, isTyping)
+setTaskStatus(sessionId, status)
+updateTaskProgress(sessionId, progress)
+setUiMeta(sessionId, payload)
+```
+
+### messagePlanSlice (`store/slices/messagePlanSlice.ts`) — DEPRECATED
+
+Originally managed agent steps and plans. Superseded by `liveStateSlice`. Its interface is a strict subset of `LiveStateSlice`.
+
+```typescript
+// State (all now in liveStateSlice):
+agentStepsBySession: Record<string, AgentStep[]>
+agentStepsByPlanStep: Record<string, Record<string, AgentStep[]>>
+planBySession: Record<string, PlanPayload | null>
+frozenPlanByMessageId: Record<string, FrozenPlanSnapshot>
+
+// Actions (all now in liveStateSlice):
+addAgentStep / clearAgentSteps / setPlan / clearPlan
+finalizePlan / completeAllSteps / freezePlanForMessage
+```

@@ -1,0 +1,147 @@
+---
+title: "Agent Prompt Files"
+description: "Reference for the prod_apps exploration prompt library and how it is used during local development and testing."
+---
+
+# Agent Prompt Files
+
+The `Agent/prompts/` directory contains a library of task-description prompts used during local development and CUA exploration testing.
+
+---
+
+## `prompts/prod_apps/`
+
+**Path:** `Agent/prompts/prod_apps/`
+
+Each file in this directory is a Markdown task description for a specific web application. They are consumed by `run_local_wrapper.py` when running the agent locally with `--app <name>` or `--explore` mode.
+
+### Purpose
+
+These files serve as exploration tasks for the `CUA_OrchestratorAgent` in development and QA environments. When loaded, the file content is used as the agent's initial user prompt (instead of a live user message). The CUA orchestrator then navigates the application UI, exercises all documented workflows, and reports findings.
+
+### Usage
+
+```bash
+# List available apps
+python run_local_wrapper.py --list-apps
+
+# Run exploration against an app
+python run_local_wrapper.py --agent cua --app gmail
+
+# Combine with --explore flag for full exploration mode
+python run_local_wrapper.py --explore --app slack
+```
+
+The discovery mechanism (`_discover_apps()` in `run_local_wrapper.py`) scans `prompts/prod_apps/*.md` at startup and registers all found files as valid `--app` values. File names without the `.md` extension become the app key.
+
+---
+
+## Available Prompt Files
+
+### `gmail.md`
+
+Exploration task for **Gmail** (Google's web email service).
+
+Covers: header bar, search bar with filters, left sidebar (folder navigation, labels), inbox email list with category tabs, email reading view with thread support, compose window (floating modal with formatting toolbar), Settings (Quick Settings panel + full settings tabs), right sidebar panel (Calendar, Keep, Tasks, Contacts), context menus.
+
+Expected workflows: read email, compose and discard, search with advanced filters, navigate folders, star/unstar, access settings, manage labels.
+
+---
+
+### `google_calendar.md`
+
+Exploration task for **Google Calendar**.
+
+Covers: month/week/day/schedule view switcher, event creation and editing, recurring events, calendar list management, event details panel, reminders and notifications, meet integration.
+
+---
+
+### `google_drive.md`
+
+Exploration task for **Google Drive**.
+
+Covers: My Drive folder navigation, shared drives, file/folder operations (rename, move, copy, share, delete), file preview panel, search with type and date filters, storage quota indicator, right-click context menus.
+
+---
+
+### `hubspot.md`
+
+Exploration task for **HubSpot CRM**.
+
+Covers: Contacts list view (filters, search, columns), contact detail page (timeline, properties panel, associated companies/deals), Deals pipeline (kanban board, deal stages), Companies view, Tasks and Activities, email integration, call logs.
+
+---
+
+### `notion.md`
+
+Exploration task for **Notion**.
+
+Covers: sidebar navigation (workspace pages, teamspaces, private pages, favorites), page editor (slash command menu, block types: text, headings, toggles, callouts, code, tables, databases), database views (table, board, gallery, calendar, list, timeline), inline links, comments, sharing settings.
+
+---
+
+### `outlook.md`
+
+Exploration task for **Microsoft Outlook** (web and desktop).
+
+Covers: folder pane (Inbox, Sent, Drafts, Junk, Deleted, Favorites, Groups), reading pane (email header, body, inline images, attachments), compose window (To/CC/BCC, formatting ribbon, insert options, send later), search with filters, calendar quick-view, Settings panel.
+
+---
+
+### `slack.md`
+
+Exploration task for **Slack**.
+
+Covers: left sidebar (workspace menu, Threads, DMs, Channels, Apps), channel list with unread indicators, top header bar (channel name, member count, search, huddle), message area (message types, reactions, thread reply indicators), rich-text message input (formatting toolbar, emoji picker, slash commands), thread panel, channel details panel (About, Members, Integrations, Pinned items, Files), direct messages, workspace preferences.
+
+Expected workflows: read channel messages, open a thread, explore message formatting, search, browse channel details, switch channels/DMs, access workspace preferences, explore emoji picker.
+
+---
+
+### `telegram.md`
+
+Exploration task for **Telegram** (web or desktop app).
+
+Covers: chat list sidebar (search, filters, archived chats, unread badges), chat view (message history, stickers, voice messages, inline bot buttons, reactions), message input (emoji, stickers, GIFs, attachments, scheduled messages, polls), chat info panel (members, media/files/links/audio tabs, group settings), channel posts vs group messages, bot interactions, settings (notifications, privacy, themes).
+
+---
+
+## File Format
+
+Each prompt file follows a consistent three-section Markdown structure:
+
+```markdown
+## Task: <Application Name>
+
+<One-line description of what the application is and its primary function.>
+
+### Key Areas to Explore
+
+- **Area name** — what to look for, sub-elements, notable UI patterns
+
+### Expected Workflows
+
+- Workflow description: steps → observable outcome
+
+### Notes
+
+- Edge cases, popups to dismiss, app-specific quirks
+```
+
+---
+
+## Relationship to System Prompts
+
+These files are **not** system prompts. They are the initial **user turn** injected into the agent's conversation history at task start. The actual agent persona and behavioral instructions come from the specialist's `SYSTEM_PROMPT` class attribute and the `PromptBuilder` pipeline.
+
+The exploration task prompt replaces the `DEFAULT_PROMPTS` dict entry for the `"cua"` agent key in `run_local_wrapper.py` when `--app` is specified.
+
+---
+
+## Adding a New App Prompt
+
+1. Create `Agent/prompts/prod_apps/<appname>.md` following the three-section format above.
+2. Run `python run_local_wrapper.py --list-apps` to confirm the file is discovered.
+3. Run `python run_local_wrapper.py --explore --app <appname>` to validate the task prompt with the CUA orchestrator locally.
+
+No code changes are required — the file discovery is fully automatic.
